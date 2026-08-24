@@ -22,6 +22,12 @@ from prompts import (
 VALID_MODES = {"BASIC", "DISEASE_HIERARCHY", "DISEASE_AND_LOCATION"}
 
 
+def print_pipeline_event(title: str, content: str) -> None:
+    """Print one readable request/response event for notebook execution."""
+    rule = "=" * 78
+    print(f"\n{rule}\n{title}\n{'-' * 78}\n{content}\n{rule}")
+
+
 def parse_atomic_status(text: str) -> str:
     """Conservative parser used only to decide whether location questions run."""
     answer_tags = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.I | re.S)
@@ -103,6 +109,11 @@ class LLMOrchestrator:
             "closed_ontology": list(CONDITIONS),
             "observations": observations,
         }
+        print_pipeline_event(
+            f"ORCHESTRATOR REQUEST | provider={self.provider} | model={self.model}",
+            "The orchestrator receives this text-only payload (no X-ray image):\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False),
+        )
         completion = self.client.chat.completions.parse(
             model=self.model,
             messages=[
@@ -121,6 +132,10 @@ class LLMOrchestrator:
         if len(returned) != len(set(returned)) or set(returned) != set(expected):
             raise ValueError("Orchestrator must return every ontology condition exactly once.")
         result["findings"].sort(key=lambda x: expected.index(x["condition"]))
+        print_pipeline_event(
+            f"ORCHESTRATOR RESPONSE | provider={self.provider} | model={self.model}",
+            json.dumps(result, indent=2, ensure_ascii=False),
+        )
         return result
 
 
@@ -135,9 +150,20 @@ class DentalAnalysisPipeline:
     def _ask_records(self, image_path: str, records: list[dict]) -> list[dict]:
         completed = []
         for index, record in enumerate(records, start=1):
-            print(f"[{index}/{len(records)}] {record['question_id']}")
             item = deepcopy(record)
+            print_pipeline_event(
+                "DENTALGPT REQUEST "
+                f"| {index}/{len(records)} | id={item['question_id']} "
+                f"| layer={item['layer']} | model={self.dental_runner.model_id}",
+                f"Question:\n{item['question']}",
+            )
             item.update(self.dental_runner.ask(image_path, item["question"]))
+            print_pipeline_event(
+                "DENTALGPT RESPONSE "
+                f"| {index}/{len(records)} | id={item['question_id']} "
+                f"| latency={item['latency_seconds']}s",
+                f"Answer:\n{item['raw_answer']}",
+            )
             if item["layer"] == "ATOMIC_FINDING":
                 item["parsed_status"] = parse_atomic_status(item["raw_answer"])
             completed.append(item)
