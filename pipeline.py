@@ -33,7 +33,7 @@ def parse_atomic_status(text: str) -> str:
 class OpenAIOrchestrator:
     """Optional text-only orchestrator. It never receives the radiograph."""
 
-    def __init__(self, model: str = "gpt-5.6"):
+    def __init__(self, model: str = "gpt-5.6", base_url: str | None = None):
         from openai import OpenAI
         from pydantic import BaseModel, ConfigDict
 
@@ -74,7 +74,8 @@ class OpenAIOrchestrator:
             findings: list[Finding]
             report: str
 
-        self.client = OpenAI()
+        client_kwargs = {"base_url": base_url} if base_url else {}
+        self.client = OpenAI(**client_kwargs)
         self.model = model
         self.output_type = OrchestratedReport
 
