@@ -30,10 +30,18 @@ def parse_atomic_status(text: str) -> str:
     return matches[-1] if matches else "UNCERTAIN"
 
 
-class OpenAIOrchestrator:
+class LLMOrchestrator:
     """Optional text-only orchestrator. It never receives the radiograph."""
 
-    def __init__(self, model: str = "gpt-5.6", base_url: str | None = None):
+    def __init__(
+        self,
+        model: str = "gpt-5.6",
+        base_url: str | None = None,
+        api_key: str | None = None,
+        provider: str = "openai",
+        timeout: float | None = None,
+        max_retries: int | None = None,
+    ):
         from openai import OpenAI
         from pydantic import BaseModel, ConfigDict
 
@@ -74,9 +82,19 @@ class OpenAIOrchestrator:
             findings: list[Finding]
             report: str
 
-        client_kwargs = {"base_url": base_url} if base_url else {}
+        client_kwargs = {}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if api_key:
+            client_kwargs["api_key"] = api_key
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
+        if max_retries is not None:
+            client_kwargs["max_retries"] = max_retries
         self.client = OpenAI(**client_kwargs)
         self.model = model
+        self.base_url = base_url
+        self.provider = provider
         self.output_type = OrchestratedReport
 
     def run(self, mode: str, observations: list[dict]) -> dict:
@@ -104,6 +122,9 @@ class OpenAIOrchestrator:
             raise ValueError("Orchestrator must return every ontology condition exactly once.")
         result["findings"].sort(key=lambda x: expected.index(x["condition"]))
         return result
+
+
+OpenAIOrchestrator = LLMOrchestrator
 
 
 class DentalAnalysisPipeline:
