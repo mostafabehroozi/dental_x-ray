@@ -80,56 +80,190 @@ def build_llama_cpp(
     cuda_arch: str = "60",
     jobs: int = 4,
     ref: str = "b10516",
+    clean_build: bool = False,
 ) -> Path:
-    """Clone and build a pinned llama.cpp release with CUDA support (Kaggle P100 => SM 60)."""
+    """
+    Build a pinned llama.cpp llama-server with CUDA support.
+
+    Kaggle note:
+        Kaggle can provide nvcc/CUDA runtime while CMake fails to expose
+        CUDA::cuda_driver.
+
+        GGML_CUDA_NO_VMM=ON avoids that unnecessary direct driver-library
+        dependency while keeping CUDA inference enabled.
+
+    P100:
+        compute capability = 6.0 -> CMAKE_CUDA_ARCHITECTURES=60
+    """
+
     source_dir = Path(source_dir)
-    server = source_dir / "build" / "bin" / "llama-server"
-    if server.is_file():
-        return server.resolve()
+    build_dir = source_dir / "build"
+    server = build_dir / "bin" / "llama-server"
+
+    # ---------------------------------------------------------
+    # 1. Clone llama.cpp if necessary
+    # ---------------------------------------------------------
 
     if not source_dir.exists():
+        print(f"Cloning llama.cpp ref {ref}...")
+
         subprocess.run(
             [
                 "git",
                 "clone",
-                "--depth",
-                "1",
-                "--branch",
-                ref,
                 "https://github.com/ggml-org/llama.cpp.git",
                 str(source_dir),
             ],
             check=True,
         )
 
+    git_dir = source_dir / ".git"
+
+    if not git_dir.exists():
+        raise RuntimeError(
+            f"{source_dir} exists but is not a valid llama.cpp git repository."
+        )
+
+    # ---------------------------------------------------------
+    # 2. Make sure we're actually on the requested pinned ref
+    # ---------------------------------------------------------
+
+    print(f"Checking out llama.cpp ref: {ref}")
+
     subprocess.run(
         [
-            "cmake",
-            "-S",
+            "git",
+            "-C",
             str(source_dir),
-            "-B",
-            str(source_dir / "build"),
-            "-DGGML_CUDA=ON",
-            "-DCMAKE_BUILD_TYPE=Release",
-            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}",
-        ],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "cmake",
-            "--build",
-            str(source_dir / "build"),
-            "--target",
-            "llama-server",
-            "-j",
-            str(max(1, jobs)),
+            "fetch",
+            "--tags",
+            "--force",
         ],
         check=True,
     )
 
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_dir),
+            "checkout",
+            "--force",
+            "--detach",
+            ref,
+        ],
+        check=True,
+    )
+
+    commit = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(source_dir),
+            "rev-parse",
+            "HEAD",
+        ],
+        text=True,
+    ).strip()
+
+    print("llama.cpp commit:", commit)
+
+    # ---------------------------------------------------------
+    # 3. Return an already valid binary unless rebuilding
+    # ---------------------------------------------------------
+
+    if server.is_file() and not clean_build:
+        print("Using existing llama-server:", server)
+        return server.resolve()
+
+    # ---------------------------------------------------------
+    # 4. Always remove a stale/failed CMake configuration
+    # ---------------------------------------------------------
+
+    if build_dir.exists():
+        print("Removing previous CMake build directory...")
+        shutil.rmtree(build_dir)
+
+    # ---------------------------------------------------------
+    # 5. Configure
+    # ---------------------------------------------------------
+
+    cmake_command = [
+        "cmake",
+        "-S",
+        str(source_dir),
+        "-B",
+        str(build_dir),
+
+        # CUDA backend remains enabled.
+        "-DGGML_CUDA=ON",
+
+        # Important for Kaggle.
+        #
+        # Without this, this llama.cpp version tries:
+        #
+        #   target_link_libraries(
+        #       ggml-cuda PRIVATE CUDA::cuda_driver
+        #   )
+        #
+        # Kaggle's CUDA environment may not expose that CMake target.
+        "-DGGML_CUDA_NO_VMM=ON",
+
+        # Single GPU notebook: no need for NCCL.
+        "-DGGML_CUDA_NCCL=OFF",
+
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}",
+    ]
+
+    print("\nConfiguring llama.cpp:")
+    print(" ".join(cmake_command))
+
+    subprocess.run(
+        cmake_command,
+        check=True,
+    )
+
+    # ---------------------------------------------------------
+    # 6. Compile only llama-server
+    # ---------------------------------------------------------
+
+    build_command = [
+        "cmake",
+        "--build",
+        str(build_dir),
+        "--target",
+        "llama-server",
+        "--config",
+        "Release",
+        "-j",
+        str(max(1, jobs)),
+    ]
+
+    print("\nBuilding llama-server:")
+    print(" ".join(build_command))
+
+    subprocess.run(
+        build_command,
+        check=True,
+    )
+
+    # ---------------------------------------------------------
+    # 7. Verify binary
+    # ---------------------------------------------------------
+
     if not server.is_file():
-        raise FileNotFoundError(f"llama-server build completed but binary was not found at {server}")
+        raise FileNotFoundError(
+            "llama-server build finished but binary was not found at:\n"
+            f"{server}"
+        )
+
+    if not os.access(server, os.X_OK):
+        server.chmod(server.stat().st_mode | 0o111)
+
+    print("\nllama-server successfully built:")
+    print(server)
+
     return server.resolve()
 
 
