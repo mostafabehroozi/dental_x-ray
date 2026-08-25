@@ -1,5 +1,3 @@
-"""Three-mode question pipeline plus an optional capable-LLM orchestrator."""
-
 from __future__ import annotations
 
 import json
@@ -23,30 +21,41 @@ VALID_MODES = {"BASIC", "DISEASE_HIERARCHY", "DISEASE_AND_LOCATION"}
 
 
 def print_pipeline_event(title: str, content: str) -> None:
-    """Print one readable request/response event for notebook execution."""
     rule = "=" * 78
     print(f"\n{rule}\n{title}\n{'-' * 78}\n{content}\n{rule}")
 
 
+def extract_answer_text(text: str) -> str | None:
+    matches = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.I | re.S)
+    return matches[-1].strip() if matches else None
+
+
 def parse_atomic_status(text: str) -> str:
-    """Conservative parser used only to decide whether location questions run."""
-    answer_tags = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.I | re.S)
-    searchable = answer_tags[-1] if answer_tags else text[-400:]
+    """Conservatively normalize a DentalGPT atomic answer.
+
+    Prefer the final <answer> block. If multiple incompatible labels appear inside it,
+    return UNCERTAIN rather than choosing whichever token happened to occur last.
+    """
+    answer = extract_answer_text(text)
+    searchable = answer if answer is not None else text[-500:]
     matches = re.findall(r"\b(PRESENT|ABSENT|UNCERTAIN)\b", searchable.upper())
-    return matches[-1] if matches else "UNCERTAIN"
+    unique = set(matches)
+    if len(unique) == 1:
+        return next(iter(unique))
+    return "UNCERTAIN"
 
 
 class LLMOrchestrator:
-    """Optional text-only orchestrator. It never receives the radiograph."""
+    """Optional text-only report/normalization model. It never receives the X-ray."""
 
     def __init__(
         self,
-        model: str = "gpt-5.6",
+        model: str,
         base_url: str | None = None,
         api_key: str | None = None,
         provider: str = "openai",
-        timeout: float | None = None,
-        max_retries: int | None = None,
+        timeout: float | None = 600,
+        max_retries: int | None = 2,
     ):
         from openai import OpenAI
         from pydantic import BaseModel, ConfigDict
@@ -97,23 +106,31 @@ class LLMOrchestrator:
             client_kwargs["timeout"] = timeout
         if max_retries is not None:
             client_kwargs["max_retries"] = max_retries
+
         self.client = OpenAI(**client_kwargs)
         self.model = model
         self.base_url = base_url
         self.provider = provider
         self.output_type = OrchestratedReport
 
-    def run(self, mode: str, observations: list[dict]) -> dict:
+    def run(
+        self,
+        mode: str,
+        observations: list[dict],
+        deterministic_atomic_statuses: dict[str, str],
+    ) -> dict:
         payload = {
             "analysis_mode": mode,
             "closed_ontology": list(CONDITIONS),
+            "deterministic_atomic_statuses": deterministic_atomic_statuses,
             "observations": observations,
         }
         print_pipeline_event(
             f"ORCHESTRATOR REQUEST | provider={self.provider} | model={self.model}",
-            "The orchestrator receives this text-only payload (no X-ray image):\n"
+            "The orchestrator receives text only (no radiograph):\n"
             + json.dumps(payload, indent=2, ensure_ascii=False),
         )
+
         completion = self.client.chat.completions.parse(
             model=self.model,
             messages=[
@@ -131,6 +148,17 @@ class LLMOrchestrator:
         expected = list(CONDITIONS)
         if len(returned) != len(set(returned)) or set(returned) != set(expected):
             raise ValueError("Orchestrator must return every ontology condition exactly once.")
+
+        # Hard safety invariant: in hierarchy/full modes, the orchestrator may format
+        # atomic statuses but may not reinterpret them.
+        by_condition = {item["condition"]: item for item in result["findings"]}
+        for condition, status in deterministic_atomic_statuses.items():
+            if by_condition[condition]["status"] != status:
+                raise ValueError(
+                    f"Orchestrator changed deterministic status for {condition}: "
+                    f"{status} -> {by_condition[condition]['status']}"
+                )
+
         result["findings"].sort(key=lambda x: expected.index(x["condition"]))
         print_pipeline_event(
             f"ORCHESTRATOR RESPONSE | provider={self.provider} | model={self.model}",
@@ -143,9 +171,10 @@ OpenAIOrchestrator = LLMOrchestrator
 
 
 class DentalAnalysisPipeline:
-    def __init__(self, dental_runner, orchestrator=None):
+    def __init__(self, dental_runner, orchestrator=None, locate_uncertain: bool = True):
         self.dental_runner = dental_runner
         self.orchestrator = orchestrator
+        self.locate_uncertain = locate_uncertain
 
     def _ask_records(self, image_path: str, records: list[dict]) -> list[dict]:
         completed = []
@@ -157,19 +186,48 @@ class DentalAnalysisPipeline:
                 f"| layer={item['layer']} | model={self.dental_runner.model_id}",
                 f"Question:\n{item['question']}",
             )
-            item.update(self.dental_runner.ask(image_path, item["question"]))
+
+            item.update(
+                self.dental_runner.ask(
+                    image_path,
+                    item["question"],
+                    max_tokens=item.get("max_tokens"),
+                )
+            )
+
             print_pipeline_event(
                 "DENTALGPT RESPONSE "
                 f"| {index}/{len(records)} | id={item['question_id']} "
-                f"| latency={item['latency_seconds']}s",
+                f"| latency={item['latency_seconds']}s "
+                f"| finish={item.get('finish_reason')}",
                 f"Answer:\n{item['raw_answer']}",
             )
+
+            if item.get("truncated"):
+                print(f"WARNING: response {item['question_id']} hit the token limit.")
+
             if item["layer"] == "ATOMIC_FINDING":
                 item["parsed_status"] = parse_atomic_status(item["raw_answer"])
+            else:
+                item["parsed_answer"] = extract_answer_text(item["raw_answer"])
+
             completed.append(item)
         return completed
 
-    def run(self, image_path: str, mode: str = "BASIC", output_dir: str = "outputs") -> dict:
+    @staticmethod
+    def _atomic_status_map(observations: list[dict]) -> dict[str, str]:
+        return {
+            item["target"]: item["parsed_status"]
+            for item in observations
+            if item["layer"] == "ATOMIC_FINDING"
+        }
+
+    def run(
+        self,
+        image_path: str,
+        mode: str = "BASIC",
+        output_dir: str = "outputs",
+    ) -> dict:
         mode = mode.upper()
         if mode not in VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
@@ -185,20 +243,30 @@ class DentalAnalysisPipeline:
             observations += atomic
 
             if mode == "DISEASE_AND_LOCATION":
+                allowed = {"PRESENT", "UNCERTAIN"} if self.locate_uncertain else {"PRESENT"}
                 candidates = [
-                    item["target"] for item in atomic
-                    if item["parsed_status"] in {"PRESENT", "UNCERTAIN"}
+                    item["target"]
+                    for item in atomic
+                    if item["parsed_status"] in allowed
                 ]
                 for condition in candidates:
                     print(f"Location follow-up: {condition}")
                     observations += self._ask_records(image_path, location_records(condition))
 
-        orchestrated = self.orchestrator.run(mode, observations) if self.orchestrator else None
+        atomic_statuses = self._atomic_status_map(observations)
+        orchestrated = (
+            self.orchestrator.run(mode, observations, atomic_statuses)
+            if self.orchestrator
+            else None
+        )
+
         result = {
             "analysis_mode": mode,
             "image_path": str(Path(image_path).resolve()),
+            "dentalgpt_model": self.dental_runner.model_id,
             "dentalgpt_call_count": len(observations),
             "total_latency_seconds": round(time.perf_counter() - started, 3),
+            "deterministic_atomic_statuses": atomic_statuses,
             "observations": observations,
             "orchestrated_output": orchestrated,
         }

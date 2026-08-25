@@ -1,89 +1,115 @@
-"""Small Hugging Face runner for the original DentalGPT checkpoint."""
-
 from __future__ import annotations
 
+import base64
+import mimetypes
 import time
 from pathlib import Path
 
-import torch
-from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
-from qwen_vl_utils import process_vision_info
+from openai import OpenAI
 
 
 class DentalGPTRunner:
+    """Thin multimodal client for DentalGPT served by llama.cpp.
+
+    The runner intentionally preserves the old project contract:
+        ask(image_path, question) -> dict
+
+    The pipeline therefore does not need to know that the model is GGUF.
+    """
+
     def __init__(
         self,
-        model_id: str = "Eric3200/DentalGPT-7B-1026",
-        processor_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-        load_in_4bit: bool = True,
-        max_new_tokens: int = 256,
-        min_pixels: int = 256 * 28 * 28,
-        max_pixels: int = 1024 * 28 * 28,
-        hf_token: str | None = None,
+        base_url: str = "http://127.0.0.1:8080",
+        api_model: str = "dentalgpt",
+        model_id: str = "mradermacher/DentalGPT-7B-1026-GGUF",
+        max_tokens: int = 768,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int = 0,
+        timeout: float = 600.0,
+        cache_prompt: bool = False,
     ):
+        self.base_url = base_url.rstrip("/")
+        self.api_model = api_model
         self.model_id = model_id
-        self.max_new_tokens = max_new_tokens
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.seed = seed
+        self.cache_prompt = cache_prompt
+        self.client = OpenAI(
+            base_url=f"{self.base_url}/v1",
+            api_key="local-llama-cpp",
+            timeout=timeout,
+            max_retries=1,
+        )
 
-        quantization_config = None
-        if load_in_4bit:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
+    @staticmethod
+    def _image_data_uri(image_path: str | Path) -> str:
+        path = Path(image_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+        mime_type, _ = mimetypes.guess_type(path.name)
+        if not mime_type or not mime_type.startswith("image/"):
+            raise ValueError(
+                f"Unsupported image type for {path.name}. Convert the radiograph to PNG/JPEG/WebP first."
             )
 
-        self.processor = AutoProcessor.from_pretrained(
-            processor_id,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-            token=hf_token,
-        )
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            quantization_config=quantization_config,
-            attn_implementation="eager",
-            token=hf_token,
-        ).eval()
+        payload = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{payload}"
 
-    @torch.inference_mode()
-    def ask(self, image_path: str, question: str) -> dict:
-        image_path = str(Path(image_path).resolve())
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_path},
-                    {"type": "text", "text": question},
-                ],
-            }
-        ]
-
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        ).to(self.model.device)
+    def ask(
+        self,
+        image_path: str,
+        question: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
+    ) -> dict:
+        image_uri = self._image_data_uri(image_path)
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        temperature = temperature if temperature is not None else self.temperature
+        seed = seed if seed is not None else self.seed
 
         started = time.perf_counter()
-        generated_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=False,
-            use_cache=True,
+        response = self.client.chat.completions.create(
+            model=self.api_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        # Put the image first so repeated calls share the same large prefix.
+                        {"type": "image_url", "image_url": {"url": image_uri}},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=self.top_p,
+            seed=seed,
+            extra_body={
+                # Preserve raw <think>/<answer> output instead of splitting reasoning server-side.
+                "reasoning_format": "none",
+                # Disabled by default for evaluation isolation; enable only after validating cache behavior.
+                "cache_prompt": self.cache_prompt,
+            },
         )
         latency = time.perf_counter() - started
 
-        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
-        answer = self.processor.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0].strip()
-        return {"raw_answer": answer, "latency_seconds": round(latency, 3)}
+        choice = response.choices[0]
+        answer = (choice.message.content or "").strip()
+        usage = getattr(response, "usage", None)
+
+        result = {
+            "raw_answer": answer,
+            "latency_seconds": round(latency, 3),
+            "finish_reason": choice.finish_reason,
+            "truncated": choice.finish_reason == "length",
+        }
+        if usage is not None:
+            result["prompt_tokens"] = usage.prompt_tokens
+            result["completion_tokens"] = usage.completion_tokens
+        return result
