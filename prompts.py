@@ -63,35 +63,44 @@ def broad_records() -> list[dict]:
             "broad_overall",
             "BROAD",
             "overall",
-            """Examine this panoramic dental radiograph as a dental radiology screening image.
-List the radiographically visible abnormalities and prior dental treatments that are reasonably supported by the image. Also mention important regions that are not reliably assessable. Do not invent clinical history.
-Give a concise reasoning section and a concise final answer inside <answer>...</answer>.""",
+            """Review the entire panoramic dental radiograph as a broad dental-radiology survey.
+
+Identify all visible abnormalities, notable dental conditions, prior treatments, positional abnormalities, and important bone or jaw findings that are reasonably supported by the image. Review the whole image and do not stop after the first few findings.
+
+If a finding is questionable, describe it as uncertain rather than forcing a diagnosis. Focus on findings rather than listing everything that appears normal or absent.""",
             1024,
         ),
         _record(
             "broad_teeth_restorations",
             "BROAD",
             "teeth_and_restorations",
-            """Inspect the teeth and dental restorations across the entire panoramic radiograph.
-Look broadly for missing/defective tooth structure, residual roots, impacted teeth, fillings, crowns/bridges, implants, root-canal-treated teeth, orthodontic appliances, and other obvious treatment-related findings.
-State only findings supported by the image and give the final concise list inside <answer>...</answer>.""",
+            """Review the teeth and dental treatment across the entire panoramic radiograph.
+
+Report all visible findings involving tooth presence or structure, caries or defects, residual roots, eruption or impaction, restorations, crowns or bridges, implants, endodontic treatment, orthodontic appliances, and other visible tooth- or treatment-related findings.
+
+Include relevant findings even when they are not explicitly named above. If something is not reliable, mark it uncertain rather than guessing. Focus on findings instead of producing a long list of absent conditions.""",
             1024,
         ),
         _record(
             "broad_periapical_periodontal",
             "BROAD",
             "periapical_and_periodontal",
-            """Inspect the periodontal, alveolar-bone, root, furcation, and periapical regions throughout this panoramic radiograph.
-Report visible abnormalities and where they are approximately located. If a region cannot be assessed reliably, say so.
-Give the final concise findings inside <answer>...</answer>.""",
+            """Review the periodontal tissues, alveolar bone, roots, furcations, and periapical regions across the entire panoramic radiograph.
+
+Report all visible abnormalities in these structures and their approximate locations. Describe what is visibly abnormal without forcing a specific disease name when the appearance is not sufficiently clear.
+
+Include any relevant finding within this perspective, even if it was not explicitly mentioned in the instruction. Mark uncertain findings as uncertain.""",
             1024,
         ),
         _record(
             "broad_jaw_position_devices",
             "BROAD",
             "jaw_position_and_devices",
-            """Inspect this panoramic radiograph for jaw-bone abnormalities, eruption/position abnormalities, impacted teeth, root fragments, and visible orthodontic or surgical devices.
-Report only radiographically supported findings and their approximate locations. Put the concise final findings inside <answer>...</answer>.""",
+            """Review the jaw bones and other important structures visible on the entire panoramic radiograph.
+
+Report all visible jaw-bone abnormalities and other relevant abnormalities involving the maxilla, mandible, mandibular regions, maxillary sinus regions, condylar regions, or visible surgical hardware.
+
+Describe the visible abnormality and approximate location without forcing a specific diagnosis when the appearance is nonspecific. Include relevant findings even when they are not explicitly listed above.""",
             1024,
         ),
     ]
