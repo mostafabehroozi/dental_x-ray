@@ -161,7 +161,7 @@ class LLMOrchestrator:
         result["source_question_ids"] = expected_ids
         print_pipeline_event(
             f"DENTIST REPORT RESPONSE | provider={self.provider} | model={self.model}",
-            json.dumps(result, indent=2, ensure_ascii=False),
+            result["report"],
         )
         return result
 
