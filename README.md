@@ -1,6 +1,6 @@
-# DentalGPT-7B-1026 GGUF integration
+# Dental expert-model reporting pipeline
 
-This rewrite replaces the old Transformers/BitsAndBytes runner with a llama.cpp multimodal server.
+The pipeline treats the image-capable dental foundational model as a replaceable **dental expert model**. The current deployment uses DentalGPT through a llama.cpp multimodal server, but reporting and evaluation code do not depend on that model name or version.
 
 ## Runtime model pair
 
@@ -11,9 +11,14 @@ The model and projector are downloaded from `mradermacher/DentalGPT-7B-1026-GGUF
 
 ## Architecture
 
-`panoramic image -> llama.cpp + mmproj -> DentalGPT text observations -> Python pipeline -> optional text-only orchestrator`
+`panoramic image -> dental expert model -> multi-level text observations -> dentist-report synthesis -> evaluation adaptation`
 
-The DentalGPT layer never generates the final JSON schema directly. It stays close to its reasoning/text behavior; Python normalizes atomic `PRESENT/ABSENT/UNCERTAIN` answers and an optional stronger text model can format the final report.
+The expert-model layer answers independent broad, family, atomic, and location questions. Python preserves those source observations and normalizes atomic `PRESENT/ABSENT/UNCERTAIN` answers. When enabled, the text-only orchestrator runs two separate phases with the same configured model:
+
+1. **Dentist report:** comprehensively combines all useful supported content, removes redundancy, and preserves locations, uncertainty, conflicts, limitations, and relevant negative findings.
+2. **Evaluation adaptation report:** maps the completed dentist report into the closed evaluation ontology without changing deterministic atomic statuses.
+
+Neither orchestration phase receives the radiograph.
 
 ## Modes
 
@@ -25,7 +30,7 @@ The DentalGPT layer never generates the final JSON schema directly. It stays clo
 
 Run `main_notebook.ipynb`. It installs Python dependencies, builds llama.cpp for CUDA SM 60 (Tesla P100), downloads the two GGUF files, starts the local server, then constructs the pipeline.
 
-The optional external orchestrator is disabled by default so DentalGPT can be tested fully locally first.
+The optional external orchestrator is disabled by default so the expert-model stage can be tested fully locally first.
 
 For a lower-memory/faster development run, switch to `DentalGPT-7B-1026.Q4_K_M.gguf` + `DentalGPT-7B-1026.mmproj-Q8_0.gguf`.
 

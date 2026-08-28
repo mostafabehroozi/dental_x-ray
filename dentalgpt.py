@@ -8,13 +8,12 @@ from pathlib import Path
 from openai import OpenAI
 
 
-class DentalGPTRunner:
-    """Thin multimodal client for DentalGPT served by llama.cpp.
+class DentalExpertModelRunner:
+    """Thin multimodal client for the configured dental expert model.
 
-    The runner intentionally preserves the old project contract:
+    The implementation currently targets an OpenAI-compatible llama.cpp server, while
+    the role and public contract stay independent of the selected model:
         ask(image_path, question) -> dict
-
-    The pipeline therefore does not need to know that the model is GGUF.
     """
 
     def __init__(
@@ -113,3 +112,7 @@ class DentalGPTRunner:
             result["prompt_tokens"] = usage.prompt_tokens
             result["completion_tokens"] = usage.completion_tokens
         return result
+
+
+# Backward-compatible import for existing notebooks and downstream callers.
+DentalGPTRunner = DentalExpertModelRunner
