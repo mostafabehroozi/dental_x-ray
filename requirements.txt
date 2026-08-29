@@ -1,4 +1,6 @@
 huggingface_hub>=0.34
 openai>=1.100
+pillow>=10.0
 pydantic>=2.8
+PyYAML>=6.0
 requests>=2.32

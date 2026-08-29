@@ -35,3 +35,36 @@ The optional external orchestrator is disabled by default so the expert-model st
 For a lower-memory/faster development run, switch to `DentalGPT-7B-1026.Q4_K_M.gguf` + `DentalGPT-7B-1026.mmproj-Q8_0.gguf`.
 
 The notebook pins llama.cpp to `b10516` rather than building an arbitrary future `master`, because multimodal APIs are evolving quickly.
+
+## Offline benchmark evaluation
+
+`benchmark.py` loads a YOLO image/label split and converts its boxes into the stable
+14-condition ontology. `evaluation.py` then scores a directory containing one saved
+pipeline JSON per image. Metric calculation is deterministic; the existing
+`evaluation_adaptation_report` is used only as normalized prediction input.
+
+```python
+from benchmark import load_yolo_benchmark
+from evaluation import EvaluationConfig, evaluate_experiment
+
+benchmark = load_yolo_benchmark(
+    "/kaggle/input/dataset/images/test",
+    "/kaggle/input/dataset/labels/test",
+    data_yaml="/kaggle/input/dataset/data.yaml",
+)
+result = evaluate_experiment(
+    benchmark,
+    "/kaggle/working/experiment_broad_v1",
+    config=EvaluationConfig(),
+    experiment_metadata={"name": "broad_v1"},
+    output_path="/kaggle/working/experiment_broad_v1/evaluation_results.json",
+)
+```
+
+Finding evaluation is enabled by default and location evaluation is disabled. Set
+`evaluate_location=True`, choose level 1 or 2, and select `location_adapters` as
+`("geometry",)`, `("vision",)`, or both. Vision-derived benchmark locations must be
+prepared with `prepare_vision_location_cache`; the notebook's optional Cell 16 shows
+both the external multimodal-LLM and dental expert-model resolver paths. Keep each
+prompt/system variant in a separate prediction directory, then use
+`compare_experiments()` on their saved evaluation result files.
