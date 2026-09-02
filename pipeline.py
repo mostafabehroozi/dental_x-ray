@@ -120,6 +120,52 @@ class LLMOrchestrator:
         self.dentist_report_type = DentistReport
         self.evaluation_adaptation_type = EvaluationAdaptationReport
 
+    def ask(
+        self,
+        input_data,
+        prompt: str,
+        max_tokens: int | None = None,
+        temperature: float = 0.0,
+    ) -> dict:
+        """Run one editable text-only research prompt without the production schema."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string.")
+
+        if isinstance(input_data, str):
+            user_content = input_data
+        else:
+            user_content = json.dumps(
+                input_data,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+
+        request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": prompt.strip()},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
+
+        started = time.perf_counter()
+        completion = self.client.chat.completions.create(**request)
+        message = completion.choices[0].message
+        usage = getattr(completion, "usage", None)
+
+        return {
+            "raw_answer": (message.content or "").strip(),
+            "latency_seconds": round(time.perf_counter() - started, 3),
+            "finish_reason": getattr(completion.choices[0], "finish_reason", None),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "model": getattr(completion, "model", self.model),
+        }
+
     def _parse(self, system_prompt: str, payload: dict, response_format):
         completion = self.client.chat.completions.parse(
             model=self.model,
