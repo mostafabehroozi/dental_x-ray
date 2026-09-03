@@ -5,7 +5,12 @@ import mimetypes
 import time
 from pathlib import Path
 
-from openai import OpenAI
+
+
+def _openai_client(**kwargs):
+    from openai import OpenAI
+
+    return OpenAI(**kwargs)
 
 
 class DentalExpertModelRunner:
@@ -36,7 +41,7 @@ class DentalExpertModelRunner:
         self.top_p = top_p
         self.seed = seed
         self.cache_prompt = cache_prompt
-        self.client = OpenAI(
+        self.client = _openai_client(
             base_url=f"{self.base_url}/v1",
             api_key="local-llama-cpp",
             timeout=timeout,
@@ -104,6 +109,81 @@ class DentalExpertModelRunner:
 
         result = {
             "raw_answer": answer,
+            "latency_seconds": round(latency, 3),
+            "finish_reason": choice.finish_reason,
+            "truncated": choice.finish_reason == "length",
+        }
+        if usage is not None:
+            result["prompt_tokens"] = usage.prompt_tokens
+            result["completion_tokens"] = usage.completion_tokens
+        return result
+
+
+class LLMVisionAnalysisRunner:
+    """Use an OpenAI-compatible multimodal LLM API as the dental expert model."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        max_tokens: int = 768,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        timeout: float = 600.0,
+        max_retries: int = 2,
+    ):
+        client_kwargs = {
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if api_key:
+            client_kwargs["api_key"] = api_key
+
+        self.client = _openai_client(**client_kwargs)
+        self.model = model
+        self.model_id = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+    def ask(
+        self,
+        image_path: str,
+        question: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> dict:
+        image_uri = DentalExpertModelRunner._image_data_uri(image_path)
+        request = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_uri}},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+            "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
+            "temperature": (
+                temperature if temperature is not None else self.temperature
+            ),
+            "top_p": self.top_p,
+        }
+
+        started = time.perf_counter()
+        response = self.client.chat.completions.create(**request)
+        latency = time.perf_counter() - started
+        choice = response.choices[0]
+        usage = getattr(response, "usage", None)
+
+        result = {
+            "raw_answer": (choice.message.content or "").strip(),
             "latency_seconds": round(latency, 3),
             "finish_reason": choice.finish_reason,
             "truncated": choice.finish_reason == "length",

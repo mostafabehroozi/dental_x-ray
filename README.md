@@ -1,6 +1,6 @@
 # Dental expert-model reporting pipeline
 
-The pipeline treats the image-capable dental foundational model as a replaceable **dental expert model**. The current deployment uses DentalGPT through a llama.cpp multimodal server, but reporting and evaluation code do not depend on that model name or version.
+The pipeline treats the image-capable dental foundational model as a replaceable **dental expert model**. It can use DentalGPT through a local llama.cpp multimodal server or an OpenAI-compatible multimodal LLM API. Reporting and evaluation code do not depend on the selected backend.
 
 ## Runtime model pair
 
@@ -11,7 +11,7 @@ The model and projector are downloaded from `mradermacher/DentalGPT-7B-1026-GGUF
 
 ## Architecture
 
-`panoramic image -> dental expert model -> multi-level text observations -> dentist-report synthesis -> evaluation adaptation`
+`panoramic image -> local DentalGPT or multimodal LLM API -> multi-level text observations -> dentist-report synthesis -> evaluation adaptation`
 
 The expert-model layer answers independent broad, family, atomic, and location questions. Python preserves those source observations and normalizes atomic `PRESENT/ABSENT/UNCERTAIN` answers. When enabled, the text-only orchestrator runs two separate phases with the same configured model:
 
@@ -28,7 +28,7 @@ Neither orchestration phase receives the radiograph.
 
 ## Kaggle
 
-Run `main_notebook.ipynb`. It installs Python dependencies, builds llama.cpp for CUDA SM 60 (Tesla P100), downloads the two GGUF files, starts the local server, then constructs the pipeline.
+Run `main_notebook.ipynb`. Keep `EXPERT_MODEL_BACKEND = "LOCAL"` for DentalGPT, or set it to `"API"` and configure `EXPERT_API_MODEL`, `EXPERT_API_BASE_URL`, and `EXPERT_API_KEY`. The API route sends the image and the same analysis questions directly to the configured multimodal model and skips all llama.cpp/GGUF setup cells.
 
 The optional external orchestrator is disabled by default so the expert-model stage can be tested fully locally first.
 
