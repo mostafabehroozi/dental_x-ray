@@ -7,12 +7,29 @@ import mimetypes
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
+from openai_compat import create_openai_client
 from prompts import CONDITIONS
 
 
 YOLO_CLASS_TO_CONDITION = {index: condition for index, condition in enumerate(CONDITIONS)}
+YOLO_CLASS_NAMES = {
+    0: "Implant (IMP)",
+    1: "Prosthetic restoration (PRR)",
+    2: "Obturation/Filling (OBT)",
+    3: "Endodontic treatment/Root canal treatment (END)",
+    4: "Carious lesion/Caries (CAR)",
+    5: "Bone resorption/Bone loss (BON)",
+    6: "Impacted tooth (IMT)",
+    7: "Apical periodontitis/Periapical lesion (API)",
+    8: "Root fragment/Residual root (ROT)",
+    9: "Furcation lesion (FUR)",
+    10: "Apical surgery (APS)",
+    11: "Root resorption (ROR)",
+    12: "Orthodontic device (ORD)",
+    13: "Surgical device (SRD)",
+}
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 LOCATION_VALUES = {
@@ -141,6 +158,43 @@ def validate_dataset_yaml(data_yaml: str | Path) -> None:
             mismatches.append(f"{class_id}: {indexed_names[class_id]!r} != {expected!r}")
     if mismatches:
         raise ValueError("YOLO class order does not match the project ontology: " + "; ".join(mismatches))
+
+
+def count_yolo_class_instances(
+    label_file_path: str | Path,
+    class_names: Mapping[int, str] = YOLO_CLASS_NAMES,
+) -> dict[str, int]:
+    """Count repeated YOLO rows by class without interpreting box geometry."""
+    label_path = Path(label_file_path)
+    if not label_path.is_file():
+        raise FileNotFoundError(label_path)
+
+    counts = {name: 0 for name in class_names.values()}
+    for line_number, raw_line in enumerate(
+        label_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 5:
+            raise ValueError(
+                f"{label_path}:{line_number} must contain: "
+                "class_id x_center y_center width height"
+            )
+        try:
+            class_id = int(parts[0])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid class ID at {label_path}:{line_number}"
+            ) from exc
+        if class_id not in class_names:
+            raise ValueError(
+                f"Unknown class ID {class_id} at {label_path}:{line_number}. "
+                f"Expected one of {sorted(class_names)}."
+            )
+        counts[class_names[class_id]] += 1
+    return counts
 
 
 def _parse_label_file(label_path: Path, image_id: str) -> tuple[YoloBox, ...]:
@@ -331,17 +385,15 @@ class VisionLocationResolver:
         max_retries: int = 2,
         max_tokens: int = 2048,
     ) -> "VisionLocationResolver":
-        from openai import OpenAI
-
-        kwargs: dict[str, Any] = {"timeout": timeout, "max_retries": max_retries}
-        if base_url:
-            kwargs["base_url"] = base_url
-        if api_key:
-            kwargs["api_key"] = api_key
         return cls(
             backend="llm",
             model=model,
-            client=OpenAI(**kwargs),
+            client=create_openai_client(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+                max_retries=max_retries,
+            ),
             max_tokens=max_tokens,
         )
 

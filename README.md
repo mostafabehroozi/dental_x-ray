@@ -13,7 +13,7 @@ The model and projector are downloaded from `mradermacher/DentalGPT-7B-1026-GGUF
 
 `panoramic image -> local DentalGPT or multimodal LLM API -> multi-level text observations -> dentist-report synthesis -> evaluation adaptation`
 
-The expert-model layer answers independent broad, family, atomic, and location questions. Python preserves those source observations and normalizes atomic `PRESENT/ABSENT/UNCERTAIN` answers. When enabled, the text-only orchestrator runs two separate phases with the same configured model:
+The expert-model layer answers independent broad, family, atomic, and location questions. Python preserves those source observations and normalizes atomic `PRESENT/ABSENT/UNCERTAIN` answers. When enabled, text-only models run two separate phases. The adapter can reuse the orchestrator or use another configured API model:
 
 1. **Dentist report:** comprehensively combines all useful supported content, removes redundancy, and preserves locations, uncertainty, conflicts, limitations, and relevant negative findings.
 2. **Evaluation adaptation report:** maps the completed dentist report into the closed evaluation ontology without changing deterministic atomic statuses.
@@ -28,7 +28,7 @@ Neither orchestration phase receives the radiograph.
 
 ## Kaggle
 
-Run `main_notebook.ipynb`. Keep `EXPERT_MODEL_BACKEND = "LOCAL"` for DentalGPT, or set it to `"API"` and configure `EXPERT_API_MODEL`, `EXPERT_API_BASE_URL`, and `EXPERT_API_KEY`. The API route sends the image and the same analysis questions directly to the configured multimodal model and skips all llama.cpp/GGUF setup cells.
+Run `main_notebook.ipynb` and edit Cell 3 only. Each API provider keeps its `base_url` and `api_key` together in `PROVIDERS`. Each model role has one configuration: use `{"backend": "local", "model": "DentalGPT", "preset": "QUALITY"}` for DentalGPT, or `{"backend": "api", "provider": "provider-name", "model": "model-name"}` for an API model. Set an optional role to `None` to disable it. An API analyzer sends the image and the same analysis questions directly to the configured multimodal model and skips all llama.cpp/GGUF setup cells.
 
 The optional external orchestrator is disabled by default so the expert-model stage can be tested fully locally first.
 

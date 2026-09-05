@@ -4,9 +4,11 @@ import json
 import re
 import time
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from openai_compat import create_openai_client
 from prompts import (
     CONDITIONS,
     DENTIST_REPORT_SYSTEM_PROMPT,
@@ -46,8 +48,58 @@ def parse_atomic_status(text: str) -> str:
     return "UNCERTAIN"
 
 
-class LLMOrchestrator:
-    """Optional text-only model for report synthesis and evaluation adaptation."""
+@lru_cache(maxsize=1)
+def _text_model_schema_types():
+    """Create the optional Pydantic response schemas once, on first use."""
+    from pydantic import BaseModel, ConfigDict
+
+    class Location(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        distribution: str | None
+        arch: str | None
+        side: str | None
+        area: str | None
+        relation: str | None
+        fdi_tooth: str | None
+
+    class Finding(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        condition: Literal[
+            "dental_implant",
+            "prosthetic_restoration",
+            "dental_filling",
+            "endodontic_treatment",
+            "carious_lesion",
+            "periodontal_bone_loss",
+            "impacted_tooth",
+            "periapical_lesion",
+            "root_fragment",
+            "furcation_lesion",
+            "apical_surgery",
+            "root_resorption",
+            "orthodontic_device",
+            "surgical_device",
+        ]
+        status: Literal["PRESENT", "ABSENT", "UNCERTAIN"]
+        evidence: str
+        location: Location
+        conflict: str | None
+
+    class DentistReport(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        report: str
+        source_question_ids: list[str]
+
+    class EvaluationAdaptationReport(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        findings: list[Finding]
+        adaptation_notes: str
+
+    return DentistReport, EvaluationAdaptationReport
+
+
+class LLMTextModel:
+    """OpenAI-compatible text model used as orchestrator and/or adapter."""
 
     def __init__(
         self,
@@ -58,62 +110,13 @@ class LLMOrchestrator:
         timeout: float | None = 600,
         max_retries: int | None = 2,
     ):
-        from openai import OpenAI
-        from pydantic import BaseModel, ConfigDict
-
-        class Location(BaseModel):
-            model_config = ConfigDict(extra="forbid")
-            distribution: str | None
-            arch: str | None
-            side: str | None
-            area: str | None
-            relation: str | None
-            fdi_tooth: str | None
-
-        class Finding(BaseModel):
-            model_config = ConfigDict(extra="forbid")
-            condition: Literal[
-                "dental_implant",
-                "prosthetic_restoration",
-                "dental_filling",
-                "endodontic_treatment",
-                "carious_lesion",
-                "periodontal_bone_loss",
-                "impacted_tooth",
-                "periapical_lesion",
-                "root_fragment",
-                "furcation_lesion",
-                "apical_surgery",
-                "root_resorption",
-                "orthodontic_device",
-                "surgical_device",
-            ]
-            status: Literal["PRESENT", "ABSENT", "UNCERTAIN"]
-            evidence: str
-            location: Location
-            conflict: str | None
-
-        class DentistReport(BaseModel):
-            model_config = ConfigDict(extra="forbid")
-            report: str
-            source_question_ids: list[str]
-
-        class EvaluationAdaptationReport(BaseModel):
-            model_config = ConfigDict(extra="forbid")
-            findings: list[Finding]
-            adaptation_notes: str
-
-        client_kwargs = {}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        if timeout is not None:
-            client_kwargs["timeout"] = timeout
-        if max_retries is not None:
-            client_kwargs["max_retries"] = max_retries
-
-        self.client = OpenAI(**client_kwargs)
+        DentistReport, EvaluationAdaptationReport = _text_model_schema_types()
+        self.client = create_openai_client(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
         self.model = model
         self.base_url = base_url
         self.provider = provider
@@ -276,7 +279,12 @@ class LLMOrchestrator:
         }
 
 
-OpenAIOrchestrator = LLMOrchestrator
+# Compatibility aliases retained for existing notebooks and downstream callers.
+LLMOrchestrator = LLMTextModel
+OpenAIOrchestrator = LLMTextModel
+
+
+_USE_ORCHESTRATOR_AS_ADAPTER = object()
 
 
 class DentalAnalysisPipeline:
@@ -286,6 +294,7 @@ class DentalAnalysisPipeline:
         orchestrator=None,
         locate_uncertain: bool = True,
         *,
+        adapter=_USE_ORCHESTRATOR_AS_ADAPTER,
         dental_runner=None,
     ):
         # dental_runner remains accepted so older notebooks keep working, but the
@@ -296,6 +305,11 @@ class DentalAnalysisPipeline:
         if self.expert_model_runner is None:
             raise ValueError("expert_model_runner is required.")
         self.orchestrator = orchestrator
+        self.adapter = (
+            orchestrator if adapter is _USE_ORCHESTRATOR_AS_ADAPTER else adapter
+        )
+        if self.adapter is not None and self.orchestrator is None:
+            raise ValueError("adapter requires orchestrator because it adapts the dentist report.")
         self.locate_uncertain = locate_uncertain
 
     def _ask_records(self, image_path: str, records: list[dict]) -> list[dict]:
@@ -376,11 +390,16 @@ class DentalAnalysisPipeline:
                     observations += self._ask_records(image_path, location_records(condition))
 
         atomic_statuses = self._atomic_status_map(observations)
-        orchestration = (
-            self.orchestrator.run(mode, observations, atomic_statuses)
-            if self.orchestrator
-            else None
-        )
+        dentist_report = None
+        evaluation_adaptation_report = None
+        if self.orchestrator:
+            dentist_report = self.orchestrator.create_dentist_report(mode, observations)
+            if self.adapter:
+                evaluation_adaptation_report = self.adapter.create_evaluation_adaptation_report(
+                    mode,
+                    dentist_report,
+                    atomic_statuses,
+                )
 
         result = {
             "analysis_mode": mode,
@@ -390,10 +409,8 @@ class DentalAnalysisPipeline:
             "total_latency_seconds": round(time.perf_counter() - started, 3),
             "deterministic_atomic_statuses": atomic_statuses,
             "observations": observations,
-            "dentist_report": orchestration["dentist_report"] if orchestration else None,
-            "evaluation_adaptation_report": (
-                orchestration["evaluation_adaptation_report"] if orchestration else None
-            ),
+            "dentist_report": dentist_report,
+            "evaluation_adaptation_report": evaluation_adaptation_report,
         }
 
         out_dir = Path(output_dir)

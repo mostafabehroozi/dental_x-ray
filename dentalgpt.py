@@ -5,12 +5,12 @@ import mimetypes
 import time
 from pathlib import Path
 
+from openai_compat import create_openai_client, vision_completion_result
 
 
 def _openai_client(**kwargs):
-    from openai import OpenAI
-
-    return OpenAI(**kwargs)
+    """Backward-compatible test seam for constructing the shared API client."""
+    return create_openai_client(**kwargs)
 
 
 class DentalExpertModelRunner:
@@ -101,22 +101,7 @@ class DentalExpertModelRunner:
                 "cache_prompt": self.cache_prompt,
             },
         )
-        latency = time.perf_counter() - started
-
-        choice = response.choices[0]
-        answer = (choice.message.content or "").strip()
-        usage = getattr(response, "usage", None)
-
-        result = {
-            "raw_answer": answer,
-            "latency_seconds": round(latency, 3),
-            "finish_reason": choice.finish_reason,
-            "truncated": choice.finish_reason == "length",
-        }
-        if usage is not None:
-            result["prompt_tokens"] = usage.prompt_tokens
-            result["completion_tokens"] = usage.completion_tokens
-        return result
+        return vision_completion_result(response, time.perf_counter() - started)
 
 
 class LLMVisionAnalysisRunner:
@@ -178,20 +163,7 @@ class LLMVisionAnalysisRunner:
 
         started = time.perf_counter()
         response = self.client.chat.completions.create(**request)
-        latency = time.perf_counter() - started
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
-
-        result = {
-            "raw_answer": (choice.message.content or "").strip(),
-            "latency_seconds": round(latency, 3),
-            "finish_reason": choice.finish_reason,
-            "truncated": choice.finish_reason == "length",
-        }
-        if usage is not None:
-            result["prompt_tokens"] = usage.prompt_tokens
-            result["completion_tokens"] = usage.completion_tokens
-        return result
+        return vision_completion_result(response, time.perf_counter() - started)
 
 
 # Backward-compatible import for existing notebooks and downstream callers.
