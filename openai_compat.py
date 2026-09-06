@@ -38,4 +38,7 @@ def vision_completion_result(response, latency_seconds: float) -> dict[str, Any]
     if usage is not None:
         result["prompt_tokens"] = usage.prompt_tokens
         result["completion_tokens"] = usage.completion_tokens
+    for field in ("model", "id"):
+        if getattr(response, field, None) is not None:
+            result[f"response_{field}"] = getattr(response, field)
     return result

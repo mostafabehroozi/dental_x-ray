@@ -32,6 +32,8 @@ class DentalExpertModelRunner:
         seed: int = 0,
         timeout: float = 600.0,
         cache_prompt: bool = False,
+        max_retries: int = 1,
+        omit_parameters: tuple[str, ...] = (),
     ):
         self.base_url = base_url.rstrip("/")
         self.api_model = api_model
@@ -41,11 +43,14 @@ class DentalExpertModelRunner:
         self.top_p = top_p
         self.seed = seed
         self.cache_prompt = cache_prompt
+        self.omit_parameters = tuple(omit_parameters)
+        if set(omit_parameters) - {"temperature", "top_p", "seed"}:
+            raise ValueError("Only sampling parameters can be omitted")
         self.client = _openai_client(
             base_url=f"{self.base_url}/v1",
             api_key="local-llama-cpp",
             timeout=timeout,
-            max_retries=1,
+            max_retries=max_retries,
         )
 
     @staticmethod
@@ -78,7 +83,7 @@ class DentalExpertModelRunner:
         seed = seed if seed is not None else self.seed
 
         started = time.perf_counter()
-        response = self.client.chat.completions.create(
+        request = dict(
             model=self.api_model,
             messages=[
                 {
@@ -101,7 +106,12 @@ class DentalExpertModelRunner:
                 "cache_prompt": self.cache_prompt,
             },
         )
-        return vision_completion_result(response, time.perf_counter() - started)
+        for parameter in self.omit_parameters:
+            request.pop(parameter, None)
+        response = self.client.chat.completions.create(**request)
+        result = vision_completion_result(response, time.perf_counter() - started)
+        result["effective_request_settings"] = {k: v for k, v in request.items() if k != "messages"}
+        return result
 
 
 class LLMVisionAnalysisRunner:
@@ -117,6 +127,9 @@ class LLMVisionAnalysisRunner:
         top_p: float = 1.0,
         timeout: float = 600.0,
         max_retries: int = 2,
+        omit_parameters: tuple[str, ...] = (),
+        token_limit_parameter: str = "max_tokens",
+        request_options: dict | None = None,
     ):
         client_kwargs = {
             "timeout": timeout,
@@ -133,6 +146,13 @@ class LLMVisionAnalysisRunner:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.omit_parameters = tuple(omit_parameters)
+        if token_limit_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("Unsupported token_limit_parameter")
+        self.token_limit_parameter = token_limit_parameter
+        self.request_options = dict(request_options or {})
+        if set(self.request_options) & {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stream"}:
+            raise ValueError("request_options cannot override model, messages, generation settings or streaming")
 
     def ask(
         self,
@@ -161,9 +181,17 @@ class LLMVisionAnalysisRunner:
             "top_p": self.top_p,
         }
 
+        request[self.token_limit_parameter] = request.pop("max_tokens")
+        request.update(self.request_options)
+        for parameter in self.omit_parameters:
+            if parameter not in {"temperature", "top_p", "seed"}:
+                raise ValueError(f"Cannot omit {parameter}")
+            request.pop(parameter, None)
         started = time.perf_counter()
         response = self.client.chat.completions.create(**request)
-        return vision_completion_result(response, time.perf_counter() - started)
+        result = vision_completion_result(response, time.perf_counter() - started)
+        result["effective_request_settings"] = {k: v for k, v in request.items() if k != "messages"}
+        return result
 
 
 # Backward-compatible import for existing notebooks and downstream callers.

@@ -2,6 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+import os
+
+
+def credentials(provider):
+    """Resolve a provider credential without including it in saved configuration."""
+    if provider.get("api_key"):
+        return provider["api_key"]
+    if provider.get("api_key_env") and os.environ.get(provider["api_key_env"]):
+        return os.environ[provider["api_key_env"]]
+    if provider.get("api_key_secret"):
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(provider["api_key_secret"])
+    raise ValueError("Provider credential is missing; set api_key, api_key_env, or api_key_secret")
 
 
 class ModelRouting:
@@ -21,12 +34,7 @@ class ModelRouting:
         return self.provider(provider_name).get("base_url")
 
     def provider_api_key(self, provider_name: str) -> str:
-        api_key = self.provider(provider_name).get("api_key")
-        if not api_key:
-            raise ValueError(
-                f"The API key for provider {provider_name!r} is not configured."
-            )
-        return str(api_key)
+        return str(credentials(self.provider(provider_name)))
 
     @staticmethod
     def model_backend(model_config: Mapping[str, Any], usage_name: str) -> str:

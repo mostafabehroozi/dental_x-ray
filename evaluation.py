@@ -11,6 +11,113 @@ from benchmark import LOCATION_VALUES, GeometryThresholds, YoloBenchmark, geomet
 from prompts import CONDITIONS
 
 
+def evaluate_research_suite(results, output_dir=None):
+    """Presence confusion and count agreement, grouped by experiment and strategy."""
+    from benchmark import count_yolo_class_instances, YOLO_CLASS_TO_CONDITION
+    from research_experiments import save_json
+    import pandas as pd
+
+    def divide(a, b):
+        return a / b if b else None
+
+    def metrics(row):
+        tp, tn, fp, fn = (row[k] for k in ("TP", "TN", "FP", "FN"))
+        return {"precision": divide(tp, tp + fp), "recall": divide(tp, tp + fn),
+                "f1": divide(2 * tp, 2 * tp + fp + fn),
+                "accuracy": divide(tp + tn, tp + tn + fp + fn),
+                "count_mae": divide(row["absolute_error"], row["finding_cases"]),
+                "exact_count_accuracy": divide(row["exact_counts"], row["finding_cases"])}
+
+    per_image, per_finding, grouped = [], [], {}
+    sums = ["TP", "TN", "FP", "FN", "matched_count", "excess_count", "missed_count",
+            "absolute_error", "exact_counts", "finding_cases", "completed_images", "model_calls",
+            "retry_calls", "fallback_template_calls", "forced_zero_checks", "completed_checks",
+            "format_failures", "operational_failures", "truncations", "interrupted_calls", "latency_seconds"]
+    for result in results:
+        strategy, model = result["strategy"], result["model"]
+        row = {"experiment_id": result["experiment_id"], "strategy_id": result["strategy_id"],
+               "image_id": result["image"]["id"], "model": model["model"],
+               "provider": model.get("provider", "local"), "backend": model["backend"],
+               "protocol": result["settings"]["atomic_protocol"] if strategy["mode"] == "atomic" else "broad",
+               "template": strategy["template_id"], "region_level": strategy["location_mode"],
+               "finding_group": strategy["finding_group"], "status": result["status"],
+               **dict.fromkeys(sums, 0)}
+        attempts = result["attempts"]
+        row.update(model_calls=len(attempts), retry_calls=sum(a.get("retry", False) for a in attempts),
+                   fallback_template_calls=sum(a.get("fallback_template", False) for a in attempts),
+                   format_failures=sum(a.get("failure_type") == "format" for a in attempts),
+                   operational_failures=sum(a.get("failure_type") == "operational" for a in attempts),
+                   truncations=sum(a.get("error") == "truncated_output" for a in attempts),
+                   interrupted_calls=sum(a.get("status") in {"started", "interrupted"} for a in attempts),
+                   latency_seconds=sum(a.get("latency_seconds", 0) for a in attempts))
+        for token in ("prompt_tokens", "completion_tokens"):
+            values = [a.get("response", {}).get(token) for a in attempts]
+            row[token] = sum(values) if values and all(v is not None for v in values) else None
+        prices = model.get("prices_per_million", {})
+        row["estimated_cost"] = (
+            (row["prompt_tokens"] * prices["input"] + row["completion_tokens"] * prices["output"]) / 1e6
+            if model["backend"] == "api" and all(row[k] is not None for k in ("prompt_tokens", "completion_tokens"))
+            and all(k in prices for k in ("input", "output")) else None)
+        if result["status"] == "completed":
+            image = result["image"]
+            import hashlib
+            if hashlib.sha256(Path(image["label_path"]).read_bytes()).hexdigest() != image["label_path_hash"]:
+                raise ValueError("Ground truth changed since inference")
+            truth = count_yolo_class_instances(image["label_path"], YOLO_CLASS_TO_CONDITION)
+            prediction = result["prediction_counts_by_condition"]
+            if set(prediction) != set(result["conditions"]):
+                raise ValueError("Incomplete finding group")
+            row["completed_images"] = 1
+            row["completed_checks"] = len(result["checks"])
+            row["forced_zero_checks"] = sum(c["forced_zero"] for c in result["checks"])
+            for condition in result["conditions"]:
+                t, p = truth[condition], prediction[condition]
+                if type(p) is not int or p < 0:
+                    raise ValueError("Invalid saved prediction count")
+                scores = {"TP": int(t > 0 and p > 0), "TN": int(t == 0 and p == 0),
+                          "FP": int(t == 0 and p > 0), "FN": int(t > 0 and p == 0),
+                          "matched_count": min(t, p), "excess_count": max(p-t, 0),
+                          "missed_count": max(t-p, 0), "absolute_error": abs(t-p),
+                          "exact_counts": int(t == p), "finding_cases": 1}
+                per_finding.append({"experiment_id": row["experiment_id"], "strategy_id": row["strategy_id"],
+                                    "image_id": row["image_id"], "finding": condition,
+                                    "ground_truth_count": t, "predicted_count": p, **scores})
+                for key, value in scores.items():
+                    row[key] += value
+        row.update(metrics(row))
+        per_image.append(row)
+        key = (row["experiment_id"], row["strategy_id"])
+        if key not in grouped:
+            grouped[key] = {k: v for k, v in row.items() if k not in {"image_id", "status"}}
+            grouped[key].update({k: 0 for k in sums})
+            grouped[key].update(planned_images=0, failed_images=0, completed_image_ids=[],
+                                prompt_tokens=0, completion_tokens=0, estimated_cost=0)
+        total = grouped[key]
+        total["planned_images"] += 1
+        total["failed_images"] += result["status"] == "failed"
+        if result["status"] == "completed":
+            total["completed_image_ids"].append(row["image_id"])
+        for field in sums:
+            total[field] += row[field]
+        for field in ("prompt_tokens", "completion_tokens", "estimated_cost"):
+            total[field] = total[field] + row[field] if total[field] is not None and row[field] is not None else None
+    summary = list(grouped.values())
+    coverage_sets = {tuple(sorted(r["completed_image_ids"])) for r in summary}
+    for row in summary:
+        row.update(metrics(row), coverage=divide(row["completed_images"], row["planned_images"]),
+                   forced_zero_rate=divide(row["forced_zero_checks"], row["completed_checks"]),
+                   unequal_image_coverage=len(coverage_sets) > 1)
+    report = {"summary": summary, "per_image": per_image, "per_finding": per_finding}
+    if output_dir:
+        directory = Path(output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, rows in report.items():
+            pd.DataFrame(rows).to_csv(directory / f"{name}.csv", index=False)
+        save_json(directory / "evaluation.json", report)
+        save_json(directory / "full_results.json", results)
+    return report
+
+
 VALID_STATUSES = {"PRESENT", "ABSENT", "UNCERTAIN"}
 DEFAULT_COMPARISON_METRICS = (
     "overall_metrics.micro_recall",
