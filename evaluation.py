@@ -32,17 +32,27 @@ def evaluate_research_suite(results, output_dir=None):
     sums = ["TP", "TN", "FP", "FN", "matched_count", "excess_count", "missed_count",
             "absolute_error", "exact_counts", "finding_cases", "completed_images", "model_calls",
             "retry_calls", "fallback_template_calls", "forced_zero_checks", "completed_checks",
-            "format_failures", "operational_failures", "truncations", "interrupted_calls", "latency_seconds"]
+            "format_failures", "operational_failures", "truncations", "interrupted_calls", "latency_seconds",
+            "analyzer_calls", "adapter_calls", "adapter_unresolved_findings", "adapter_fallback_images"]
     for result in results:
         strategy, model = result["strategy"], result["model"]
+        adapter = result.get("adapter")
         row = {"experiment_id": result["experiment_id"], "strategy_id": result["strategy_id"],
                "image_id": result["image"]["id"], "model": model["model"],
                "provider": model.get("provider", "local"), "backend": model["backend"],
+               "adapter_model": adapter["model"]["model"] if adapter else None,
+               "adapter_provider": adapter["model"]["provider"] if adapter else None,
+               "output_format": strategy.get("output_format", "structured"),
+               "prompt_profile": result.get("prompt_profile", "legacy/dentalgpt"),
                "protocol": result["settings"]["atomic_protocol"] if strategy["mode"] == "atomic" else "broad",
                "template": strategy["template_id"], "region_level": strategy["location_mode"],
                "finding_group": strategy["finding_group"], "status": result["status"],
                **dict.fromkeys(sums, 0)}
         attempts = result["attempts"]
+        row.update(analyzer_calls=sum(a.get("role", "analyzer") == "analyzer" for a in attempts),
+                   adapter_calls=sum(a.get("role") == "adapter" for a in attempts),
+                   adapter_unresolved_findings=len(result.get("adapter_unresolved_conditions", [])),
+                   adapter_fallback_images=int(result.get("adapter_fallback", False)))
         row.update(model_calls=len(attempts), retry_calls=sum(a.get("retry", False) for a in attempts),
                    fallback_template_calls=sum(a.get("fallback_template", False) for a in attempts),
                    format_failures=sum(a.get("failure_type") == "format" for a in attempts),
@@ -53,11 +63,15 @@ def evaluate_research_suite(results, output_dir=None):
         for token in ("prompt_tokens", "completion_tokens"):
             values = [a.get("response", {}).get(token) for a in attempts]
             row[token] = sum(values) if values and all(v is not None for v in values) else None
-        prices = model.get("prices_per_million", {})
-        row["estimated_cost"] = (
-            (row["prompt_tokens"] * prices["input"] + row["completion_tokens"] * prices["output"]) / 1e6
-            if model["backend"] == "api" and all(row[k] is not None for k in ("prompt_tokens", "completion_tokens"))
-            and all(k in prices for k in ("input", "output")) else None)
+        costs = []
+        for attempt in attempts:
+            billing_model = adapter["model"] if attempt.get("role") == "adapter" else model
+            prices = billing_model.get("prices_per_million", {})
+            usage = attempt.get("response", {})
+            costs.append((usage["prompt_tokens"] * prices["input"] + usage["completion_tokens"] * prices["output"]) / 1e6
+                         if billing_model["backend"] == "api" and all(k in prices for k in ("input", "output"))
+                         and all(usage.get(k) is not None for k in ("prompt_tokens", "completion_tokens")) else None)
+        row["estimated_cost"] = sum(costs) if costs and all(c is not None for c in costs) else None
         if result["status"] == "completed":
             image = result["image"]
             import hashlib
@@ -81,6 +95,7 @@ def evaluate_research_suite(results, output_dir=None):
                           "exact_counts": int(t == p), "finding_cases": 1}
                 per_finding.append({"experiment_id": row["experiment_id"], "strategy_id": row["strategy_id"],
                                     "image_id": row["image_id"], "finding": condition,
+                                    "adapter_unresolved": condition in result.get("adapter_unresolved_conditions", []),
                                     "ground_truth_count": t, "predicted_count": p, **scores})
                 for key, value in scores.items():
                     row[key] += value

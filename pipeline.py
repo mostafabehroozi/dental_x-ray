@@ -8,7 +8,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from openai_compat import create_openai_client
+from openai_compat import (
+    APICallController,
+    DEFAULT_API_CALL_DELAY_SECONDS,
+    DEFAULT_API_CALL_MAX_RETRIES,
+    create_openai_client,
+)
 from prompts import (
     CONDITIONS,
     DENTIST_REPORT_SYSTEM_PROMPT,
@@ -108,18 +113,27 @@ class LLMTextModel:
         api_key: str | None = None,
         provider: str = "openai",
         timeout: float | None = 600,
-        max_retries: int | None = 2,
+        max_retries: int = DEFAULT_API_CALL_MAX_RETRIES,
+        api_call_delay_seconds: float = DEFAULT_API_CALL_DELAY_SECONDS,
+        log_api_calls: bool = True,
     ):
         DentistReport, EvaluationAdaptationReport = _text_model_schema_types()
         self.client = create_openai_client(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout,
-            max_retries=max_retries,
+            max_retries=0,
         )
         self.model = model
         self.base_url = base_url
         self.provider = provider
+        self.api_calls = APICallController(
+            provider=provider,
+            model=model,
+            delay_seconds=api_call_delay_seconds,
+            max_retries=max_retries,
+            log_calls=log_api_calls,
+        )
         self.dentist_report_type = DentistReport
         self.evaluation_adaptation_type = EvaluationAdaptationReport
 
@@ -156,7 +170,10 @@ class LLMTextModel:
             request["max_tokens"] = max_tokens
 
         started = time.perf_counter()
-        completion = self.client.chat.completions.create(**request)
+        completion = self.api_calls.call(
+            lambda: self.client.chat.completions.create(**request),
+            "chat.completions.create",
+        )
         message = completion.choices[0].message
         usage = getattr(completion, "usage", None)
 
@@ -170,13 +187,16 @@ class LLMTextModel:
         }
 
     def _parse(self, system_prompt: str, payload: dict, response_format):
-        completion = self.client.chat.completions.parse(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            response_format=response_format,
+        completion = self.api_calls.call(
+            lambda: self.client.chat.completions.parse(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format=response_format,
+            ),
+            "chat.completions.parse",
         )
         parsed = completion.choices[0].message.parsed
         if parsed is None:

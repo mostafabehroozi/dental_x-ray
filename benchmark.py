@@ -9,7 +9,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from openai_compat import create_openai_client
+from openai_compat import (
+    APICallController,
+    DEFAULT_API_CALL_DELAY_SECONDS,
+    DEFAULT_API_CALL_MAX_RETRIES,
+    create_openai_client,
+)
 from prompts import CONDITIONS
 
 
@@ -373,6 +378,11 @@ class VisionLocationResolver:
         self.client = client
         self.expert_model_runner = expert_model_runner
         self.max_tokens = max_tokens
+        self.api_calls = (
+            APICallController(provider="openai", model=model)
+            if backend == "llm"
+            else None
+        )
 
     @classmethod
     def from_openai_compatible(
@@ -381,21 +391,32 @@ class VisionLocationResolver:
         model: str,
         base_url: str | None = None,
         api_key: str | None = None,
+        provider: str = "openai",
         timeout: float = 600,
-        max_retries: int = 2,
+        max_retries: int = DEFAULT_API_CALL_MAX_RETRIES,
+        api_call_delay_seconds: float = DEFAULT_API_CALL_DELAY_SECONDS,
+        log_api_calls: bool = True,
         max_tokens: int = 2048,
     ) -> "VisionLocationResolver":
-        return cls(
+        resolver = cls(
             backend="llm",
             model=model,
             client=create_openai_client(
                 base_url=base_url,
                 api_key=api_key,
                 timeout=timeout,
-                max_retries=max_retries,
+                max_retries=0,
             ),
             max_tokens=max_tokens,
         )
+        resolver.api_calls = APICallController(
+            provider=provider,
+            model=model,
+            delay_seconds=api_call_delay_seconds,
+            max_retries=max_retries,
+            log_calls=log_api_calls,
+        )
+        return resolver
 
     @classmethod
     def from_expert_model(cls, runner: Any, *, max_tokens: int = 2048) -> "VisionLocationResolver":
@@ -413,19 +434,22 @@ class VisionLocationResolver:
             )
             return str(result["raw_answer"])
 
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": _image_data_uri(annotated_image_path)}},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-            max_tokens=self.max_tokens,
-            temperature=0.0,
+        completion = self.api_calls.call(
+            lambda: self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": _image_data_uri(annotated_image_path)}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                max_tokens=self.max_tokens,
+                temperature=0.0,
+            ),
+            "chat.completions.create",
         )
         return str(completion.choices[0].message.content or "")
 

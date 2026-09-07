@@ -5,7 +5,13 @@ import mimetypes
 import time
 from pathlib import Path
 
-from openai_compat import create_openai_client, vision_completion_result
+from openai_compat import (
+    APICallController,
+    DEFAULT_API_CALL_DELAY_SECONDS,
+    DEFAULT_API_CALL_MAX_RETRIES,
+    create_openai_client,
+    vision_completion_result,
+)
 
 
 def _openai_client(**kwargs):
@@ -32,7 +38,9 @@ class DentalExpertModelRunner:
         seed: int = 0,
         timeout: float = 600.0,
         cache_prompt: bool = False,
-        max_retries: int = 1,
+        max_retries: int = DEFAULT_API_CALL_MAX_RETRIES,
+        api_call_delay_seconds: float = DEFAULT_API_CALL_DELAY_SECONDS,
+        log_api_calls: bool = True,
         omit_parameters: tuple[str, ...] = (),
     ):
         self.base_url = base_url.rstrip("/")
@@ -50,7 +58,14 @@ class DentalExpertModelRunner:
             base_url=f"{self.base_url}/v1",
             api_key="local-llama-cpp",
             timeout=timeout,
+            max_retries=0,
+        )
+        self.api_calls = APICallController(
+            provider="local-llama.cpp",
+            model=self.api_model,
+            delay_seconds=api_call_delay_seconds,
             max_retries=max_retries,
+            log_calls=log_api_calls,
         )
 
     @staticmethod
@@ -108,7 +123,10 @@ class DentalExpertModelRunner:
         )
         for parameter in self.omit_parameters:
             request.pop(parameter, None)
-        response = self.client.chat.completions.create(**request)
+        response = self.api_calls.call(
+            lambda: self.client.chat.completions.create(**request),
+            "chat.completions.create",
+        )
         result = vision_completion_result(response, time.perf_counter() - started)
         result["effective_request_settings"] = {k: v for k, v in request.items() if k != "messages"}
         return result
@@ -122,18 +140,21 @@ class LLMVisionAnalysisRunner:
         model: str,
         base_url: str | None = None,
         api_key: str | None = None,
+        provider: str = "openai",
         max_tokens: int = 768,
         temperature: float = 0.0,
         top_p: float = 1.0,
         timeout: float = 600.0,
-        max_retries: int = 2,
+        max_retries: int = DEFAULT_API_CALL_MAX_RETRIES,
+        api_call_delay_seconds: float = DEFAULT_API_CALL_DELAY_SECONDS,
+        log_api_calls: bool = True,
         omit_parameters: tuple[str, ...] = (),
         token_limit_parameter: str = "max_tokens",
         request_options: dict | None = None,
     ):
         client_kwargs = {
             "timeout": timeout,
-            "max_retries": max_retries,
+            "max_retries": 0,
         }
         if base_url:
             client_kwargs["base_url"] = base_url
@@ -143,6 +164,14 @@ class LLMVisionAnalysisRunner:
         self.client = _openai_client(**client_kwargs)
         self.model = model
         self.model_id = model
+        self.provider = provider
+        self.api_calls = APICallController(
+            provider=provider,
+            model=model,
+            delay_seconds=api_call_delay_seconds,
+            max_retries=max_retries,
+            log_calls=log_api_calls,
+        )
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -154,6 +183,13 @@ class LLMVisionAnalysisRunner:
         if set(self.request_options) & {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stream"}:
             raise ValueError("request_options cannot override model, messages, generation settings or streaming")
 
+    def _messages(self, image_path: str, question: str) -> list:
+        image_uri = DentalExpertModelRunner._image_data_uri(image_path)
+        return [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": image_uri}},
+            {"type": "text", "text": question},
+        ]}]
+
     def ask(
         self,
         image_path: str,
@@ -162,18 +198,9 @@ class LLMVisionAnalysisRunner:
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> dict:
-        image_uri = DentalExpertModelRunner._image_data_uri(image_path)
         request = {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image_uri}},
-                        {"type": "text", "text": question},
-                    ],
-                }
-            ],
+            "messages": self._messages(image_path, question),
             "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
             "temperature": (
                 temperature if temperature is not None else self.temperature
@@ -188,10 +215,24 @@ class LLMVisionAnalysisRunner:
                 raise ValueError(f"Cannot omit {parameter}")
             request.pop(parameter, None)
         started = time.perf_counter()
-        response = self.client.chat.completions.create(**request)
+        response = self.api_calls.call(
+            lambda: self.client.chat.completions.create(**request),
+            "chat.completions.create",
+        )
         result = vision_completion_result(response, time.perf_counter() - started)
         result["effective_request_settings"] = {k: v for k, v in request.items() if k != "messages"}
         return result
+
+
+class LLMTextAnalysisRunner(LLMVisionAnalysisRunner):
+    """Same generation options as the vision runner; first ask argument is source text.
+
+    The adapter receives no image or label data and cannot load an image via this route.
+    """
+
+    def _messages(self, source_text: str, question: str) -> list:
+        return [{"role": "system", "content": question},
+                {"role": "user", "content": source_text}]
 
 
 # Backward-compatible import for existing notebooks and downstream callers.

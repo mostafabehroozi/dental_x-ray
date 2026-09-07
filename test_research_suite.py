@@ -11,7 +11,8 @@ from prompts import CONDITIONS
 from research_prompts import DEFAULT_STRATEGIES
 from research_experiments import prepare_suite, run_suite, load_suite, parse_answer, local_preset, question
 from evaluation import evaluate_research_suite
-from dentalgpt import LLMVisionAnalysisRunner
+from dentalgpt import LLMVisionAnalysisRunner, LLMTextAnalysisRunner
+from openai_compat import APICallExhaustedError
 
 
 class FakeRunner:
@@ -132,6 +133,15 @@ class SuiteTests(unittest.TestCase):
         self.assertTrue(all(r["TN"] == 0 and r["coverage"] == 0 for r in rows))
         self.assertNotIn("sensitive text", json.dumps(results))
 
+    def test_exhausted_api_retries_stop_the_suite(self):
+        self.experiments[0]["strategies"] = ["broad_whole"]
+        runner = FakeRunner(lambda *args: (_ for _ in ()).throw(
+            APICallExhaustedError("provider=p: ConnectionError: offline")
+        ))
+        with self.assertRaisesRegex(APICallExhaustedError, "provider=p"):
+            self.run_fake(self.plan(), runner)
+        self.assertEqual(len(runner.calls), 1)
+
     def test_resume_changed_input_and_missing_labels(self):
         plan = self.plan()
         directory = self.run_fake(plan, FakeRunner())
@@ -170,7 +180,8 @@ class SuiteTests(unittest.TestCase):
         response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), finish_reason="stop")], usage=None)
         with patch("dentalgpt._openai_client") as client:
             client.return_value.chat.completions.create.return_value = response
-            runner = LLMVisionAnalysisRunner(model="m", max_retries=0, omit_parameters=("temperature", "top_p"), token_limit_parameter="max_completion_tokens")
+            runner = LLMVisionAnalysisRunner(model="m", max_retries=0, api_call_delay_seconds=0,
+                                             omit_parameters=("temperature", "top_p"), token_limit_parameter="max_completion_tokens")
             result = runner.ask(str(self.image), "question", temperature=.4)
             request = client.return_value.chat.completions.create.call_args.kwargs
             self.assertNotIn("temperature", request)
@@ -185,6 +196,7 @@ class SuiteTests(unittest.TestCase):
             local_preset(self.models, [{"model": "l"}, {"model": "m"}])
 
     def test_paper_question_forms_and_regional_adaptations(self):
+        self.models["a"] = {"backend": "local", "model": "DentalGPT", "preset": "QUALITY"}
         self.experiments[0].update(strategies=["atomic_whole", "atomic_arch"], atomic_protocol="presence_then_count")
         whole, arch = self.plan()["jobs"]
         presence = question(whole, "presence", "atomic_1", "impacted_tooth", whole["regions"][0][1])
@@ -233,7 +245,7 @@ class SuiteTests(unittest.TestCase):
                "DentalAnalysisPipeline": lambda **kwargs: self.fail("ordinary pipeline constructed")}
         exec("".join(notebook["cells"][3]["source"]), env)
         # The old ordinary analyzer remains local; the selected suite is API-only.
-        env.update(RESEARCH_LOCAL_PRESET=None, NEEDS_LOCAL_RUNTIME=False)
+        env.update(RESEARCH_LOCAL_PRESET=None, NEEDS_LOCAL_RUNTIME=False, ORCHESTRATOR=None, ADAPTER=None)
         for index in [4, 5, 6, 7, 8, 9, 13]:
             exec("".join(notebook["cells"][index]["source"]), env)
         self.assertIsNone(env["server"])
@@ -261,6 +273,157 @@ class SuiteTests(unittest.TestCase):
         self.models["a"]["prices_per_million"] = {"input": 2, "output": 4}
         result = load_suite(self.run_fake(self.plan(), FakeRunner()))
         self.assertEqual(evaluate_research_suite(result)["summary"][0]["estimated_cost"], .00004)
+
+    def adapter_plan(self, scope="broad"):
+        self.providers["adapter_provider"] = {"api_key": "ADAPTER_SECRET"}
+        self.models["adapter"] = {"backend": "api", "provider": "adapter_provider", "model": "extractor",
+                                  "prices_per_million": {"input": 10, "output": 20}}
+        self.models["a"]["prices_per_million"] = {"input": 2, "output": 4}
+        self.experiments[0].update(adapter="adapter", adapter_scope=scope)
+        strategies = copy.deepcopy(DEFAULT_STRATEGIES)
+        strategies["broad_whole"]["output_format"] = "narrative"
+        return prepare_suite(self.providers, self.models, strategies, self.experiments, self.images)
+
+    def test_broad_adapter_role_counts_cost_and_resume(self):
+        plan = self.adapter_plan()
+        self.assertEqual(sum(j["min_calls"] for j in plan["jobs"]), 44)
+        sources = []
+        class Adapter:
+            def ask(inner, source, prompt, **kwargs):
+                sources.append(source)
+                return answer({"counts": {c: 2 if c == CONDITIONS[0] else 0 for c in CONDITIONS}, "unresolved_conditions": []})
+        analyzer = FakeRunner(lambda prompt, *_: (
+            {"raw_answer": "Two dental implants. All other listed findings absent.", "prompt_tokens": 10, "completion_tokens": 5}
+            if "natural language" in prompt else answer({"choice": "B", "count": 0})))
+        directory = run_suite(plan, self.providers, self.root / "runs", runner_factory=lambda j: analyzer,
+                              adapter_runner_factory=lambda j: Adapter())
+        self.assertEqual(len(analyzer.calls), 43)
+        self.assertEqual(sources, ["Two dental implants. All other listed findings absent."])
+        rows = evaluate_research_suite(load_suite(directory))["summary"]
+        self.assertEqual(rows[0]["adapter_model"], "extractor")
+        self.assertEqual(rows[0]["adapter_provider"], "adapter_provider")
+        self.assertEqual(rows[0]["TP"], 1)
+        self.assertAlmostEqual(rows[0]["estimated_cost"], .00024)
+        self.assertEqual([r["adapter_calls"] for r in rows], [1, 0, 0])
+        self.assertNotIn("ADAPTER_SECRET", (Path(directory) / "manifest.json").read_text())
+        run_suite(plan, self.providers, self.root, resume_dir=directory,
+                  runner_factory=lambda j: self.fail("analyzer called on resume"),
+                  adapter_runner_factory=lambda j: self.fail("adapter called on resume"))
+        self.models["adapter"]["model"] = "new-extractor"
+        self.assertNotEqual(plan["fingerprint"], prepare_suite(self.providers, self.models,
+            {**DEFAULT_STRATEGIES, "broad_whole": {**DEFAULT_STRATEGIES["broad_whole"], "output_format": "narrative"}},
+            self.experiments, self.images)["fingerprint"])
+
+    def test_adapter_all_groups_and_exhaustion(self):
+        plan = self.adapter_plan(scope="all")
+        self.assertEqual(sum(j["min_calls"] for j in plan["jobs"]), 46)
+        adapter = FakeRunner(lambda *args: {"raw_answer": "bad"})
+        directory = run_suite(plan, self.providers, self.root / "runs", runner_factory=lambda j: FakeRunner(),
+                              adapter_runner_factory=lambda j: adapter)
+        results = load_suite(directory)
+        self.assertTrue(all(r["adapter_fallback"] for r in results))
+        self.assertEqual(len(adapter.calls), 27)
+        self.assertTrue(all(r["prediction_counts_by_condition"] == dict.fromkeys(CONDITIONS, 0) for r in results))
+
+    def test_adapter_auth_failure_allows_atomic_strategies(self):
+        class Unauthorized(Exception):
+            status_code = 401
+        def fail(*args):
+            raise Unauthorized()
+        directory = run_suite(self.adapter_plan(), self.providers, self.root / "runs",
+                              runner_factory=lambda j: FakeRunner(), adapter_runner_factory=lambda j: FakeRunner(fail))
+        results = load_suite(directory)
+        self.assertEqual([r["status"] for r in results], ["failed", "completed", "completed"])
+        self.assertEqual(results[0]["failure_role"], "adapter")
+
+    def test_text_adapter_never_loads_image(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"), finish_reason="stop")], usage=None)
+        with patch("dentalgpt._openai_client") as client, patch("dentalgpt.DentalExpertModelRunner._image_data_uri", side_effect=AssertionError("image access")):
+            client.return_value.chat.completions.create.return_value = response
+            runner = LLMTextAnalysisRunner(model="adapter", max_retries=0, api_call_delay_seconds=0,
+                                           omit_parameters=("temperature", "top_p"))
+            runner.ask("SOURCE REPORT ONLY", "EXTRACTION INSTRUCTIONS")
+            request = client.return_value.chat.completions.create.call_args.kwargs
+            self.assertEqual(request["messages"], [{"role": "system", "content": "EXTRACTION INSTRUCTIONS"},
+                                                  {"role": "user", "content": "SOURCE REPORT ONLY"}])
+            self.assertNotIn("temperature", request)
+
+    def test_adapter_unresolved_contract(self):
+        good = {"counts": dict.fromkeys(CONDITIONS, 0), "unresolved_conditions": [CONDITIONS[0]]}
+        self.assertEqual(parse_answer(answer(good)["raw_answer"], "adapter", CONDITIONS), good)
+        good["counts"][CONDITIONS[0]] = 1
+        with self.assertRaises(ValueError):
+            parse_answer(answer(good)["raw_answer"], "adapter", CONDITIONS)
+
+    def test_adapter_interruption_resumes_without_analyzer_calls(self):
+        self.experiments[0]["strategies"] = ["broad_whole"]
+        plan = self.adapter_plan()
+        def interrupt(*args):
+            raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            run_suite(plan, self.providers, self.root / "runs", runner_factory=lambda j: FakeRunner(),
+                      adapter_runner_factory=lambda j: FakeRunner(interrupt))
+        directory = next((self.root / "runs").iterdir())
+        analyzer = FakeRunner(lambda *args: self.fail("repeated analyzer request"))
+        adapter = FakeRunner(lambda *args: answer({"counts": dict.fromkeys(CONDITIONS, 0),
+                                                   "unresolved_conditions": [CONDITIONS[0]]}))
+        run_suite(plan, self.providers, self.root, resume_dir=directory, runner_factory=lambda j: analyzer,
+                  adapter_runner_factory=lambda j: adapter)
+        results = load_suite(directory)
+        self.assertEqual(len(analyzer.calls), 0)
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(evaluate_research_suite(results)["summary"][0]["adapter_unresolved_findings"], 1)
+        self.assertEqual(results[0]["attempts"][-1]["requested_temperature"], .2)
+
+    def test_narrative_requires_adapter_and_unused_templates_do_not_change_fdm(self):
+        strategies = copy.deepcopy(DEFAULT_STRATEGIES)
+        strategies["broad_whole"]["output_format"] = "narrative"
+        with self.assertRaisesRegex(ValueError, "requires an experiment adapter"):
+            prepare_suite(self.providers, self.models, strategies, self.experiments, self.images)
+        plan = self.plan()
+        self.assertTrue(all("adapter" not in j and "adapter" not in j["templates"] for j in plan["jobs"]))
+        with patch("research_experiments.PROMPT_TEMPLATES", {**__import__("research_prompts").PROMPT_TEMPLATES,
+                                                            "adapter": {"adapter_1": "irrelevant change"}}):
+            self.assertEqual(plan["fingerprint"], self.plan()["fingerprint"])
+
+    def test_api_templates_are_independent_of_dentalgpt_and_preserve_contracts(self):
+        from research_prompts import API_VISUAL_RULES, FDM_PRESENCE_PROMPT_TEMPLATES
+        self.experiments[0]["strategies"] = ["atomic_whole", "atomic_arch"]
+        for job in self.plan()["jobs"]:
+            self.assertEqual(job["prompt_profile"], "api")
+            for stage in ("presence", "count", "combined"):
+                for template in ("atomic_1", "atomic_2", "atomic_3"):
+                    for condition in CONDITIONS:
+                        rendered = question(job, stage, template, condition, job["regions"][0][1])
+                        self.assertIn(API_VISUAL_RULES, rendered)
+                        self.assertNotIn("<think>", rendered)
+                        self.assertIn("<answer>", rendered)
+                        self.assertNotIn("{finding}", rendered)
+                        self.assertNotIn("{count_subject}", rendered)
+                        if stage == "combined":
+                            self.assertIn('"choice":"A","count":3', rendered)
+                            self.assertIn('"choice":"B","count":0', rendered)
+                            self.assertIn("Counting unit:", rendered)
+        self.models["a"]["settings"] = {"prompt_profile": "dentalgpt"}
+        job = self.plan()["jobs"][0]
+        self.assertEqual(job["templates"]["presence"], FDM_PRESENCE_PROMPT_TEMPLATES)
+        self.assertIn("<think>", question(job, "presence", "atomic_1", CONDITIONS[0], job["regions"][0][1]))
+
+    def test_api_broad_narrative_table_and_override(self):
+        plan = self.adapter_plan()
+        job = plan["jobs"][0]
+        rendered = question(job, "broad", "broad_1")
+        self.assertIn("exactly one row per listed category", rendered)
+        self.assertIn("UNCERTAIN", rendered)
+        self.assertIn("UNKNOWN", rendered)
+        self.assertIn("Do not output JSON", rendered)
+        self.assertNotIn("<think>", rendered)
+        for condition in CONDITIONS:
+            self.assertIn(condition, rendered)
+        self.experiments[0]["strategies"] = ["atomic_whole"]
+        override = "Custom {finding}: <answer>A</answer>"
+        job = self.plan(prompt_overrides={"presence": {"atomic_1": override}})["jobs"][0]
+        self.assertEqual(job["templates"]["presence"]["atomic_1"], override)
 
 
 if __name__ == "__main__":

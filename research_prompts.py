@@ -52,7 +52,7 @@ COMBINED_FORMAT = (
     ' The final answer must be a JSON object with "choice" ("A" or "B") and '
     '"count" (a non-negative integer). For A, count must be positive; for B, count must be 0.'
 )
-LLM_ATOMIC_PROMPT_TEMPLATES = {
+FDM_COMBINED_PROMPT_TEMPLATES = {
     key: text.replace(PRESENCE_FORMAT, COMBINED_FORMAT)
     for key, text in FDM_PRESENCE_PROMPT_TEMPLATES.items()
 }
@@ -123,11 +123,91 @@ BROAD_PROMPT_TEMPLATES = {
     "broad_2": "Inspect both jaws systematically and report the total number of visible instances for every listed finding.",
     "broad_3": "Review the entire radiograph for each category below, then provide its whole-image count.",
 }
+
+# Provider-neutral API prompts: final outputs only, without a model-specific
+# reasoning transcript. Task units and response contracts stay fixed across wording variants.
+API_VISUAL_RULES = (
+    "Use only evidence visible in the supplied dental radiograph. "
+    "Evaluate each requested finding independently; one treatment or device is not proof of another finding. "
+    "Count each supported instance once using the specified counting unit, even if it has several visible components. "
+    "Do not infer hidden instances, clinical history, or diagnoses outside the requested categories. "
+    "Do not count equivocal artifacts or overlapping anatomy as confirmed findings. "
+    "Presence anywhere in the requested scope is sufficient; it need not be generalized throughout that scope."
+)
+API_ATOMIC_TASK = (
+    "\nTarget finding: {finding}\nScope: {image_scope}\nCounting unit: {count_subject}\n\n"
+    + API_VISUAL_RULES +
+    " Inspect the entire requested scope, including visible anterior and posterior areas. "
+    "Use surrounding anatomy for context, but count only instances inside the requested scope."
+)
+API_COMBINED_FORMAT = (
+    '\nReturn exactly one <answer> tag containing a JSON object with only "choice" and "count". '
+    '"count" is the number of visibly supported instances, as a non-negative integer. '
+    'Use "choice":"A" when count is greater than zero; use "choice":"B" when count is zero. '
+    'Do not include explanations, Markdown fences, extra keys, or reasoning text. '
+    'Format examples only (not evidence about this image): '
+    '<answer>{{"choice":"A","count":3}}</answer> or <answer>{{"choice":"B","count":0}}</answer>.'
+)
+API_ATOMIC_OPENINGS = {
+    "atomic_1": "Assess the specified finding in the specified scope of this dental radiograph.",
+    "atomic_2": "Inspect this dental radiograph for the single target finding within the requested scope.",
+    "atomic_3": "Perform a focused visual assessment of the target finding, limited to the scope below.",
+}
+LLM_ATOMIC_PROMPT_TEMPLATES = {
+    key: opening + API_ATOMIC_TASK + API_COMBINED_FORMAT
+    for key, opening in API_ATOMIC_OPENINGS.items()
+}
+API_PRESENCE_PROMPT_TEMPLATES = {
+    key: opening + "\nTarget finding: {finding}\nScope: {image_scope}\n\n" + API_VISUAL_RULES +
+         "\nA. True: at least one visibly supported instance.\nB. False: no visibly supported instance.\n"
+         "Return only <answer>A</answer> or <answer>B</answer>, without explanations or reasoning text."
+    for key, opening in API_ATOMIC_OPENINGS.items()
+}
+API_COUNT_PROMPT_TEMPLATES = {
+    key: opening + API_ATOMIC_TASK +
+         "\nHow many supported instances are visible? Return only the non-negative integer "
+         "inside one <answer>...</answer> tag, without explanations or reasoning text."
+    for key, opening in API_ATOMIC_OPENINGS.items()
+}
+API_BROAD_PROMPT_TEMPLATES = {
+    key: opening + "\n" + API_VISUAL_RULES +
+         " Inspect both jaws, including anterior and posterior areas, for all listed categories. "
+         "Report whole-image totals using the same counting units for every category. "
+         "Keep the final response concise; do not include a reasoning transcript or treatment recommendations."
+    for key, opening in {
+        "broad_1": "Analyze the complete dental radiograph and report all findings in the categories listed below.",
+        "broad_2": "Review the whole dental radiograph systematically and summarize every listed finding category.",
+        "broad_3": "Produce one complete image-based assessment covering all of the following finding categories.",
+    }.items()
+}
+API_NARRATIVE_FORMAT = (
+    "\nWrite one overall report in natural language: a short image-quality/limitations summary, "
+    "then a table with exactly one row per listed category, in the listed order. "
+    "Columns: category key | status (PRESENT, ABSENT, or UNCERTAIN) | whole-image count | short visible evidence or limitation. "
+    "Use an integer when an exact count is supported. For an uncountable positive finding use PRESENT and UNKNOWN; "
+    "for uncertain presence use UNCERTAIN and UNKNOWN. Use ABSENT and 0 only when absence is assessable. "
+    "If the image cannot be assessed, explicitly mark affected categories UNCERTAIN with UNKNOWN counts. "
+    "Keep table counts consistent with the prose and count each instance once. "
+    "Do not output JSON, a reasoning transcript, or invented tooth numbers."
+)
+ADAPTER_PROMPT_TEMPLATES = {
+    "adapter_1": "Convert the supplied analyzer report into finding counts using only that report.",
+    "adapter_2": "Extract the reported counts for each listed finding. Use no evidence beyond the supplied report.",
+    "adapter_3": "Normalize the supplied report to the required count schema without adding clinical findings.",
+}
+
 PROMPT_TEMPLATES = {
     "presence": FDM_PRESENCE_PROMPT_TEMPLATES,
     "count": FDM_COUNT_PROMPT_TEMPLATES,
-    "combined": LLM_ATOMIC_PROMPT_TEMPLATES,
+    "combined": FDM_COMBINED_PROMPT_TEMPLATES,
     "broad": BROAD_PROMPT_TEMPLATES,
+    "adapter": ADAPTER_PROMPT_TEMPLATES,
+}
+API_PROMPT_TEMPLATES = {
+    "presence": API_PRESENCE_PROMPT_TEMPLATES,
+    "count": API_COUNT_PROMPT_TEMPLATES,
+    "combined": LLM_ATOMIC_PROMPT_TEMPLATES,
+    "broad": API_BROAD_PROMPT_TEMPLATES,
 }
 DEFAULT_STRATEGIES = {
     "broad_whole": {"mode": "broad", "location_mode": "whole", "finding_group": "all_14", "template_id": "broad_1"},
