@@ -1,106 +1,139 @@
-# DentalGPT panoramic findings pipeline
+# DentVLM panoramic findings pipeline
 
-A small wrapper that gets findings, counts, and coarse locations out of
-DentalGPT (a 7B dental vision-language model) on panoramic radiographs, while
-sending it only question shapes it was trained and evaluated on. Everything else
-(task decomposition, location, aggregation, scoring) happens in Python.
+A small wrapper that gets findings, their regions, and a multiplicity signal out
+of DentVLM (a 7B dental vision-language model) on panoramic radiographs, while
+sending it only questions it was trained and evaluated on. Everything else
+(task decomposition, aggregation, scoring) happens in Python.
 
 ## Why it looks like this
 
-DentalGPT (arXiv 2512.11558) was fine-tuned from Qwen2.5-VL-7B and then trained
-with reinforcement learning on multiple-choice questions. The only panoramic
-skill the paper measures is one condition per question, answered True/False
-(Figure 7, 84% accuracy). Counting appears once, as a tooth count with a prose
-answer (Figure 9). Location is never asked. So:
+DentVLM (Meng et al., Nature Communications 2026; arXiv 2509.23344) is
+Qwen2-VL-7B fine-tuned in two stages on 2.46 million bilingual dental VQA pairs:
+stage 1 answers only, stage 2 answer plus rationale plus location. For panoramic
+X-rays it was trained on 13 yes/no tasks: caries, periodontal disease, impacted
+tooth, apical periodontitis, residual root, residual crown, insufficient space
+for primary tooth eruption, calculus, prosthetic crown, root canal therapy,
+fillings, prosthetic bridge, implant. Each task is asked with one of nine fixed
+question templates (Supplementary Table 7). The model answers `Yes` or `No` on
+line 1 and then writes a rationale that names the location with one of nine
+fixed descriptors ("the left posterior region of the upper dentition", ...).
+It has no count task, no "list all findings" task for oral diseases, no
+cropped-panoramic training, and no JSON or tag format. So:
 
-* **Presence** uses the Figure 7 wording verbatim, one finding per call.
-* **Counts** use the Figure 9 wording for fillings and the same "How many teeth
-  ..." shape for the other tooth-anchored findings. Findings whose boxes are
-  regions or devices (bone loss, furcation, apical surgery, appliances, plates)
-  are presence-only.
-* **Location** is never put into words. For each positive, the same presence
-  question is sent to four overlapping quadrant crops; the quadrant set is
-  whichever crops answer True. Quadrant is the honest ceiling for this model.
+* **Presence** uses one Table S7 question per task, worded as in the authors'
+  released test set, on the whole image. Line 1 decides, as in the authors'
+  scorer; both words or neither is unparseable.
+* **Location** is never asked in words. The nine descriptors are read from the
+  rationale by exact match, exactly as the authors compute their IoU, and mapped
+  onto six dental-arch cells (upper/lower x left/anterior/right).
+* **Multiplicity** is the number of cells named (0 to 6), reported as
+  "in N region(s)". The tooth-count question from the DentalGPT branch is kept
+  behind `Protocol(count_question=True)` as an explicitly out-of-distribution
+  experiment.
+* **Findings without a DentVLM task** (furcation involvement, apical surgery,
+  root resorption, orthodontic appliances, surgical plates) are not asked and
+  are reported as "not assessed by this model". `Protocol(ask_untrained=True)`
+  asks them anyway and scores them under `trained_task=False`; the paper's
+  zero-shot accuracy on untrained diseases is 52-64%.
+* **Prosthetic restoration** (crowns or bridges in the benchmark) is the OR of
+  the prosthetic crown and prosthetic bridge tasks, regions merged.
 * **No JSON, no region wording, no paraphrase retries, no forced zeros.** One
   greedy call per question. Unparseable answers are recorded as such and
   excluded from the per-finding TP/FP/TN/FN tables, never converted into a
-  negative there. The per-image complete-case rate and recall are strict: a
-  true finding whose answer was unparseable counts as not caught.
+  negative there. The per-image complete-case rate and recall are strict.
 
-The only public weights are the GGUF conversion of `DentalGPT-7B-1026`. That
-checkpoint may predate the reinforcement-learning stage, and the exact sentence
-the authors appended to request `<think>/<answer>` tags is unpublished. A short
-probe therefore decides once per run whether the suffix is needed ("plain" or
-"tagged"), and the run manifest records the choice.
+Left and right follow the model's own convention (Supplementary Table S6): its
+"left posterior region" is FDI quadrants 1 and 4, the patient's right, which is
+the left side of a panoramic as displayed. `dental_pipeline.LEFT_IS_IMAGE_LEFT`
+records that reading, the dentist summary translates cells to the patient's
+side, and the notebook checks the convention against DENTEX boxes.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `dental_pipeline.py` | prompts, answer extraction, quadrant crops, model runner, probe, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX), quadrant geometry, metrics, CSV/JSON export |
-| `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
+| `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), cell geometry, metrics, side-convention check, CSV/JSON export |
+| `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
 | `test_dental_pipeline.py` | offline tests with a fake model (`python -m unittest -q test_dental_pipeline`) |
 
 ## Calls per image
 
-14 presence calls, plus one count call per positive countable finding, plus
-four crop calls per positive when `LOCATION="quadrant"`. A typical image with
-four or five positives needs about 35 calls; an all-negative image needs 14.
+13 whole-image calls, the same for every image (one per task; crown and bridge
+are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
+
+* `phrasings=3`: ask three verbatim wordings per task and vote (majority for
+  yes/no; `region_vote="union"` is the paper's matching voting, `"majority"`
+  its majority voting). 39 calls per image. In-distribution.
+* `count_question=True`: one count call per positive countable finding.
+  Out-of-distribution.
+* `location="crops"`: the primary question on six cell crops per positive task,
+  scored on the same cells for comparison. Cropped panoramics are outside the
+  model's image distribution.
+* `location="none"`: presence only.
 
 ## Runtime settings that matter
 
-* `--image-max-tokens 6144`: llama.cpp otherwise caps Qwen2.5-VL images at 4096
-  tokens and silently downscales a full-size panoramic below training resolution.
-* No `--image-min-tokens` floor, so quadrant crops of small panoramics stay at
-  native size, as they would under the Hugging Face processor.
-* `--ctx-size 16384` so image tokens, question, and a long `<think>` fit.
-* `max_tokens 4096`, temperature 0, `repeat_penalty 1.05` (the same value as the
-  backbone's generation config; llama.cpp applies it over the last 64 tokens).
-* Replies cut off by `max_tokens` without a closed `<answer>` are graded as
-  unparseable, never as an answer.
-* No system prompt is sent; the GGUF chat template injects Qwen's default one,
-  matching the authors' published inference snippet.
-* Use Q6_K or Q8_0 weights with the f16 projector for reported numbers.
+* The model is published only as bf16 safetensors (Hugging Face
+  `ZJU-AI4H/DentVLM`, gated with automatic approval, CC BY-NC 4.0). Accept the
+  license once, store a token as a Kaggle secret, and let Cell 6 convert it
+  with llama.cpp's converter (Q8_0 language model, f16 vision projector, about
+  9.5 GB kept, 17 GB scratch). Keep the two files in a private Kaggle dataset
+  or your own Hugging Face repo for later sessions.
+* `--image-max-tokens 8192` mirrors the authors' `max_pixels` of 8192 x 28 x 28;
+  llama.cpp would otherwise cap Qwen2-VL images at 4096 tokens. No token floor.
+  The paper's ablation found a 1024 x 1024 bound best for disease tasks;
+  `IMAGE_MAX_TOKENS = 1369` reproduces it for an A/B.
+* `--ctx-size 16384`, the authors' maximum input length.
+* `max_tokens 512` (the authors' output cap), temperature 0, `repeat_penalty
+  1.05` as in their inference script. Line 1 is present even when a rationale
+  is cut off, so truncated replies are still graded.
+* No system prompt is sent; the chat template injects Qwen's default one, which
+  the authors' vLLM script sets explicitly.
 * Radiographs must be JPEG, PNG, or BMP (what llama.cpp can decode).
-* `BACKEND="api"` in Cell 3 sends the same prompts to an OpenAI-compatible
-  vision API instead, for a controlled comparison against DentalGPT.
+* `BACKEND="api"` in Cell 3 sends the same questions to an OpenAI-compatible
+  vision API instead, for a controlled comparison.
 
 ## Datasets
 
 * **UMFIH 14-class set** (Zenodo 15487430, CC BY 4.0 with a non-commercial
   note): the exact ontology, YOLO boxes. Score the 100-image internal test split
   and the 180 external-validation images separately.
-* **DENTEX** (Hugging Face `ibrahimhamamci/DENTEX`, CC BY-NC-SA): FDI
-  quadrant labels for caries, periapical lesion, and impacted tooth. Gives real
-  quadrant ground truth for those three findings. Use the fully labeled train
-  split (`training_data/quadrant-enumeration-disease`, 705 images) and the
-  validation split (`validation_triple.json`, 50 images); DentalGPT never saw
-  DENTEX, so both are held-out. The 250-image test split is raw LabelMe files
-  with unmapped Turkish labels and is not supported.
+* **DENTEX** (Hugging Face `ibrahimhamamci/DENTEX`, CC BY-NC-SA): FDI quadrant
+  and tooth labels for caries, periapical lesion, and impacted tooth, which
+  give exact cell truth through the model's own tooth-region mapping. Use the
+  fully labeled train split (`training_data/quadrant-enumeration-disease`, 705
+  images) and the validation split (`validation_triple.json`, 50 images).
+  DentVLM's authors used only the 242-image official test split for their
+  external validation, so both are held out. That test split ships as raw
+  LabelMe files with unmapped Turkish labels and is not supported.
 
-Each dataset is scored on the findings it annotates; unannotated findings are
-not counted as negatives. Location truth is scored against the same overlapping
-crop windows the model saw: a box counts in every window that holds at least a
-quarter of its area. With two datasets the notebook also prints a pooled
-table over the shared findings.
+Each dataset is scored on the findings it annotates and the model was asked
+about; unannotated findings are not counted as negatives. Geometric location
+truth (UMFIH) counts a box in every cell window holding at least a quarter of
+its area; the windows overlap on the canine line and the occlusal plane.
 
 ## Evaluation outputs
 
 `<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
-`paper_covered` flag), `counts.csv` (exact, within-1, MAE on true positives and a
-strict MAE that scores misses as zero), `regions.csv` (per-crop TP, FP, TN, FN,
-exact-set match, Jaccard, unlocalized rate), `per_image.csv`, and
-`evaluation.json` with a summary: micro and macro F1, complete-case rate, mean
-false alarms per image.
+`trained_task` flag), `regions.csv` (per-cell TP, FP, TN, FN, exact-set match,
+Jaccard, unlocalized rate), `counts.csv` (only when the count question was
+asked), `per_image.csv`, and `evaluation.json` with a summary: micro and macro
+F1, complete-case rate, mean false alarms per image, and the list of findings
+not assessed.
 
 ## Caveats
 
-* Ten of the 14 findings are outside the paper's evaluated panoramic labels;
-  read the `paper_covered` column before comparing to the paper's 84%.
-* Ground-truth boxes are per instance while the model counts teeth, so counts
-  for crowns/bridges and multi-box fillings carry definitional error.
+* The paper reports DentVLM's own location IoU at about 38% on its test set, so
+  cell-level location is a coarse signal; the presence answer is the reliable
+  part.
+* Caries and calculus are the weakest panoramic tasks in the paper (about 63%
+  and 62%); implants, bridges and crowns the strongest (above 90%).
+* Ground-truth boxes are per instance while the model names regions, so the
+  region count is a lower bound on the number of occurrences.
 * Apical surgery, root resorption, and furcation have very few positives in
-  UMFIH; their rows are not statistically meaningful.
+  UMFIH and no DentVLM task; their rows are not statistically meaningful even
+  with `ask_untrained=True`.
+* The weights are CC BY-NC 4.0: research use only.

@@ -3,53 +3,103 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 
-DEFAULT_REPO_ID = "mradermacher/DentalGPT-7B-1026-GGUF"
-DEFAULT_MODEL_FILENAME = "DentalGPT-7B-1026.Q6_K.gguf"
-DEFAULT_MMPROJ_FILENAME = "DentalGPT-7B-1026.mmproj-f16.gguf"
+# DentVLM is published only as bf16 safetensors (Hugging Face ZJU-AI4H/DentVLM, gated with
+# automatic approval, CC BY-NC 4.0). convert_to_gguf() turns it into the two GGUF files below
+# once; keep them in a private Kaggle dataset or Hugging Face repo and point the notebook at it.
+DENTVLM_HF_REPO_ID = "ZJU-AI4H/DentVLM"
+DEFAULT_MODEL_FILENAME = "DentVLM-Q8_0.gguf"
+DEFAULT_MMPROJ_FILENAME = "DentVLM-mmproj-f16.gguf"
 
 
 @dataclass(frozen=True)
-class DentalGPTFiles:
+class ModelFiles:
     model_path: Path
     mmproj_path: Path
 
 
-def download_dentalgpt(
+def download_gguf(
     model_dir: str | Path,
-    repo_id: str = DEFAULT_REPO_ID,
+    repo_id: str,
     model_filename: str = DEFAULT_MODEL_FILENAME,
     mmproj_filename: str = DEFAULT_MMPROJ_FILENAME,
     hf_token: str | None = None,
-) -> DentalGPTFiles:
+) -> ModelFiles:
     """Download exactly the GGUF language model and matching vision projector."""
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=model_filename,
-            local_dir=str(model_dir),
-            token=hf_token,
-        )
-    )
-    mmproj_path = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=mmproj_filename,
-            local_dir=str(model_dir),
-            token=hf_token,
-        )
-    )
-    return DentalGPTFiles(model_path=model_path, mmproj_path=mmproj_path)
+    model_path = Path(hf_hub_download(repo_id=repo_id, filename=model_filename, local_dir=str(model_dir), token=hf_token))
+    mmproj_path = Path(hf_hub_download(repo_id=repo_id, filename=mmproj_filename, local_dir=str(model_dir), token=hf_token))
+    return ModelFiles(model_path=model_path, mmproj_path=mmproj_path)
+
+
+def local_gguf(model_dir: str | Path, model_filename: str = DEFAULT_MODEL_FILENAME,
+               mmproj_filename: str = DEFAULT_MMPROJ_FILENAME) -> ModelFiles:
+    """Use GGUF files already on disk (for example an attached Kaggle dataset)."""
+    model_dir = Path(model_dir)
+    files = ModelFiles(model_path=model_dir / model_filename, mmproj_path=model_dir / mmproj_filename)
+    for path in (files.model_path, files.mmproj_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    return files
+
+
+def convert_to_gguf(
+    out_dir: str | Path,
+    llama_cpp_dir: str | Path,
+    hf_repo_id: str = DENTVLM_HF_REPO_ID,
+    hf_token: str | None = None,
+    work_dir: str | Path = "/tmp/dentvlm_hf",
+    outtype: str = "q8_0",
+    model_filename: str = DEFAULT_MODEL_FILENAME,
+    mmproj_filename: str = DEFAULT_MMPROJ_FILENAME,
+    install_requirements: bool = True,
+) -> ModelFiles:
+    """One-time conversion of the Hugging Face checkpoint to GGUF (language model + mmproj).
+
+    Needs the gated repo accepted on the Hugging Face model page and a token, about 17 GB of
+    scratch disk for the safetensors under work_dir, and llama.cpp's converter requirements.
+    The converter writes the language model directly at the requested outtype (q8_0 by
+    default) and the vision projector in f16, so llama-quantize is not needed.
+    """
+    out_dir, llama_cpp_dir, work_dir = Path(out_dir), Path(llama_cpp_dir), Path(work_dir)
+    converter = llama_cpp_dir / "convert_hf_to_gguf.py"
+    if not converter.is_file():
+        raise FileNotFoundError(f"{converter} (build_llama_cpp clones the repository)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = ModelFiles(model_path=out_dir / model_filename, mmproj_path=out_dir / mmproj_filename)
+    if files.model_path.is_file() and files.mmproj_path.is_file():
+        print("GGUF files already present:", out_dir)
+        return files
+
+    if install_requirements:
+        requirements = llama_cpp_dir / "requirements" / "requirements-convert_hf_to_gguf.txt"
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", str(requirements)], check=True)
+
+    print(f"Downloading {hf_repo_id} to {work_dir} ...")
+    hf_dir = Path(snapshot_download(repo_id=hf_repo_id, local_dir=str(work_dir), token=hf_token,
+                                    allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"]))
+
+    if not files.mmproj_path.is_file():
+        print("Converting the vision projector (f16) ...")
+        subprocess.run([sys.executable, str(converter), str(hf_dir), "--mmproj", "--outtype", "f16",
+                        "--outfile", str(files.mmproj_path)], check=True)
+    if not files.model_path.is_file():
+        print(f"Converting the language model ({outtype}) ...")
+        subprocess.run([sys.executable, str(converter), str(hf_dir), "--outtype", outtype,
+                        "--outfile", str(files.model_path)], check=True)
+    for path in (files.model_path, files.mmproj_path):
+        print(f"{path} ({path.stat().st_size / 1024**3:.2f} GiB)")
+    return files
 
 
 def find_llama_server(explicit_path: str | Path | None = None) -> Path | None:
@@ -271,7 +321,7 @@ def build_llama_cpp(
 
 
 class LlamaCppServer:
-    """Own a local llama.cpp server process for DentalGPT multimodal inference."""
+    """Own a local llama.cpp server process for DentVLM multimodal inference."""
 
     def __init__(
         self,
@@ -280,14 +330,14 @@ class LlamaCppServer:
         mmproj_path: str | Path,
         host: str = "127.0.0.1",
         port: int = 8080,
-        alias: str = "dentalgpt",
+        alias: str = "dentvlm",
         n_gpu_layers: int = 999,
         ctx_size: int = 16384,
         parallel: int = 1,
-        image_max_tokens: int | None = 6144,
+        image_max_tokens: int | None = 8192,
         image_min_tokens: int | None = None,
         startup_timeout: float = 180.0,
-        log_path: str | Path = "/kaggle/working/llama_dentalgpt_server.log",
+        log_path: str | Path = "/kaggle/working/llama_dentvlm_server.log",
     ):
         self.binary = Path(binary)
         self.model_path = Path(model_path)
@@ -298,10 +348,10 @@ class LlamaCppServer:
         self.n_gpu_layers = n_gpu_layers
         self.ctx_size = ctx_size
         self.parallel = parallel
-        # llama.cpp caps Qwen2.5-VL images at 4096 tokens (about 3.2 MP) unless told
-        # otherwise; a full-size panoramic needs ~4400-5900 tokens to keep the
-        # resolution the model was trained with. ctx must hold image + prompt + answer.
-        # No token floor: crops of small panoramics stay at native size, as in training.
+        # The authors run DentVLM with max_pixels = 8192 x 28 x 28, i.e. up to 8192 image
+        # tokens, and no floor beyond 4 tokens; llama.cpp would otherwise cap Qwen2-VL images
+        # at 4096 tokens and downscale a full-size panoramic. ctx must hold image + prompt +
+        # answer (the authors' max input length is 16384).
         self.image_max_tokens = image_max_tokens
         self.image_min_tokens = image_min_tokens
         self.startup_timeout = startup_timeout
@@ -350,16 +400,13 @@ class LlamaCppServer:
             str(self.ctx_size),
             "--parallel",
             str(self.parallel),
-            # Keep DentalGPT's <think>/<answer> text intact for our parser/logs.
-            "--reasoning-format",
-            "none",
         ]
         if self.image_max_tokens:
             command += ["--image-max-tokens", str(self.image_max_tokens)]
         if self.image_min_tokens:
             command += ["--image-min-tokens", str(self.image_min_tokens)]
 
-        print("Starting llama.cpp DentalGPT server...")
+        print("Starting llama.cpp DentVLM server...")
         print(" ".join(command))
         self.process = subprocess.Popen(
             command,
@@ -377,7 +424,7 @@ class LlamaCppServer:
                     f"Last server log lines:\n{tail}"
                 )
             if self._healthy():
-                print(f"DentalGPT server ready at {self.base_url}")
+                print(f"DentVLM server ready at {self.base_url}")
                 return
             time.sleep(1.0)
 

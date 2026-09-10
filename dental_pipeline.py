@@ -1,19 +1,21 @@
-"""In-distribution DentalGPT pipeline: presence, tooth counts, and quadrant location.
+"""In-distribution DentVLM pipeline: presence, location, and multiplicity on panoramic radiographs.
 
-Every text sent to the model is one of two shapes with evidence in the DentalGPT
-paper (arXiv 2512.11558):
+Every text sent to the model is a question DentVLM (Meng et al., Nature
+Communications 2026; arXiv 2509.23344) was trained and evaluated on:
 
-* Presence: the Panorama-Classification question of Figure 7, one condition per
-  call, answered A (True) or B (False). This is the only panoramic skill the
-  paper measures (84% accuracy).
-* Count: the Figure 1/9 filling-count question, and the same tooth-anchored
-  "How many ..." shape for the other countable findings. The model counts
-  teeth, so findings whose boxes are regions or devices are presence-only.
+* One yes/no question per panoramic task, worded as in the authors' released
+  test set or as one of the nine templates of Supplementary Table 7, e.g.
+  "Based on the imaging, determine whether the patient has {task}?".
+* DentVLM answers "Yes"/"No" on line 1 and then writes a rationale that names
+  the location with one of nine fixed descriptors ("the left posterior region
+  of the upper dentition", ...). Location is read from that rationale exactly
+  as the authors' scorer does; nothing about location is ever asked in words.
+* Multiplicity is the number of distinct regions the model names (0-6). A
+  tooth-count question exists only as an explicitly out-of-distribution option.
 
-Location is never asked in words. For each whole-image positive the same
-presence question is sent to overlapping quadrant crops; the quadrant set is
-whichever crops answer A. Nothing else (JSON contracts, region wording,
-fallback paraphrases, forced zeros) is used.
+Nothing else (JSON contracts, <think> tags, region wording, paraphrase
+retries, forced zeros) is used. Findings the model has no task for are not
+asked by default and are reported as "not assessed".
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import json
 import mimetypes
 import re
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 # Stable ontology in YOLO class order of the UMFIH 14-class dataset.
@@ -44,17 +47,14 @@ CONDITIONS = (
     "surgical_device",
 )
 
-# Condition names substituted into the presence question. Paper vocabulary is
-# used where the paper has the category (Root canal treatment, Periodontal
-# disease, Impacted tooth, Periapical lesion, Dental caries); MMOral/PMC
-# vocabulary elsewhere. Edit here only.
+# Display names for the dentist report.
 LABELS = {
     "dental_implant": "Dental implant",
     "prosthetic_restoration": "Dental crown or bridge",
     "dental_filling": "Dental filling",
     "endodontic_treatment": "Root canal treatment",
     "carious_lesion": "Dental caries",
-    "periodontal_bone_loss": "Periodontal disease",
+    "periodontal_bone_loss": "Periodontal bone loss",
     "impacted_tooth": "Impacted tooth",
     "periapical_lesion": "Periapical lesion",
     "root_fragment": "Residual root",
@@ -65,10 +65,97 @@ LABELS = {
     "surgical_device": "Surgical fixation plate or screws",
 }
 
-# Figure 7 (Panorama-Classification) wording, verbatim except the label.
-PRESENCE_QUESTION = "Kindly evaluate if the condition '{label}' is present in this image.\nA. True\nB. False"
+# DentVLM's panoramic tasks (Supplementary Tables S2-S3 and the image-task mapping of
+# Figure 1a), in asking order. questions[0] is Table S7 template #2 or the verbatim
+# wording of the authors' released test set; [1] and [2] are verbatim alternates used
+# only by the phrasing-ensemble option. Edit wording here only.
+TASKS = {
+    "implant": {"name": "Implant", "questions": (
+        "Based on the imaging, determine whether the patient has an implant?",
+        "Based on the imaging, does the patient have any abnormalities with the implant?",
+        "Please confirm whether the patient has an implant?")},
+    "prosthetic_crown": {"name": "Prosthetic Crown", "questions": (
+        "Based on the imaging analysis, does the patient have a prosthetic crown?",
+        "Please confirm whether the patient has a prosthetic crown?",
+        "Based on the imaging, determine whether the patient has a prosthetic crown?")},
+    "prosthetic_bridge": {"name": "Prosthetic Bridge", "questions": (
+        "Based on the imaging, determine whether the patient has a prosthetic bridge?",
+        "Evaluate the images to confirm whether there is a prosthetic bridge disease?",
+        "Please confirm whether the patient has a prosthetic bridge?")},
+    "fillings": {"name": "Fillings", "questions": (
+        "Based on the imaging analysis, does the patient have fillings?",
+        "Evaluate the images to confirm if there is a filling disease?",
+        "Based on the imaging, determine whether the patient has fillings?")},
+    "root_canal_therapy": {"name": "Root Canal Therapy", "questions": (
+        "Based on the imaging, determine whether the patient has root canal filling?",
+        "Based on the imaging analysis, does the patient have a root canal filling?",
+        "Please confirm whether the patient has root canal therapy?")},
+    "caries": {"name": "Caries", "questions": (
+        "Based on the imaging analysis, does the patient have caries?",
+        "Examine the images to determine if there is the presence of caries.",
+        "Based on the imaging, determine whether the patient has caries?")},
+    "periodontal_disease": {"name": "Periodontal Disease", "questions": (
+        "Based on the imaging, determine whether the patient has periodontal disease?",
+        "Examine the images to determine if periodontal disease is present?",
+        "Whether a patient has periodontal disease through imaging?")},
+    "impacted_tooth": {"name": "Impacted Tooth", "questions": (
+        "Based on the imaging, determine whether the patient has an impacted tooth?",
+        "Please confirm whether the patient has an impacted tooth?",
+        "Based on the imaging analysis, does the patient have an impacted tooth?")},
+    "apical_periodontitis": {"name": "Apical Periodontitis", "questions": (
+        "Based on the imaging, does the patient have apical periodontitis abnormalities?",
+        "Is there apical periodontitis in the images?",
+        "Based on the imaging, determine whether the patient has apical periodontitis?")},
+    "residual_root": {"name": "Residual Root", "questions": (
+        "Examine the imaging to determine if there is a disease related to residual roots?",
+        "Does the patient have any oral diseases related to residual roots?",
+        "Based on the imaging, determine whether the patient has residual roots?")},
+    "residual_crown": {"name": "Residual Crown", "questions": (
+        "Please confirm whether the patient has a residual crown?",
+        "Is there any oral disease related to residual crowns identified in the images?",
+        "Based on the imaging, determine whether the patient has a residual crown?")},
+    "insufficient_eruption_space": {"name": "Insufficient Space for Primary Tooth Eruption", "questions": (
+        "Based on the imaging, does the patient have insufficient space for the eruption of primary teeth?",
+        "Does the patient have insufficient space for the eruption of primary teeth?",
+        "Please confirm whether the patient has insufficient space for the eruption of primary teeth?")},
+    "calculus": {"name": "Calculus", "questions": (
+        "Evaluate the images to confirm if there is calculus disease?",
+        "Evaluate the images to confirm if there is a calculus disease?",
+        "Based on the imaging, determine whether the patient has calculus?")},
+}
+MAX_PHRASINGS = 3
 
-# Tooth-anchored count questions. The filling question is Figure 1/9 verbatim.
+# UMFIH class -> DentVLM task(s). A crown or a bridge both count as a prosthetic restoration.
+CONDITION_TASKS = {
+    "dental_implant": ("implant",),
+    "prosthetic_restoration": ("prosthetic_crown", "prosthetic_bridge"),
+    "dental_filling": ("fillings",),
+    "endodontic_treatment": ("root_canal_therapy",),
+    "carious_lesion": ("caries",),
+    "periodontal_bone_loss": ("periodontal_disease",),
+    "impacted_tooth": ("impacted_tooth",),
+    "periapical_lesion": ("apical_periodontitis",),
+    "root_fragment": ("residual_root",),
+}
+TRAINED = tuple(c for c in CONDITIONS if c in CONDITION_TASKS)
+
+# UMFIH classes DentVLM has no task for. Asked only with Protocol.ask_untrained, through
+# Table S7 template #2 with these labels. The paper's zero-shot accuracy on diseases it was
+# not trained on is 52-64%, so this is off by default and scored as trained_task=False.
+UNTRAINED_LABELS = {
+    "furcation_lesion": "furcation involvement",
+    "apical_surgery": "apical surgery",
+    "root_resorption": "root resorption",
+    "orthodontic_device": "an orthodontic appliance",
+    "surgical_device": "surgical fixation plates or screws",
+}
+UNTRAINED_TEMPLATE = "Based on the imaging, determine whether the patient has {label}?"
+
+# DentVLM panoramic tasks without a UMFIH class: asked for the dentist report, never scored.
+EXTRA_TASKS = ("residual_crown", "insufficient_eruption_space", "calculus")
+
+# Out-of-distribution tooth-count questions (DentVLM has no count task). Used only with
+# Protocol.count_question, for the positive countable findings.
 COUNT_QUESTIONS = {
     "dental_implant": "How many dental implants are visualized in the panoramic radiograph?",
     "prosthetic_restoration": "How many teeth in the image have a dental crown or bridge?",
@@ -80,54 +167,109 @@ COUNT_QUESTIONS = {
     "root_fragment": "How many residual roots are visualized in the panoramic radiograph?",
     "root_resorption": "How many teeth in the image show root resorption?",
 }
-COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_QUESTIONS)  # the other five are presence-only
+COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_QUESTIONS)
 
-# The paper says a fixed sentence was appended during RL to request <think> and
-# <answer> tags but does not publish it. This is the common VLM-R1 wording and is
-# a reconstruction; probe() decides whether it is needed at all.
-THINK_SUFFIX = "Output the thinking process in <think> </think> and final answer in <answer> </answer> tags."
-MODES = ("plain", "tagged")
-
-# Crop windows as normalized (left, top, right, bottom). Quadrants use patient-side
-# names in FDI order (UR, UL, LL, LR); image left is the patient's right. Windows
-# overlap by 10% of the width and 20% of the height so a finding on the midline or
-# the occlusal plane is whole in at least one crop; location truth is scored
-# against these same windows.
-CROPS = {
-    "quadrant": {
-        "UR": (0.00, 0.00, 0.55, 0.60),
-        "UL": (0.45, 0.00, 1.00, 0.60),
-        "LL": (0.45, 0.40, 1.00, 1.00),
-        "LR": (0.00, 0.40, 0.55, 1.00),
-    },
-    "arch": {
-        "upper": (0.00, 0.00, 1.00, 0.60),
-        "lower": (0.00, 0.40, 1.00, 1.00),
-    },
+# The nine location descriptors DentVLM writes in its rationale (Supplementary Note S1), in
+# the order of the authors' scorer, and the six dental-arch cells they map onto. "left" and
+# "right" are DentVLM's own words: Table S6 defines its "left posterior region" as FDI
+# quadrants 1 and 4, the patient's right, which is the left side of a panoramic as displayed.
+# LEFT_IS_IMAGE_LEFT records that reading; the DENTEX side check in the notebook confirms it,
+# and flipping it mirrors the cell windows and the FDI mapping together.
+CELLS = ("upper-right", "upper-anterior", "upper-left", "lower-right", "lower-anterior", "lower-left")
+DESCRIPTORS = {
+    "the right posterior region of both the upper and lower dentition": ("upper-right", "lower-right"),
+    "the anterior region of both the upper and lower dentition": ("upper-anterior", "lower-anterior"),
+    "the left posterior region of both the upper and lower dentition": ("upper-left", "lower-left"),
+    "the right posterior region of the upper dentition": ("upper-right",),
+    "the anterior region of the upper dentition": ("upper-anterior",),
+    "the left posterior region of the upper dentition": ("upper-left",),
+    "the right posterior region of the lower dentition": ("lower-right",),
+    "the anterior region of the lower dentition": ("lower-anterior",),
+    "the left posterior region of the lower dentition": ("lower-left",),
 }
-LOCATION_LEVELS = ("none", "arch", "quadrant")
+LEFT_IS_IMAGE_LEFT = True
+
+# Cell windows as normalized (left, top, right, bottom) image coordinates. The anterior
+# window covers incisors and canines; windows overlap so a box on the canine line or the
+# occlusal plane is whole in at least one cell. Location truth is scored against these same
+# windows (dental_eval, 25%-area rule); DENTEX uses its FDI tooth numbers instead.
+_X = {"left": (0.00, 0.45), "anterior": (0.35, 0.65), "right": (0.55, 1.00)}
+_Y = {"upper": (0.00, 0.58), "lower": (0.42, 1.00)}
+_FLIP = {"left": "right", "right": "left", "anterior": "anterior"}
+
+
+def cell_windows(left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> dict[str, tuple[float, float, float, float]]:
+    windows = {}
+    for cell in CELLS:
+        row, col = cell.split("-")
+        image_side = col if left_is_image_left else _FLIP[col]
+        (left, right), (top, bottom) = _X[image_side], _Y[row]
+        windows[cell] = (left, top, right, bottom)
+    return windows
+
+
+CELL_WINDOWS = cell_windows()
+LOCATION_LEVELS = ("rationale", "crops", "none")
+REGION_VOTES = ("union", "majority")
 
 
 # ----------------------------------------------------------------------------
-# Prompts
+# Questions
 # ----------------------------------------------------------------------------
-def with_mode(question: str, mode: str) -> str:
-    if mode not in MODES:
-        raise ValueError(f"mode must be one of {MODES}")
-    return question if mode == "plain" else f"{question}\n\n{THINK_SUFFIX}"
+def questions_for(task: str) -> tuple[str, ...]:
+    if task in TASKS:
+        return TASKS[task]["questions"]
+    if task in UNTRAINED_LABELS:
+        return (UNTRAINED_TEMPLATE.format(label=UNTRAINED_LABELS[task]),)
+    raise KeyError(task)
 
 
-def presence_question(condition: str, mode: str = "plain") -> str:
-    return with_mode(PRESENCE_QUESTION.format(label=LABELS[condition]), mode)
+def task_name(task: str) -> str:
+    return TASKS[task]["name"] if task in TASKS else LABELS[task]
 
 
-def count_question(condition: str, mode: str = "plain") -> str:
-    return with_mode(COUNT_QUESTIONS[condition], mode)
+def condition_tasks(condition: str, ask_untrained: bool = False) -> tuple[str, ...]:
+    """Task keys that decide a condition; empty when the model is not asked about it."""
+    if condition in CONDITION_TASKS:
+        return CONDITION_TASKS[condition]
+    if ask_untrained and condition in UNTRAINED_LABELS:
+        return (condition,)
+    return ()
 
 
 # ----------------------------------------------------------------------------
-# Answer extraction (lenient, like the paper's rule-based reward)
+# Answer extraction (the authors' scorer: line 1 decides, regions by exact match)
 # ----------------------------------------------------------------------------
+_YES = re.compile(r"\byes\b", re.I)
+_NO = re.compile(r"\bno\b", re.I)
+
+
+def first_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def extract_answer(text: str) -> str | None:
+    """'yes', 'no', or None (unparseable). Read from the first line; both words -> None."""
+    line = first_line(text)
+    yes, no = bool(_YES.search(line)), bool(_NO.search(line))
+    if yes == no:
+        return None
+    return "yes" if yes else "no"
+
+
+def extract_regions(text: str) -> list[str]:
+    """Cells named anywhere in the reply through the nine descriptors (exact, case-insensitive)."""
+    low = text.lower()
+    found = set()
+    for descriptor, cells in DESCRIPTORS.items():
+        if descriptor in low:
+            found.update(cells)
+    return [c for c in CELLS if c in found]
+
+
 _NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
     "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
@@ -137,60 +279,9 @@ _FDI_NUMBERS = {q * 10 + t for q in (1, 2, 3, 4) for t in range(1, 9)}
 _TOOTH_REFERENCE = re.compile(r"\b(?:tooth|teeth)[\s:(]*#?\d{1,2}(?:\s*(?:,|and|&)\s*#?\d{1,2})*|#\d{1,2}", re.I)
 
 
-def answer_body(text: str) -> str:
-    """The graded part of a response: last <answer> block, else text after </think>.
-
-    An opened but unclosed <think> block (cut off by max_tokens) is not an answer.
-    """
-    blocks = re.findall(r"<answer>(.*?)</answer>", text, flags=re.I | re.S)
-    if blocks:
-        return blocks[-1].strip()
-    if "</think>" in text:
-        return text.rsplit("</think>", 1)[1].strip()
-    if "<think>" in text:
-        return ""
-    return text.strip()
-
-
-def graded(reply: dict, extract):
-    """Grade a model reply; a reply cut off by max_tokens without a closed <answer> is unparseable."""
-    if reply.get("truncated") and "</answer>" not in reply["text"].lower():
-        return None
-    return extract(reply["text"])
-
-
-def extract_choice(text: str) -> str | None:
-    """Return 'A', 'B', or None (unparseable). Never guesses."""
-    body = answer_body(text)
-    a_option, b_option = r"\bA\s*[.)]\s*True\b", r"\bB\s*[.)]\s*False\b"
-    if re.search(a_option, body, re.I) and re.search(b_option, body, re.I):
-        # The options were restated before answering; drop that first copy only.
-        body = re.sub(a_option, " ", body, count=1, flags=re.I)
-        body = re.sub(b_option, " ", body, count=1, flags=re.I)
-    match = re.search(r"\b([AB])\s*[.):]?\s*(True|False)\b", body, re.I)
-    if match:
-        return match.group(1).upper()
-    # "Answer: A", "The answer is A because ...", "(B)", "**A**", "B." (letter stays case-sensitive
-    # so the article "a" is never read as option A).
-    match = (re.search(r"(?i:answer|option|choice)\s*(?:is|:)?\s*[\"'*(]*([AB])\b", body)
-             or re.search(r"(?:^|[\s(\[*\"'>])([AB])(?=[.),:\]*\"'\n]|\s+(?:is|because)\b|\s*$)", body))
-    if match:
-        return match.group(1)
-    truthy = re.search(r"\b(true|yes)\b", body, re.I)
-    falsy = re.search(r"\b(false|no)\b", body, re.I)
-    if truthy and not falsy:
-        return "A"
-    if falsy and not truthy:
-        return "B"
-    if truthy and falsy:
-        return "A" if truthy.start() < falsy.start() else "B"
-    return None
-
-
 def extract_count(text: str) -> int | None:
-    """Count of teeth/instances in the answer body; None if absent."""
-    body = answer_body(text)
-    # Prefer "10 teeth" / "3 implants" style totals (Figure 9 ends with "demonstrates 10 teeth").
+    """Count of teeth/instances in a reply to the out-of-distribution count question; None if absent."""
+    body = text.strip()
     unit_counts = re.findall(
         r"(?<![\d#])\b(\d{1,3})\s+(?:visible\s+|distinct\s+)?(?:teeth|tooth|dental|implants?|roots?|residual|impacted|lesions?|crowns?|fillings?)\b",
         body, flags=re.I)
@@ -226,27 +317,27 @@ def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
 
 
-def make_crops(image_path: str | Path, level: str, cache_dir: str | Path | None = None) -> dict[str, bytes]:
-    """Return {region: png_bytes} for the requested level, optionally cached on disk."""
-    if level not in CROPS:
-        raise ValueError(f"level must be one of {tuple(CROPS)}")
+def make_crops(image_path: str | Path, windows: dict | None = None,
+               cache_dir: str | Path | None = None) -> dict[str, bytes]:
+    """Return {cell: png_bytes} for the cell windows, optionally cached on disk."""
     from PIL import Image
 
+    windows = windows or CELL_WINDOWS
     crops: dict[str, bytes] = {}
     with Image.open(image_path) as source:
         width, height = source.size
-        for region, (left, top, right, bottom) in CROPS[level].items():
-            target = Path(cache_dir) / f"{Path(image_path).stem}_{region}.png" if cache_dir else None
+        for cell, (left, top, right, bottom) in windows.items():
+            target = Path(cache_dir) / f"{Path(image_path).stem}_{cell}.png" if cache_dir else None
             if target is not None and target.is_file():
-                crops[region] = target.read_bytes()
+                crops[cell] = target.read_bytes()
                 continue
             box = (round(left * width), round(top * height), round(right * width), round(bottom * height))
             buffer = io.BytesIO()
             source.crop(box).save(buffer, format="PNG")
-            crops[region] = buffer.getvalue()
+            crops[cell] = buffer.getvalue()
             if target is not None:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(crops[region])
+                target.write_bytes(crops[cell])
     return crops
 
 
@@ -260,8 +351,8 @@ class VisionRunner:
         self,
         base_url: str | None = "http://127.0.0.1:8080/v1",
         api_key: str = "local-llama-cpp",
-        model: str = "dentalgpt",
-        max_tokens: int = 4096,
+        model: str = "dentvlm",
+        max_tokens: int = 512,
         temperature: float = 0.0,
         timeout: float = 600.0,
         local: bool = True,
@@ -289,6 +380,8 @@ class VisionRunner:
         }
 
     def ask(self, image: str | Path | bytes, question: str) -> dict:
+        # Image before the question and no system message of our own: the chat template
+        # injects Qwen's default "You are a helpful assistant.", which the authors use.
         request = {
             "model": self.model,
             "messages": [{"role": "user", "content": [
@@ -299,11 +392,9 @@ class VisionRunner:
             "temperature": self.temperature,
         }
         if self.local:
-            # Keep <think>/<answer> text intact, reuse the image KV prefix, and use the same
-            # repetition-penalty value as the backbone's generation_config (llama.cpp applies it
-            # over the last 64 tokens rather than the whole sequence).
-            request["extra_body"] = {"reasoning_format": "none", "cache_prompt": self.cache_prompt,
-                                     "repeat_penalty": 1.05, "seed": 0}
+            # Reuse the image KV prefix across the questions of one image; repetition penalty as
+            # in the authors' inference script (1.05).
+            request["extra_body"] = {"cache_prompt": self.cache_prompt, "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
         started = time.perf_counter()
         try:
@@ -329,116 +420,157 @@ class VisionRunner:
 
 
 # ----------------------------------------------------------------------------
-# Probe: does this checkpoint emit <think> tags on its own?
+# Protocol, per-image analysis, dataset runs with resume
 # ----------------------------------------------------------------------------
-def probe(runner, image_paths, n: int = 10) -> dict:
-    """Send the bare presence and count questions, with and without the suffix.
+@dataclass(frozen=True)
+class Protocol:
+    """Everything the wrapper may vary. Defaults are the paper's protocol."""
 
-    Recommends "plain" when the model already reasons in tags on its own, and
-    "tagged" only when the suffix actually produces the tagged format without
-    mostly running past max_tokens.
-    """
-    paths = list(image_paths)[:n]
-    stats = {}
-    for mode in MODES:
-        rows = []
-        for path in paths:
-            for kind, question in (("presence", presence_question("endodontic_treatment", mode)),
-                                   ("count", count_question("dental_filling", mode))):
-                reply = runner.ask(path, question)
-                text = reply["text"]
-                rows.append({
-                    "image": str(path), "kind": kind, "mode": mode, "text": text,
-                    "has_think": "<think>" in text, "has_answer": "<answer>" in text,
-                    "parsed": graded(reply, extract_choice if kind == "presence" else extract_count),
-                    "truncated": reply["truncated"], "completion_tokens": reply["completion_tokens"],
-                })
-        total = len(rows) or 1
-        stats[mode] = {
-            "think_tag_rate": sum(r["has_think"] for r in rows) / total,
-            "answer_tag_rate": sum(r["has_answer"] for r in rows) / total,
-            "parse_rate": sum(r["parsed"] is not None for r in rows) / total,
-            "truncation_rate": sum(r["truncated"] for r in rows) / total,
-            "samples": rows,
-        }
-    plain, tagged = stats["plain"], stats["tagged"]
-    if plain["think_tag_rate"] >= 0.5 or tagged["think_tag_rate"] < 0.5 or tagged["truncation_rate"] > 0.5:
-        recommended = "plain"
+    phrasings: int = 1            # 1, or up to 3 verbatim wordings per task with a majority vote
+    region_vote: str = "union"    # with phrasings > 1: "union" (matching voting) or "majority"
+    location: str = "rationale"   # "rationale" (free, in-distribution) | "crops" (comparison) | "none"
+    count_question: bool = False  # out-of-distribution tooth-count question for positive countables
+    ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
+    extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.phrasings <= MAX_PHRASINGS:
+            raise ValueError(f"phrasings must be between 1 and {MAX_PHRASINGS}")
+        if self.region_vote not in REGION_VOTES:
+            raise ValueError(f"region_vote must be one of {REGION_VOTES}")
+        if self.location not in LOCATION_LEVELS:
+            raise ValueError(f"location must be one of {LOCATION_LEVELS}")
+
+    def tasks(self) -> tuple[str, ...]:
+        """Task keys in asking order: condition tasks in ontology order, then the extras."""
+        keys: list[str] = []
+        for condition in CONDITIONS:
+            keys.extend(condition_tasks(condition, self.ask_untrained))
+        if self.extra_tasks:
+            keys.extend(EXTRA_TASKS)
+        return tuple(dict.fromkeys(keys))
+
+
+def vote(answers: list[dict], region_vote: str) -> dict:
+    """Presence by majority of the parsed answers; regions from the yes answers."""
+    parsed = [a["answer"] for a in answers if a["answer"] is not None]
+    yes, no = parsed.count("yes"), parsed.count("no")
+    presence = "yes" if yes > no else "no" if no > yes else None
+    if presence != "yes":
+        return {"presence": presence, "regions": None}
+    positive = [set(a["regions"]) for a in answers if a["answer"] == "yes"]
+    if region_vote == "union":
+        cells = set().union(*positive)
     else:
-        recommended = "tagged"
-    return {"recommended_mode": recommended, "images": len(paths), **stats}
+        needed = len(positive) // 2 + 1  # strict majority of the yes answers
+        cells = {c for c in CELLS if sum(c in r for r in positive) >= needed}
+    return {"presence": "yes", "regions": [c for c in CELLS if c in cells]}
 
 
-# ----------------------------------------------------------------------------
-# Per-image analysis and dataset runs with resume
-# ----------------------------------------------------------------------------
-def _record(calls: list, stage: str, condition: str, region: str | None, question: str, reply: dict) -> None:
-    calls.append({"stage": stage, "condition": condition, "region": region, "question": question, **reply})
+def _record(calls: list, stage: str, task: str, cell: str | None, question: str, reply: dict) -> None:
+    calls.append({"stage": stage, "task": task, "cell": cell, "question": question, **reply})
 
 
-def analyze_image(runner, image_path: str | Path, mode: str = "plain", location: str = "quadrant",
+def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
+    keys = condition_tasks(condition, protocol.ask_untrained)
+    if not keys or any(k not in tasks for k in keys):
+        return {"asked": False, "tasks": [], "presence": None, "regions": None, "region_count": None, "count": None}
+    answers = [tasks[k]["presence"] for k in keys]
+    if "yes" in answers:
+        presence = "yes"
+    elif all(a == "no" for a in answers):
+        presence = "no"
+    else:
+        presence = None
+    regions = None
+    if presence == "yes" and protocol.location != "none":
+        named = set()
+        for k in keys:
+            if tasks[k]["presence"] == "yes":
+                named.update(tasks[k]["regions"] or [])
+        regions = [c for c in CELLS if c in named]
+    return {"asked": True, "tasks": list(keys), "presence": presence, "regions": regions,
+            "region_count": len(regions) if regions is not None else None, "count": None}
+
+
+def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(),
                   crop_dir: str | Path | None = None) -> dict:
-    """Presence for all 14 findings, counts and crops for positives. Deterministic order."""
-    if location not in LOCATION_LEVELS:
-        raise ValueError(f"location must be one of {LOCATION_LEVELS}")
+    """One yes/no question per task on the whole image; regions from the rationale. Deterministic order."""
     path = Path(image_path)
     calls: list[dict] = []
-    findings = {c: {"presence": None, "count": None, "regions": None} for c in CONDITIONS}
+    tasks: dict[str, dict] = {}
 
-    for condition in CONDITIONS:
-        question = presence_question(condition, mode)
-        reply = runner.ask(path, question)
-        _record(calls, "presence", condition, None, question, reply)
-        findings[condition]["presence"] = graded(reply, extract_choice)
-
-    positives = [c for c in CONDITIONS if findings[c]["presence"] == "A"]
-    for condition in positives:
-        if condition in COUNTABLE:
-            question = count_question(condition, mode)
+    for task in protocol.tasks():
+        answers = []
+        for question in questions_for(task)[:protocol.phrasings]:
             reply = runner.ask(path, question)
-            _record(calls, "count", condition, None, question, reply)
-            findings[condition]["count"] = graded(reply, extract_count)
+            _record(calls, "presence", task, None, question, reply)
+            answers.append({"answer": extract_answer(reply["text"]), "regions": extract_regions(reply["text"]),
+                            "truncated": reply["truncated"]})
+        tasks[task] = {"name": task_name(task), "answers": answers, **vote(answers, protocol.region_vote)}
 
-    if location != "none" and positives:
-        crops = make_crops(path, location, crop_dir)
-        for condition in positives:
-            findings[condition]["regions"] = {}
-        for region, png in crops.items():  # region-major order keeps the image prefix cached
-            for condition in positives:
-                question = presence_question(condition, mode)
+    positives = [t for t in tasks if tasks[t]["presence"] == "yes"]
+    if protocol.location == "crops" and positives:
+        # Comparison only: cropped panoramics are outside DentVLM's image distribution.
+        crops = make_crops(path, CELL_WINDOWS, crop_dir)
+        for task in positives:
+            tasks[task]["regions"] = []
+        for cell, png in crops.items():  # cell-major order keeps the image prefix cached
+            for task in positives:
+                question = questions_for(task)[0]
                 reply = runner.ask(png, question)
-                _record(calls, "region", condition, region, question, reply)
-                findings[condition]["regions"][region] = graded(reply, extract_choice)
+                _record(calls, "crop", task, cell, question, reply)
+                if extract_answer(reply["text"]) == "yes":
+                    tasks[task]["regions"].append(cell)
+    elif protocol.location == "none":
+        for task in tasks:
+            tasks[task]["regions"] = None
+
+    findings = {c: _finding(c, tasks, protocol) for c in CONDITIONS}
+    if protocol.count_question:
+        for condition in COUNTABLE:
+            if findings[condition]["presence"] == "yes":
+                question = COUNT_QUESTIONS[condition]
+                reply = runner.ask(path, question)
+                _record(calls, "count", condition, None, question, reply)
+                findings[condition]["count"] = extract_count(reply["text"])
 
     return {
         "image": str(path.resolve()),
         "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "mode": mode,
-        "location_level": location,
+        "protocol": asdict(protocol),
+        "location_level": protocol.location,
+        "left_is_image_left": LEFT_IS_IMAGE_LEFT,
+        "tasks": tasks,
         "findings": findings,
         "calls": calls,
         "call_count": len(calls),
     }
 
 
-def run_config(mode: str, location: str, runner_settings: dict, provenance: dict | None = None) -> dict:
+def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | None = None) -> dict:
     """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts."""
     config = {
-        "mode": mode, "location_level": location, "labels": LABELS, "presence_question": PRESENCE_QUESTION,
-        "count_questions": COUNT_QUESTIONS, "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
-        "crops": CROPS.get(location), "runner": runner_settings, "provenance": provenance or {},
+        "protocol": asdict(protocol),
+        "questions": {task: questions_for(task)[:protocol.phrasings] for task in protocol.tasks()},
+        "count_questions": COUNT_QUESTIONS if protocol.count_question else None,
+        "descriptors": DESCRIPTORS, "cells": CELLS,
+        # Cell windows shape the model input only in crop mode; elsewhere they are evaluation
+        # geometry, so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
+        "cell_windows": CELL_WINDOWS if protocol.location == "crops" else None,
+        "runner": runner_settings, "provenance": provenance or {},
     }
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
 
 
-def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode: str = "plain",
-                location: str = "quadrant", resume: bool = True, provenance: dict | None = None) -> Path:
+def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, protocol: Protocol = Protocol(),
+                resume: bool = True, provenance: dict | None = None) -> Path:
     """Analyze every image, one JSON per image, skipping finished ones on resume."""
     out = Path(out_dir)
     results_dir = out / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    config = run_config(mode, location, runner.settings(), provenance)
+    config = run_config(protocol, runner.settings(), provenance)
     manifest_path = out / "manifest.json"
     if manifest_path.is_file():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -453,7 +585,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
         if resume and target.is_file():
             continue
         print(f"[{index}/{len(todo)}] {image_id}")
-        result = analyze_image(runner, path, mode=mode, location=location, crop_dir=out / "crops")
+        result = analyze_image(runner, path, protocol=protocol, crop_dir=out / "crops")
         result["image_id"] = image_id
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -469,28 +601,50 @@ def load_results(out_dir: str | Path) -> dict[str, dict]:
     return results
 
 
+# ----------------------------------------------------------------------------
+# Dentist summary
+# ----------------------------------------------------------------------------
+def describe_cell(cell: str, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> str:
+    """Patient-side wording for a cell, with the image side in parentheses."""
+    row, col = cell.split("-")
+    if col == "anterior":
+        return f"{row} anterior"
+    image_side = col if left_is_image_left else _FLIP[col]
+    return f"patient's {row} {_FLIP[image_side]} posterior (image {image_side})"
+
+
 def dentist_report(result: dict) -> str:
     """Deterministic plain-text summary of one image result for a dentist."""
-    present, absent, unclear = [], [], []
+    flag = result.get("left_is_image_left", LEFT_IS_IMAGE_LEFT)
+    present, absent, unclear, not_assessed = [], [], [], []
     for condition in CONDITIONS:
         finding = result["findings"][condition]
         label = LABELS[condition]
-        if finding["presence"] == "A":
+        if not finding["asked"]:
+            not_assessed.append(label)
+        elif finding["presence"] == "yes":
             parts = [label]
+            if finding["regions"]:
+                parts.append(f"in {len(finding['regions'])} region(s): "
+                             + ", ".join(describe_cell(c, flag) for c in finding["regions"]))
+            elif finding["regions"] is not None:
+                parts.append("region not stated")
             if finding["count"] is not None:
-                parts.append(f"count {finding['count']}")
-            if finding["regions"] is not None:
-                hits = [r for r, a in finding["regions"].items() if a == "A"]
-                parts.append("location " + ", ".join(hits) if hits else "location not resolved")
+                parts.append(f"count {finding['count']} (experimental)")
             present.append(" - " + "; ".join(parts))
-        elif finding["presence"] == "B":
+        elif finding["presence"] == "no":
             absent.append(label)
         else:
             unclear.append(label)
+    extras_present = [t["name"] for k, t in result["tasks"].items() if k in EXTRA_TASKS and t["presence"] == "yes"]
     lines = [f"Image: {Path(result['image']).name}", "Findings present:"]
     lines += present or [" - none"]
+    if extras_present:
+        lines.append("Also present (no benchmark class): " + ", ".join(extras_present))
     lines.append("Not seen: " + (", ".join(absent) or "none"))
     if unclear:
         lines.append("Not assessable (unparseable answer): " + ", ".join(unclear))
+    if not_assessed:
+        lines.append("Not assessed by this model: " + ", ".join(not_assessed))
     lines.append("Experimental model output for dentist review; not a diagnosis.")
     return "\n".join(lines)
