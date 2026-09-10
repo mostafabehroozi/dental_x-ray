@@ -10,6 +10,11 @@ Findings the model was not asked about are listed as not assessed and skipped.
 Unparseable answers are excluded from the per-finding confusion tables and
 reported as counts. The per-image complete-case rate and recall are strict: a
 true finding whose answer was unparseable counts as not caught.
+
+Location truth (which cells a true box occupies) comes, in this order, from
+regions attached to the box by location_adapter (apply_adapted), from DENTEX
+FDI tooth numbers, or from the fixed cell windows. The evaluation summary
+reports which source placed how many boxes.
 """
 from __future__ import annotations
 
@@ -17,7 +22,8 @@ import csv
 import json
 from pathlib import Path
 
-from dental_pipeline import CELL_WINDOWS, CELLS, CONDITIONS, COUNTABLE, LEFT_IS_IMAGE_LEFT, TRAINED
+from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, COUNTABLE, LEFT_IS_IMAGE_LEFT, TRAINED, fdi_unit,
+                             unit_cell, units_to_cells)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -104,18 +110,11 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
 # ----------------------------------------------------------------------------
 def fdi_cell(quadrant: int, tooth: int, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> str:
     """DentVLM's cell for an FDI tooth (Table S6): its 'left' is FDI quadrants 1/4 (patient's right)."""
-    row = "upper" if quadrant in (1, 2, 5, 6) else "lower"
-    if tooth <= 3:
-        return f"{row}-anterior"
-    patient_right = quadrant in (1, 4, 5, 8)
-    col = ("left" if patient_right else "right") if left_is_image_left else ("right" if patient_right else "left")
-    return f"{row}-{col}"
+    return unit_cell(fdi_unit(quadrant, tooth), left_is_image_left)
 
 
-def box_regions(box: dict, windows: dict | None = None) -> set[str]:
-    """Cells holding the box: exact from FDI when present, else windows holding >= 25% of its area."""
-    if box.get("fdi"):
-        return {fdi_cell(*box["fdi"])}
+def geometric_regions(box: dict, windows: dict | None = None) -> set[str]:
+    """Cells whose fixed window holds >= 25% of the box area (the model-free fallback)."""
     windows = windows or CELL_WINDOWS
     left, top = box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2
     right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
@@ -128,6 +127,22 @@ def box_regions(box: dict, windows: dict | None = None) -> set[str]:
     return hits
 
 
+def box_regions(box: dict, windows: dict | None = None) -> set[str]:
+    """Cells holding the box: adapted regions if attached, else exact from FDI, else geometry."""
+    if box.get("regions") is not None:
+        return set(box["regions"])
+    if box.get("fdi"):
+        return {fdi_cell(*box["fdi"])}
+    return geometric_regions(box, windows)
+
+
+def box_source(box: dict) -> str:
+    """Which method decides this box's cells (see box_regions)."""
+    if box.get("regions") is not None:
+        return box.get("region_source", "adapted")
+    return "fdi" if box.get("fdi") else "geometry"
+
+
 def gt_regions(boxes: list[dict]) -> set[str]:
     regions = set()
     for box in boxes:
@@ -137,6 +152,68 @@ def gt_regions(boxes: list[dict]) -> set[str]:
 
 def straddling(box: dict) -> bool:
     return len(box_regions(box)) > 1
+
+
+# ----------------------------------------------------------------------------
+# Adapted location truth (location_adapter output)
+# ----------------------------------------------------------------------------
+def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, dict]:
+    """Copy of gt whose boxes carry the adapter's cells as box['regions'] (+ 'region_source').
+
+    Units (from the LLM adapter) and geometry fallbacks are re-mapped here, so flipping
+    LEFT_IS_IMAGE_LEFT changes the truth without new adapter calls; cells named by the
+    local model itself (source "fdm") are already in its own convention and stay as saved.
+    """
+    out = {}
+    for image_id, entry in gt.items():
+        boxes = [dict(b) for b in entry["boxes"]]
+        records = adapted.get(image_id, {}).get("boxes") if boxes else []
+        if records is None or len(records) != len(boxes):
+            raise ValueError(f"{image_id}: {len(boxes)} boxes but adapted truth for "
+                             f"{len(records) if records else 0}; run the adapter on every image of this dataset")
+        for box, record in zip(boxes, records):
+            if record["source"] == "llm" and record.get("units"):
+                box["regions"] = units_to_cells(record["units"])
+            elif record["source"] == "fdm":
+                box["regions"] = list(record["regions"])
+            else:
+                box["regions"] = [c for c in CELLS if c in geometric_regions(box)]
+            box["region_source"] = record["source"]
+        out[image_id] = {**entry, "boxes": boxes}
+    return out
+
+
+def location_truth_summary(gt: dict[str, dict]) -> dict:
+    """How many true boxes each truth source placed (adapted llm/fdm, fdi, geometry)."""
+    counts: dict[str, int] = {}
+    for entry in gt.values():
+        for box in entry["boxes"]:
+            counts[box_source(box)] = counts.get(box_source(box), 0) + 1
+    return {"boxes": sum(counts.values()), "by_source": dict(sorted(counts.items()))}
+
+
+def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
+    """On boxes with FDI tooth numbers (DENTEX): how often the adapter's and the geometric cells
+    match the exact FDI cell. This is the adapter's own accuracy check."""
+    n = adapter_exact = adapter_contains = geometry_exact = geometry_contains = 0
+    for image_id, entry in gt.items():
+        records = adapted.get(image_id, {}).get("boxes", [])
+        for box, record in zip(entry["boxes"], records):
+            if not box.get("fdi"):
+                continue
+            truth = fdi_cell(*box["fdi"])
+            if record["source"] == "llm" and record.get("units"):
+                predicted = set(units_to_cells(record["units"]))
+            else:
+                predicted = set(record["regions"])
+            geometry = geometric_regions(box)
+            n += 1
+            adapter_exact += predicted == {truth}
+            adapter_contains += truth in predicted
+            geometry_exact += geometry == {truth}
+            geometry_contains += truth in geometry
+    return {"boxes_with_fdi": n, "adapter_exact": _ratio(adapter_exact, n), "adapter_contains": _ratio(adapter_contains, n),
+            "geometry_exact": _ratio(geometry_exact, n), "geometry_contains": _ratio(geometry_contains, n)}
 
 
 # ----------------------------------------------------------------------------
@@ -259,6 +336,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "location_level": level, "not_assessed": not_assessed,
+        "location_truth": location_truth_summary({i: gt[i] for i in ids}),
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),

@@ -209,6 +209,39 @@ def cell_windows(left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> dict[str, tup
 
 
 CELL_WINDOWS = cell_windows()
+
+# Dental-arch units: FDI quadrant x {anterior, posterior}. This is how DentVLM's authors built
+# their location labels (box -> nearest teeth -> tooth-region mapping; anterior = incisors and
+# canine, positions 1-3) and the finest division the six cells are made of, so ground-truth
+# boxes translated into units (location_adapter) map onto cells deterministically.
+UNITS = ("Q1-posterior", "Q1-anterior", "Q2-anterior", "Q2-posterior",
+         "Q3-posterior", "Q3-anterior", "Q4-anterior", "Q4-posterior")
+
+
+def fdi_unit(quadrant: int, tooth: int) -> str:
+    """Unit of an FDI tooth position; primary-dentition quadrants 5-8 fold onto 1-4."""
+    quadrant = quadrant - 4 if quadrant > 4 else quadrant
+    return f"Q{quadrant}-{'anterior' if tooth <= 3 else 'posterior'}"
+
+
+def unit_cell(unit: str, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> str:
+    """DentVLM's cell for a unit (Table S6): its 'left' is FDI quadrants 1/4, the patient's right."""
+    if unit not in UNITS:
+        raise ValueError(f"unknown unit {unit!r}")
+    quadrant, zone = int(unit[1]), unit.split("-")[1]
+    row = "upper" if quadrant in (1, 2) else "lower"
+    if zone == "anterior":
+        return f"{row}-anterior"
+    patient_right = quadrant in (1, 4)
+    col = ("left" if patient_right else "right") if left_is_image_left else ("right" if patient_right else "left")
+    return f"{row}-{col}"
+
+
+def units_to_cells(units, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> list[str]:
+    cells = {unit_cell(u, left_is_image_left) for u in units}
+    return [c for c in CELLS if c in cells]
+
+
 LOCATION_LEVELS = ("rationale", "crops", "none")
 REGION_VOTES = ("union", "majority")
 

@@ -53,10 +53,11 @@ side, and the notebook checks the convention against DENTEX boxes.
 | File | Role |
 | --- | --- |
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), cell geometry, metrics, side-convention check, CSV/JSON export |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics, side-convention check, CSV/JSON export |
+| `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
-| `test_dental_pipeline.py` | offline tests with a fake model (`python -m unittest -q test_dental_pipeline`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Calls per image
 
@@ -110,9 +111,51 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
   LabelMe files with unmapped Turkish labels and is not supported.
 
 Each dataset is scored on the findings it annotates and the model was asked
-about; unannotated findings are not counted as negatives. Geometric location
-truth (UMFIH) counts a box in every cell window holding at least a quarter of
-its area; the windows overlap on the canine line and the occlusal plane.
+about; unannotated findings are not counted as negatives.
+
+## Location truth
+
+Ground truth is numeric (boxes); DentVLM reports six cells. Scoring location
+means deciding which cells each true box occupies, and fixed image windows do
+that badly: the midline, the canine line and the occlusal plane move with
+patient positioning and the shape of the arch. DentVLM's authors built their
+own location labels anatomically (box, nearest teeth, tooth-region mapping;
+Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
+
+* `"llm"` (recommended): `location_adapter.LLMAdapter` draws numbered boxes on
+  the radiograph, burns the FDI quadrant names into the corners, and asks a
+  strong vision model through any OpenAI-compatible API (GPT-5, Gemini's
+  compatibility endpoint, NIM, ...) for the dental-arch units each box
+  occupies: FDI quadrant x anterior (incisors and canine) / posterior
+  (premolars, molars and behind), plus the FDI tooth positions. Units are the
+  finest division the six cells are made of, so the mapping onto cells is
+  deterministic (`dental_pipeline.unit_cell`) and follows the same
+  `LEFT_IS_IMAGE_LEFT` reading as the model's own words. One call per image
+  (chunked above `max_boxes_per_call` boxes), strict JSON back, one retry when
+  the reply is incomplete, and a box the model cannot place falls back to the
+  windows. For reasoning models set `token_param` to `max_completion_tokens`
+  and leave `temperature` at `None`.
+* `"fdm"` (experimental): DentVLM itself. It has no question about a marked
+  region, so the task is split into one in-distribution question per box: a
+  full-frame "spotlight" copy that shows only the box and a margin, the
+  finding's own Table S7 question, and the descriptor DentVLM writes in its
+  rationale. The truth then lives in the model's own convention, but masked
+  panoramics are outside its image distribution; boxes it answers "No" to, or
+  findings without a DentVLM task, fall back to the windows.
+* `"geometry"`: the fixed cell windows (a box counts in every window holding at
+  least a quarter of its area; the windows overlap on the canine line and the
+  occlusal plane). No model calls.
+
+The adapter runs once per dataset and adapter (Cell 12), independently of the
+model run, and resumes: one JSON per image under
+`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
+cells, the windows' answer and the source that placed the box; the drawn or
+spotlighted images are kept under `.../drawn` for audit. DENTEX boxes carry FDI
+tooth numbers, which give exact cells, so on a DENTEX dataset Cell 12 also
+prints the adapter's and the windows' agreement with that exact truth
+(`dental_eval.truth_agreement`): the check that the adapter is worth its calls.
+`evaluation.json` records under `summary.location_truth` how many true boxes
+each source placed.
 
 ## Evaluation outputs
 
@@ -128,7 +171,9 @@ not assessed.
 
 * The paper reports DentVLM's own location IoU at about 38% on its test set, so
   cell-level location is a coarse signal; the presence answer is the reliable
-  part.
+  part. Location truth from the LLM adapter is itself a model output: read the
+  DENTEX agreement numbers and spot-check the drawn images before trusting the
+  region rows.
 * Caries and calculus are the weakest panoramic tasks in the paper (about 63%
   and 62%); implants, bridges and crowns the strongest (above 90%).
 * Ground-truth boxes are per instance while the model names regions, so the
