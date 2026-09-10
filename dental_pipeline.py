@@ -107,6 +107,41 @@ CROPS = {
 }
 LOCATION_LEVELS = ("none", "arch", "quadrant")
 
+# Dental-arch units: FDI quadrant x {anterior, posterior}, the finest division the quadrant and
+# arch windows are made of (anterior = incisors and canine, positions 1-3). Ground-truth boxes
+# translated into units (location_adapter) map onto the crop names deterministically; the same
+# unit output also serves a six-cell vocabulary (DentVLM branch). Quadrant names are patient-side
+# in FDI order; UR and LR are the image-left windows.
+UNITS = ("Q1-posterior", "Q1-anterior", "Q2-anterior", "Q2-posterior",
+         "Q3-posterior", "Q3-anterior", "Q4-anterior", "Q4-posterior")
+UNIT_QUADRANT = {"Q1": "UR", "Q2": "UL", "Q3": "LL", "Q4": "LR"}
+QUADRANT_ARCH = {"UR": "upper", "UL": "upper", "LL": "lower", "LR": "lower"}
+
+
+def fdi_unit(quadrant: int, tooth: int) -> str:
+    """Unit of an FDI tooth position; primary-dentition quadrants 5-8 fold onto 1-4."""
+    quadrant = quadrant - 4 if quadrant > 4 else quadrant
+    return f"Q{quadrant}-{'anterior' if tooth <= 3 else 'posterior'}"
+
+
+def unit_region(unit: str, level: str = "quadrant") -> str:
+    """Crop-window name of a unit at the given level."""
+    if unit not in UNITS:
+        raise ValueError(f"unknown unit {unit!r}")
+    quadrant = UNIT_QUADRANT[unit.split("-")[0]]
+    return quadrant if level == "quadrant" else QUADRANT_ARCH[quadrant]
+
+
+def units_to_regions(units, level: str = "quadrant") -> list[str]:
+    names = {unit_region(u, level) for u in units}
+    return [r for r in CROPS[level] if r in names]
+
+
+def quadrants_to_regions(quadrants, level: str = "quadrant") -> list[str]:
+    """Quadrant names (UR, UL, LL, LR) at the given level, in window order."""
+    names = set(quadrants) if level == "quadrant" else {QUADRANT_ARCH[q] for q in quadrants}
+    return [r for r in CROPS[level] if r in names]
+
 
 # ----------------------------------------------------------------------------
 # Prompts

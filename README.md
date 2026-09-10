@@ -38,10 +38,11 @@ probe therefore decides once per run whether the suffix is needed ("plain" or
 | File | Role |
 | --- | --- |
 | `dental_pipeline.py` | prompts, answer extraction, quadrant crops, model runner, probe, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX), quadrant geometry, metrics, CSV/JSON export |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics, CSV/JSON export |
+| `location_adapter.py` | translates ground-truth boxes into the quadrant windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
-| `test_dental_pipeline.py` | offline tests with a fake model (`python -m unittest -q test_dental_pipeline`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Calls per image
 
@@ -73,7 +74,7 @@ four or five positives needs about 35 calls; an all-negative image needs 14.
   note): the exact ontology, YOLO boxes. Score the 100-image internal test split
   and the 180 external-validation images separately.
 * **DENTEX** (Hugging Face `ibrahimhamamci/DENTEX`, CC BY-NC-SA): FDI
-  quadrant labels for caries, periapical lesion, and impacted tooth. Gives real
+  quadrant labels for caries, periapical lesion, and impacted tooth. Gives exact
   quadrant ground truth for those three findings. Use the fully labeled train
   split (`training_data/quadrant-enumeration-disease`, 705 images) and the
   validation split (`validation_triple.json`, 50 images); DentalGPT never saw
@@ -81,10 +82,54 @@ four or five positives needs about 35 calls; an all-negative image needs 14.
   with unmapped Turkish labels and is not supported.
 
 Each dataset is scored on the findings it annotates; unannotated findings are
-not counted as negatives. Location truth is scored against the same overlapping
-crop windows the model saw: a box counts in every window that holds at least a
-quarter of its area. With two datasets the notebook also prints a pooled
+not counted as negatives. With two datasets the notebook also prints a pooled
 table over the shared findings.
+
+## Location truth
+
+Ground truth is numeric (boxes); the pipeline localizes a finding as the set of
+quadrant crops that answer True. Scoring location means deciding which quadrant
+windows each true box occupies, and fixed image fractions do that badly: the
+midline and the occlusal plane move with patient positioning and the shape of
+the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
+
+* `"llm"` (recommended): `location_adapter.LLMAdapter` draws numbered boxes on
+  the radiograph, burns the FDI quadrant names into the corners, and asks a
+  strong vision model through any OpenAI-compatible API (GPT-5, Gemini's
+  compatibility endpoint, NIM, ...) for the dental-arch units each box
+  occupies: FDI quadrant x anterior (incisors and canine) / posterior
+  (premolars, molars and behind), plus the FDI tooth positions. Units are the
+  finest division the quadrant and arch windows are made of, so the mapping
+  onto the pipeline's names is deterministic (`dental_pipeline.unit_region`),
+  and the same output serves the six-cell vocabulary of the DentVLM branch.
+  One call per image (chunked above `max_boxes_per_call` boxes), strict JSON
+  back, one retry when the reply is incomplete, and a box the model cannot
+  place falls back to the windows. For reasoning models set `token_param` to
+  `max_completion_tokens` and leave `temperature` at `None`.
+* `"fdm"` (experimental): DentalGPT itself. It was trained with reinforcement
+  learning on multiple-choice questions, so the task is split into two short
+  questions per box in the Figure 7 shape, on a copy of the image with only
+  that box drawn in red: which jaw (upper / lower / both) and which side of the
+  image (left / right / both). Sides are asked as image sides so the model never
+  resolves the patient-side convention; the quadrant follows in Python. The
+  probe's `<think>/<answer>` mode is reused. Drawn boxes are outside the
+  model's training images, and an unparseable answer leaves the box to the
+  windows.
+* `"geometry"`: the fixed crop windows (a box counts in every window holding at
+  least a quarter of its area; the windows overlap on the midline and the
+  occlusal plane). No model calls.
+
+The adapter runs once per dataset and adapter (Cell 12), independently of the
+model run, and resumes: one JSON per image under
+`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
+quadrants, the windows' answer and the source that placed the box; the drawn
+images are kept under `.../drawn` for audit. DENTEX boxes carry FDI quadrant
+labels, which are exact, so on a DENTEX dataset Cell 12 also prints the
+adapter's and the windows' agreement with that truth
+(`dental_eval.truth_agreement`): the check that the adapter is worth its calls.
+`evaluation.json` records under `summary.location_truth` how many true boxes
+each source placed. Arch-level scoring (`LOCATION="arch"`) derives from the
+same quadrants.
 
 ## Evaluation outputs
 
@@ -100,6 +145,9 @@ false alarms per image.
 
 * Ten of the 14 findings are outside the paper's evaluated panoramic labels;
   read the `paper_covered` column before comparing to the paper's 84%.
+* Location truth from the LLM adapter is itself a model output: read the DENTEX
+  agreement numbers and spot-check the drawn images before trusting the region
+  rows.
 * Ground-truth boxes are per instance while the model counts teeth, so counts
   for crowns/bridges and multi-box fillings carry definitional error.
 * Apical surgery, root resorption, and furcation have very few positives in

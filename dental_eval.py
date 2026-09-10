@@ -8,6 +8,11 @@ per-image numbers a dentist cares about (complete-case rate, false alarms).
 Unparseable answers are excluded from the per-finding confusion tables and
 reported as counts. The per-image complete-case rate and recall are strict: a
 true finding whose answer was unparseable counts as not caught.
+
+Location truth (which crop windows a true box occupies) comes, in this order,
+from regions attached to the box by location_adapter (apply_adapted), from
+DENTEX FDI quadrant labels, or from the fixed crop windows. The evaluation
+summary reports which source placed how many boxes.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import csv
 import json
 from pathlib import Path
 
-from dental_pipeline import CONDITIONS, COUNTABLE, CROPS
+from dental_pipeline import CONDITIONS, COUNTABLE, CROPS, UNIT_QUADRANT, quadrants_to_regions, units_to_regions
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -38,7 +43,7 @@ DENTEX_DISEASES = {
 
 # ----------------------------------------------------------------------------
 # Ground truth loaders -> {image_id: {"path", "boxes", "annotated"}}
-# box = {"condition", "xc", "yc", "w", "h", "quadrant" (optional, from labels)}
+# box = {"condition", "xc", "yc", "w", "h", "fdi" (optional (quadrant, tooth))}
 # ----------------------------------------------------------------------------
 def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]:
     images_root, labels_root = Path(images_dir), Path(labels_dir)
@@ -69,6 +74,8 @@ def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]
 def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[str, dict]:
     """DENTEX quadrant-enumeration-disease split (COCO-style JSON; train or validation_triple)."""
     payload = json.loads(Path(annotations_json).read_text(encoding="utf-8"))
+    quadrants = {c["id"]: int(c["name"]) for c in payload.get("categories_1", []) if str(c["name"]).strip().isdigit()}
+    teeth = {c["id"]: int(c["name"]) for c in payload.get("categories_2", []) if str(c["name"]).strip().isdigit()}
     disease_names = {c["id"]: str(c["name"]).strip().lower() for c in payload.get("categories_3", [])}
     images = {img["id"]: img for img in payload["images"]}
     dataset = {}
@@ -86,10 +93,12 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
             raise ValueError(f"unknown DENTEX disease label {disease!r}")
         x, y, w, h = ann["bbox"]
         width, height = img["width"], img["height"]
-        # Location truth comes from box geometry; DENTEX's own FDI quadrant labels agree with
-        # it on 97% of validation boxes, which confirms the image-left = patient-right convention.
         box = {"condition": condition, "xc": (x + w / 2) / width, "yc": (y + h / 2) / height,
                "w": w / width, "h": h / height}
+        # FDI quadrant and tooth number give exact quadrant truth. They agree with box geometry on
+        # 97% of validation boxes, which confirms the image-left = patient-right display convention.
+        if ann.get("category_id_1") in quadrants and ann.get("category_id_2") in teeth:
+            box["fdi"] = (quadrants[ann["category_id_1"]], teeth[ann["category_id_2"]])
         dataset[Path(img["file_name"]).stem]["boxes"].append(box)
     return dataset
 
@@ -97,8 +106,13 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
 # ----------------------------------------------------------------------------
 # Geometry
 # ----------------------------------------------------------------------------
-def box_regions(box: dict, level: str) -> set[str]:
-    """Crop windows of the given level holding >= 25% of the box area."""
+def fdi_quadrant(quadrant: int) -> str:
+    """Quadrant window name of an FDI quadrant (primary-dentition quadrants 5-8 fold onto 1-4)."""
+    return UNIT_QUADRANT[f"Q{quadrant - 4 if quadrant > 4 else quadrant}"]
+
+
+def geometric_regions(box: dict, level: str) -> set[str]:
+    """Crop windows of the given level holding >= 25% of the box area (the model-free fallback)."""
     left, top = box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2
     right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
     area = max(box["w"] * box["h"], 1e-9)
@@ -110,6 +124,22 @@ def box_regions(box: dict, level: str) -> set[str]:
     return hits
 
 
+def box_regions(box: dict, level: str) -> set[str]:
+    """Windows holding the box: adapted quadrants if attached, else exact from FDI, else geometry."""
+    if box.get("regions") is not None:
+        return set(quadrants_to_regions(box["regions"], level))
+    if box.get("fdi"):
+        return set(quadrants_to_regions([fdi_quadrant(box["fdi"][0])], level))
+    return geometric_regions(box, level)
+
+
+def box_source(box: dict) -> str:
+    """Which method decides this box's windows (see box_regions)."""
+    if box.get("regions") is not None:
+        return box.get("region_source", "adapted")
+    return "fdi" if box.get("fdi") else "geometry"
+
+
 def gt_regions(boxes: list[dict], level: str) -> set[str]:
     regions = set()
     for box in boxes:
@@ -119,6 +149,67 @@ def gt_regions(boxes: list[dict], level: str) -> set[str]:
 
 def straddling(box: dict, level: str) -> bool:
     return len(box_regions(box, level)) > 1
+
+
+# ----------------------------------------------------------------------------
+# Adapted location truth (location_adapter output)
+# ----------------------------------------------------------------------------
+def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, dict]:
+    """Copy of gt whose boxes carry the adapter's quadrants as box['regions'] (+ 'region_source').
+
+    Units from the LLM adapter and geometry fallbacks are re-mapped here; quadrants named by the
+    local model itself (source "fdm") stay as saved.
+    """
+    out = {}
+    for image_id, entry in gt.items():
+        boxes = [dict(b) for b in entry["boxes"]]
+        records = adapted.get(image_id, {}).get("boxes") if boxes else []
+        if records is None or len(records) != len(boxes):
+            raise ValueError(f"{image_id}: {len(boxes)} boxes but adapted truth for "
+                             f"{len(records) if records else 0}; run the adapter on every image of this dataset")
+        for box, record in zip(boxes, records):
+            if record["source"] == "llm" and record.get("units"):
+                box["regions"] = units_to_regions(record["units"])
+            elif record["source"] == "fdm":
+                box["regions"] = list(record["regions"])
+            else:
+                box["regions"] = quadrants_to_regions(geometric_regions(box, "quadrant"))
+            box["region_source"] = record["source"]
+        out[image_id] = {**entry, "boxes": boxes}
+    return out
+
+
+def location_truth_summary(gt: dict[str, dict]) -> dict:
+    """How many true boxes each truth source placed (adapted llm/fdm, fdi, geometry)."""
+    counts: dict[str, int] = {}
+    for entry in gt.values():
+        for box in entry["boxes"]:
+            counts[box_source(box)] = counts.get(box_source(box), 0) + 1
+    return {"boxes": sum(counts.values()), "by_source": dict(sorted(counts.items()))}
+
+
+def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
+    """On boxes with FDI labels (DENTEX): how often the adapter's and the geometric quadrants match
+    the exact FDI quadrant. This is the adapter's own accuracy check."""
+    n = adapter_exact = adapter_contains = geometry_exact = geometry_contains = 0
+    for image_id, entry in gt.items():
+        records = adapted.get(image_id, {}).get("boxes", [])
+        for box, record in zip(entry["boxes"], records):
+            if not box.get("fdi"):
+                continue
+            truth = fdi_quadrant(box["fdi"][0])
+            if record["source"] == "llm" and record.get("units"):
+                predicted = set(units_to_regions(record["units"]))
+            else:
+                predicted = set(record["regions"])
+            geometry = geometric_regions(box, "quadrant")
+            n += 1
+            adapter_exact += predicted == {truth}
+            adapter_contains += truth in predicted
+            geometry_exact += geometry == {truth}
+            geometry_contains += truth in geometry
+    return {"boxes_with_fdi": n, "adapter_exact": _ratio(adapter_exact, n), "adapter_contains": _ratio(adapter_contains, n),
+            "geometry_exact": _ratio(geometry_exact, n), "geometry_contains": _ratio(geometry_contains, n)}
 
 
 # ----------------------------------------------------------------------------
@@ -238,7 +329,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     f1s = [r["f1"] for r in presence if r["f1"] is not None]
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
-        "location_level": level, **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
+        "location_level": level, "location_truth": location_truth_summary({i: gt[i] for i in ids}),
+        **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
         "complete_case_rate": _ratio(sum(r["complete_case"] for r in per_image), len(per_image)),
