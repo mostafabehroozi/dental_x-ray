@@ -176,7 +176,9 @@ class AdapterTests(unittest.TestCase):
         region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "quadrant").items()}
         script = {("presence", "dental_filling", None): "A", ("count", "dental_filling", None): "2",
                   ("region", "dental_filling", "UR"): "A"}
-        results = dp.load_results(dp.run_dataset(FakeRunner(script, region_of), self.images, self.root / "run"))
+        results = dp.load_results(dp.run_dataset(
+            FakeRunner(script, region_of), self.images, self.root / "run",
+            protocol=dp.Protocol(presence_level="region", count_level="overall", region_prompt="crop")))
         geometry = {r["condition"]: r for r in ev.evaluate(self.gt, results, dataset="toy")["regions"]}
         self.assertEqual((geometry["dental_filling"]["TP"], geometry["dental_filling"]["FN"]), (1, 0))
         truth = ev.apply_adapted(self.gt, adapted)

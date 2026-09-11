@@ -11,21 +11,29 @@ DentalGPT (arXiv 2512.11558) was fine-tuned from Qwen2.5-VL-7B and then trained
 with reinforcement learning on multiple-choice questions. The only panoramic
 skill the paper measures is one condition per question, answered True/False
 (Figure 7, 84% accuracy). Counting appears once, as a tooth count with a prose
-answer (Figure 9). Location is never asked. So:
+answer (Figure 9). Location is never asked in the paper, but the panoramic
+benchmark it was scored on (MMOral-OPG-Bench, arXiv 2509.09254) asks "in which
+jaw" and counts "in the lower jaw", and the model itself, in Figure 9, counts
+per jaw and walks "the right upper quadrant ... the left lower quadrant" by
+name. So:
 
-* **Presence** uses the Figure 7 wording verbatim, one finding per call.
+* **Presence** uses the Figure 7 wording verbatim, one finding per call, on the
+  whole image. This is the screening pass in every configuration.
 * **Counts** use the Figure 9 wording for fillings and the same "How many teeth
   ..." shape for the other tooth-anchored findings. Findings whose boxes are
   regions or devices (bone loss, furcation, apical surgery, appliances, plates)
   are presence-only.
-* **Location** is never put into words. For each positive, the same presence
-  question is sent to four overlapping quadrant crops; the quadrant set is
-  whichever crops answer True. Quadrant is the honest ceiling for this model.
-* **No JSON, no region wording, no paraphrase retries, no forced zeros.** One
-  greedy call per question. Unparseable answers are recorded as such and
-  excluded from the per-finding TP/FP/TN/FN tables, never converted into a
-  negative there. The per-image complete-case rate and recall are strict: a
-  true finding whose answer was unparseable counts as not caught.
+* **Regions** are the two jaws ("the upper jaw", benchmark-verbatim) or the four
+  FDI quadrants ("the upper right quadrant", the model's own words, patient's
+  side). Nothing finer is ever named. A region is put to the model either in
+  words on the whole image (the image stays in distribution, no seams for
+  counts) or as a crop with the verbatim whole-image question (the question
+  stays verbatim, the picture does not).
+* **No JSON, no paraphrase retries, no forced zeros.** One greedy call per
+  question. Unparseable answers are recorded as such and excluded from the
+  per-finding TP/FP/TN/FN tables, never converted into a negative there. The
+  per-image complete-case rate and recall are strict: a true finding whose
+  answer was unparseable counts as not caught.
 
 The only public weights are the GGUF conversion of `DentalGPT-7B-1026`. That
 checkpoint may predate the reinforcement-learning stage, and the exact sentence
@@ -33,29 +41,55 @@ the authors appended to request `<think>/<answer>` tags is unpublished. A short
 probe therefore decides once per run whether the suffix is needed ("plain" or
 "tagged"), and the run manifest records the choice.
 
+## Two levels
+
+`dental_pipeline.Protocol` (Cell 3) has four knobs:
+
+| Knob | Values | Meaning |
+| --- | --- | --- |
+| `PRESENCE_LEVEL` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: whole image first, then the same question per region for every positive finding; the region set is the regions that answer A. Presence stays the whole-image answer. |
+| `COUNT_LEVEL` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region (the regions that answered A when `PRESENCE_LEVEL="region"`, else every region); the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
+| `REGION_SCHEME` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
+| `REGION_PROMPT` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
+
+The whole-image wording is byte-identical in every configuration; the region
+wording only fills a scope slot of the same sentence (`REGION_PHRASES`,
+`COUNT_TEMPLATES`). Quadrant words are the patient's sides, so "the upper right
+quadrant" is the image-left window; `QUADRANT_WORDS_ARE_PATIENT_SIDE` records
+that reading and the DENTEX side check (below) confirms it.
+
+## Calls per image
+
+R = regions in the scheme (4 or 2), P = positive findings, Pc = positive
+countable findings, Rp = regions that answered A for a finding.
+
+| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (P=5, Pc=4, quadrants) |
+| --- | --- | --- |
+| overall / overall | 14 + Pc | 18 |
+| region / overall | 14 + R x P + Pc | 38 |
+| overall / region | 14 + R x Pc | 30 |
+| region / region | 14 + R x P + sum(Rp) | 34 to 50 |
+
+An all-negative image always needs 14. With `REGION_PROMPT="words"` every call
+reuses the cached image prefix; with crops the prefix is rebuilt per region.
+
 ## Files
 
 | File | Role |
 | --- | --- |
-| `dental_pipeline.py` | prompts, answer extraction, quadrant crops, model runner, probe, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics, CSV/JSON export |
-| `location_adapter.py` | translates ground-truth boxes into the quadrant windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
+| `dental_pipeline.py` | prompts and region wording, answer extraction, crops, model runner, probe, `Protocol`, resumable run loop, dentist summary |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. per-region counts and the side check, CSV/JSON export |
+| `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
 | `test_dental_pipeline.py`, `test_location_adapter.py` | offline tests with fake models (`python -m unittest -q`) |
-
-## Calls per image
-
-14 presence calls, plus one count call per positive countable finding, plus
-four crop calls per positive when `LOCATION="quadrant"`. A typical image with
-four or five positives needs about 35 calls; an all-negative image needs 14.
 
 ## Runtime settings that matter
 
 * `--image-max-tokens 6144`: llama.cpp otherwise caps Qwen2.5-VL images at 4096
   tokens and silently downscales a full-size panoramic below training resolution.
-* No `--image-min-tokens` floor, so quadrant crops of small panoramics stay at
-  native size, as they would under the Hugging Face processor.
+* No `--image-min-tokens` floor, so crops of small panoramics stay at native
+  size, as they would under the Hugging Face processor.
 * `--ctx-size 16384` so image tokens, question, and a long `<think>` fit.
 * `max_tokens 4096`, temperature 0, `repeat_penalty 1.05` (the same value as the
   backbone's generation config; llama.cpp applies it over the last 64 tokens).
@@ -77,9 +111,10 @@ four or five positives needs about 35 calls; an all-negative image needs 14.
   quadrant labels for caries, periapical lesion, and impacted tooth. Gives exact
   quadrant ground truth for those three findings. Use the fully labeled train
   split (`training_data/quadrant-enumeration-disease`, 705 images) and the
-  validation split (`validation_triple.json`, 50 images); DentalGPT never saw
-  DENTEX, so both are held-out. The 250-image test split is raw LabelMe files
-  with unmapped Turkish labels and is not supported.
+  validation split (`validation_triple.json`, 50 images). The DentalGPT paper
+  does not list the detection sets it trained on, so treat DENTEX as held-out
+  with that caveat. The 250-image test split is raw LabelMe files with unmapped
+  Turkish labels and is not supported.
 
 Each dataset is scored on the findings it annotates; unannotated findings are
 not counted as negatives. With two datasets the notebook also prints a pooled
@@ -88,10 +123,10 @@ table over the shared findings.
 ## Location truth
 
 Ground truth is numeric (boxes); the pipeline localizes a finding as the set of
-quadrant crops that answer True. Scoring location means deciding which quadrant
-windows each true box occupies, and fixed image fractions do that badly: the
-midline and the occlusal plane move with patient positioning and the shape of
-the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
+regions that answer True (or count above zero). Scoring location means deciding
+which region windows each true box occupies, and fixed image fractions do that
+badly: the midline and the occlusal plane move with patient positioning and the
+shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
 
 * `"llm"` (recommended): `location_adapter.LLMAdapter` draws numbered boxes on
   the radiograph, burns the FDI quadrant names into the corners, and asks a
@@ -128,27 +163,56 @@ labels, which are exact, so on a DENTEX dataset Cell 12 also prints the
 adapter's and the windows' agreement with that truth
 (`dental_eval.truth_agreement`): the check that the adapter is worth its calls.
 `evaluation.json` records under `summary.location_truth` how many true boxes
-each source placed. Arch-level scoring (`LOCATION="arch"`) derives from the
-same quadrants.
+each source placed. Arch-level scoring derives from the same quadrants. For
+per-region counts each true box is counted once, in the first window (in UR,
+UL, LL, LR order) that holds it.
 
 ## Evaluation outputs
 
 `<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
-`paper_covered` flag), `counts.csv` (exact, within-1, MAE on true positives and a
-strict MAE that scores misses as zero), `regions.csv` (per-crop TP, FP, TN, FN,
-exact-set match, Jaccard, unlocalized rate), `per_image.csv`, and
-`evaluation.json` with a summary: micro and macro F1, complete-case rate, mean
-false alarms per image.
+`paper_covered` flag), `counts.csv` (exact, within-1, MAE on true positives, a
+strict MAE that scores misses as zero, and `count_unasked` for positives no
+region answered A for), `region_counts.csv` (the same per finding and region
+when `COUNT_LEVEL="region"`; a region that answered B to presence counts as 0
+in the strict MAE), `regions.csv` (per-region TP, FP, TN, FN, exact-set match,
+Jaccard, unlocalized rate, `from_counts` for regions derived from counts, and
+`pred_all_regions_rate` next to `truth_all_regions_rate`), `per_image.csv`,
+and `evaluation.json` with a summary: the protocol, micro and macro F1,
+complete-case rate, mean false alarms per image, and, for the quadrant scheme,
+`side_agreement`.
+
+Two diagnostics decide whether word-based regions are being read:
+
+* `side_agreement`: how often a quadrant the model answered for holds a true
+  box on that image side (only findings whose true boxes all lie on one side
+  count). Far above 50% confirms the patient-side reading; far below means
+  `QUADRANT_WORDS_ARE_PATIENT_SIDE` should be set to `False` (the words move
+  to the mirrored windows) and the run repeated. DENTEX is the clean test: its
+  FDI quadrant labels are exact.
+* `pred_all_regions_rate` far above `truth_all_regions_rate` means the model
+  answered A in every region whenever the whole image was positive, i.e. it
+  ignored the region clause; switch to `REGION_PROMPT="crop"` for that finding
+  set.
 
 ## Caveats
 
 * Ten of the 14 findings are outside the paper's evaluated panoramic labels;
   read the `paper_covered` column before comparing to the paper's 84%.
+* Jaw wording is benchmark-verbatim; quadrant wording rests on the model's own
+  narration and on FDI numbering, and no benchmark question uses the word.
+  Read the side agreement and the region tables on DENTEX before trusting
+  quadrant rows.
 * Location truth from the LLM adapter is itself a model output: read the DENTEX
   agreement numbers and spot-check the drawn images before trusting the region
   rows.
 * Ground-truth boxes are per instance while the model counts teeth, so counts
-  for crowns/bridges and multi-box fillings carry definitional error.
+  for crowns/bridges and multi-box fillings carry definitional error; region
+  counts inherit it.
+* Region questions are asked only for whole-image positives, so region recall
+  is capped by whole-image recall.
+* With `REGION_PROMPT="crop"` and `COUNT_LEVEL="region"`, the windows overlap
+  by 10% of the width and 20% of the height, so teeth on the seams can be
+  counted twice; use words for region counts.
 * Apical surgery, root resorption, and furcation have very few positives in
   UMFIH; their rows are not statistically meaningful.

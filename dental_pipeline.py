@@ -1,7 +1,8 @@
-"""In-distribution DentalGPT pipeline: presence, tooth counts, and quadrant location.
+"""In-distribution DentalGPT pipeline: presence, tooth counts, and region location.
 
-Every text sent to the model is one of two shapes with evidence in the DentalGPT
-paper (arXiv 2512.11558):
+Every text sent to the model is one of the shapes with evidence in the DentalGPT
+paper (arXiv 2512.11558) or in the panoramic benchmark it was scored on
+(MMOral-OPG-Bench, arXiv 2509.09254):
 
 * Presence: the Panorama-Classification question of Figure 7, one condition per
   call, answered A (True) or B (False). This is the only panoramic skill the
@@ -9,11 +10,16 @@ paper (arXiv 2512.11558):
 * Count: the Figure 1/9 filling-count question, and the same tooth-anchored
   "How many ..." shape for the other countable findings. The model counts
   teeth, so findings whose boxes are regions or devices are presence-only.
+* Region: the same two questions restricted to one region of the mouth. The
+  regions are the two jaws (the benchmark asks "in which jaw" and even counts
+  "in the lower jaw") and the four FDI quadrants (the model walks them by name
+  in its own reasoning, Figure 9). The region is either named in the question
+  on the whole image ("words") or implied by sending a crop ("crop").
 
-Location is never asked in words. For each whole-image positive the same
-presence question is sent to overlapping quadrant crops; the quadrant set is
-whichever crops answer A. Nothing else (JSON contracts, region wording,
-fallback paraphrases, forced zeros) is used.
+Two levels are set independently (Protocol): where presence is resolved (whole
+image only, or whole image and then each region for the positives) and where
+counts are taken (one whole-image count, or one count per region). Nothing
+else (JSON contracts, fallback paraphrases, forced zeros) is used.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import json
 import mimetypes
 import re
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 # Stable ontology in YOLO class order of the UMFIH 14-class dataset.
@@ -67,20 +74,25 @@ LABELS = {
 
 # Figure 7 (Panorama-Classification) wording, verbatim except the label.
 PRESENCE_QUESTION = "Kindly evaluate if the condition '{label}' is present in this image.\nA. True\nB. False"
+# The same wording with the region named; used when Protocol.region_prompt is "words".
+REGION_PRESENCE_QUESTION = "Kindly evaluate if the condition '{label}' is present in {region} of this image.\nA. True\nB. False"
 
-# Tooth-anchored count questions. The filling question is Figure 1/9 verbatim.
-COUNT_QUESTIONS = {
-    "dental_implant": "How many dental implants are visualized in the panoramic radiograph?",
-    "prosthetic_restoration": "How many teeth in the image have a dental crown or bridge?",
-    "dental_filling": "How many visible teeth in the image appear to have dental fillings based on their radiopaque characteristics?",
-    "endodontic_treatment": "How many teeth in the image have root canal treatment?",
-    "carious_lesion": "How many teeth in the image are suspected to have caries?",
-    "impacted_tooth": "How many impacted teeth are visualized in the panoramic radiograph?",
-    "periapical_lesion": "How many teeth in the image show signs of a periapical lesion?",
-    "root_fragment": "How many residual roots are visualized in the panoramic radiograph?",
-    "root_resorption": "How many teeth in the image show root resorption?",
+# Tooth-anchored count questions as (template, whole-image scope). The whole-image wording is
+# the template with its scope filled in (the filling question is Figure 1/9 verbatim); a region
+# replaces the scope ("How many teeth in the upper right quadrant have ...").
+COUNT_TEMPLATES = {
+    "dental_implant": ("How many dental implants are visualized in {scope}?", "the panoramic radiograph"),
+    "prosthetic_restoration": ("How many teeth in {scope} have a dental crown or bridge?", "the image"),
+    "dental_filling": ("How many visible teeth in {scope} appear to have dental fillings based on their radiopaque characteristics?", "the image"),
+    "endodontic_treatment": ("How many teeth in {scope} have root canal treatment?", "the image"),
+    "carious_lesion": ("How many teeth in {scope} are suspected to have caries?", "the image"),
+    "impacted_tooth": ("How many impacted teeth are visualized in {scope}?", "the panoramic radiograph"),
+    "periapical_lesion": ("How many teeth in {scope} show signs of a periapical lesion?", "the image"),
+    "root_fragment": ("How many residual roots are visualized in {scope}?", "the panoramic radiograph"),
+    "root_resorption": ("How many teeth in {scope} show root resorption?", "the image"),
 }
-COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_QUESTIONS)  # the other five are presence-only
+COUNT_QUESTIONS = {c: template.format(scope=scope) for c, (template, scope) in COUNT_TEMPLATES.items()}  # whole image
+COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_TEMPLATES)  # the other five are presence-only
 
 # The paper says a fixed sentence was appended during RL to request <think> and
 # <answer> tags but does not publish it. This is the common VLM-R1 wording and is
@@ -88,7 +100,7 @@ COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_QUESTIONS)  # the other fi
 THINK_SUFFIX = "Output the thinking process in <think> </think> and final answer in <answer> </answer> tags."
 MODES = ("plain", "tagged")
 
-# Crop windows as normalized (left, top, right, bottom). Quadrants use patient-side
+# Region windows as normalized (left, top, right, bottom). Quadrants use patient-side
 # names in FDI order (UR, UL, LL, LR); image left is the patient's right. Windows
 # overlap by 10% of the width and 20% of the height so a finding on the midline or
 # the occlusal plane is whole in at least one crop; location truth is scored
@@ -105,11 +117,31 @@ CROPS = {
         "lower": (0.00, 0.40, 1.00, 1.00),
     },
 }
-LOCATION_LEVELS = ("none", "arch", "quadrant")
+REGION_SCHEMES = tuple(CROPS)
+
+# The regions as dental text, used when the region is named in the question. Quadrants carry
+# the patient's sides, as dentists and DentalGPT itself (Figure 9) name them, so "the upper
+# right quadrant" is the image-left window UR. QUADRANT_WORDS_ARE_PATIENT_SIDE records that the
+# model reads the words that way; the DENTEX side check (dental_eval.side_agreement) confirms
+# it, and setting it False attaches the mirrored words to the windows instead.
+REGION_PHRASES = {
+    "quadrant": {
+        "UR": "the upper right quadrant",
+        "UL": "the upper left quadrant",
+        "LL": "the lower left quadrant",
+        "LR": "the lower right quadrant",
+    },
+    "arch": {
+        "upper": "the upper jaw",
+        "lower": "the lower jaw",
+    },
+}
+QUADRANT_WORDS_ARE_PATIENT_SIDE = True
+_MIRROR = {"UR": "UL", "UL": "UR", "LL": "LR", "LR": "LL"}
 
 # Dental-arch units: FDI quadrant x {anterior, posterior}, the finest division the quadrant and
 # arch windows are made of (anterior = incisors and canine, positions 1-3). Ground-truth boxes
-# translated into units (location_adapter) map onto the crop names deterministically; the same
+# translated into units (location_adapter) map onto the window names deterministically; the same
 # unit output also serves a six-cell vocabulary (DentVLM branch). Quadrant names are patient-side
 # in FDI order; UR and LR are the image-left windows.
 UNITS = ("Q1-posterior", "Q1-anterior", "Q2-anterior", "Q2-posterior",
@@ -125,7 +157,7 @@ def fdi_unit(quadrant: int, tooth: int) -> str:
 
 
 def unit_region(unit: str, level: str = "quadrant") -> str:
-    """Crop-window name of a unit at the given level."""
+    """Window name of a unit at the given level."""
     if unit not in UNITS:
         raise ValueError(f"unknown unit {unit!r}")
     quadrant = UNIT_QUADRANT[unit.split("-")[0]]
@@ -143,6 +175,17 @@ def quadrants_to_regions(quadrants, level: str = "quadrant") -> list[str]:
     return [r for r in CROPS[level] if r in names]
 
 
+def region_phrase(region: str, scheme: str = "quadrant", patient_side: bool | None = None) -> str:
+    """The words for a window. With patient_side False the quadrant words are mirrored."""
+    if scheme not in REGION_PHRASES or region not in REGION_PHRASES[scheme]:
+        raise ValueError(f"unknown region {region!r} for scheme {scheme!r}")
+    if patient_side is None:
+        patient_side = QUADRANT_WORDS_ARE_PATIENT_SIDE
+    if scheme == "quadrant" and not patient_side:
+        region = _MIRROR[region]
+    return REGION_PHRASES[scheme][region]
+
+
 # ----------------------------------------------------------------------------
 # Prompts
 # ----------------------------------------------------------------------------
@@ -152,12 +195,29 @@ def with_mode(question: str, mode: str) -> str:
     return question if mode == "plain" else f"{question}\n\n{THINK_SUFFIX}"
 
 
-def presence_question(condition: str, mode: str = "plain") -> str:
-    return with_mode(PRESENCE_QUESTION.format(label=LABELS[condition]), mode)
+def presence_question(condition: str, mode: str = "plain", region: str | None = None,
+                      scheme: str = "quadrant") -> str:
+    """Figure 7 question for the whole image, or for one named region."""
+    if region is None:
+        text = PRESENCE_QUESTION.format(label=LABELS[condition])
+    else:
+        text = REGION_PRESENCE_QUESTION.format(label=LABELS[condition], region=region_phrase(region, scheme))
+    return with_mode(text, mode)
 
 
-def count_question(condition: str, mode: str = "plain") -> str:
-    return with_mode(COUNT_QUESTIONS[condition], mode)
+def count_scope(condition: str, region: str | None = None, scheme: str = "quadrant") -> str:
+    """Scope words of a count question: the whole image, or a region ("... of the panoramic radiograph")."""
+    _, whole = COUNT_TEMPLATES[condition]
+    if region is None:
+        return whole
+    phrase = region_phrase(region, scheme)
+    return phrase if whole == "the image" else f"{phrase} of {whole}"
+
+
+def count_question(condition: str, mode: str = "plain", region: str | None = None,
+                   scheme: str = "quadrant") -> str:
+    template, _ = COUNT_TEMPLATES[condition]
+    return with_mode(template.format(scope=count_scope(condition, region, scheme)), mode)
 
 
 # ----------------------------------------------------------------------------
@@ -262,7 +322,7 @@ def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
 
 
 def make_crops(image_path: str | Path, level: str, cache_dir: str | Path | None = None) -> dict[str, bytes]:
-    """Return {region: png_bytes} for the requested level, optionally cached on disk."""
+    """Return {region: png_bytes} for the requested scheme, optionally cached on disk."""
     if level not in CROPS:
         raise ValueError(f"level must be one of {tuple(CROPS)}")
     from PIL import Image
@@ -405,75 +465,156 @@ def probe(runner, image_paths, n: int = 10) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Protocol: the two levels and how a region is put to the model
+# ----------------------------------------------------------------------------
+PRESENCE_LEVELS = ("overall", "region")
+COUNT_LEVELS = ("overall", "region")
+REGION_PROMPTS = ("words", "crop")
+
+
+@dataclass(frozen=True)
+class Protocol:
+    """What the wrapper may vary. Defaults are the recommended run.
+
+    presence_level  "overall": presence from the whole-image question only.
+                    "region":  whole image first, then the same question per region for every
+                               positive finding; the region set is the regions answering A.
+    count_level     "overall": one whole-image count per positive countable finding.
+                    "region":  one count per region; in the regions that answered A when
+                               presence_level is "region", else in every region. The finding's
+                               count is the sum. A region count of 0 is a valid answer.
+    region_scheme   "quadrant" (UR, UL, LL, LR) or "arch" (upper, lower).
+    region_prompt   "words": the region is named in the question and the whole image is sent.
+                    "crop":  the whole-image question is sent with the region crop.
+    """
+
+    presence_level: str = "region"
+    count_level: str = "region"
+    region_scheme: str = "quadrant"
+    region_prompt: str = "words"
+
+    def __post_init__(self) -> None:
+        for value, allowed, name in ((self.presence_level, PRESENCE_LEVELS, "presence_level"),
+                                     (self.count_level, COUNT_LEVELS, "count_level"),
+                                     (self.region_scheme, REGION_SCHEMES, "region_scheme"),
+                                     (self.region_prompt, REGION_PROMPTS, "region_prompt")):
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
+
+    @property
+    def uses_regions(self) -> bool:
+        return "region" in (self.presence_level, self.count_level)
+
+    @property
+    def regions(self) -> tuple[str, ...]:
+        """Region names in window order, empty when both levels are "overall"."""
+        return tuple(CROPS[self.region_scheme]) if self.uses_regions else ()
+
+
+# ----------------------------------------------------------------------------
 # Per-image analysis and dataset runs with resume
 # ----------------------------------------------------------------------------
 def _record(calls: list, stage: str, condition: str, region: str | None, question: str, reply: dict) -> None:
     calls.append({"stage": stage, "condition": condition, "region": region, "question": question, **reply})
 
 
-def analyze_image(runner, image_path: str | Path, mode: str = "plain", location: str = "quadrant",
+def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol: Protocol = Protocol(),
                   crop_dir: str | Path | None = None) -> dict:
-    """Presence for all 14 findings, counts and crops for positives. Deterministic order."""
-    if location not in LOCATION_LEVELS:
-        raise ValueError(f"location must be one of {LOCATION_LEVELS}")
+    """Whole-image presence for all 14 findings, then regions and counts for the positives as the
+    protocol says. Deterministic order: with crops, region-major so the crop's image prefix stays
+    cached; with words every call shares the whole image."""
     path = Path(image_path)
     calls: list[dict] = []
-    findings = {c: {"presence": None, "count": None, "regions": None} for c in CONDITIONS}
+    findings = {c: {"presence": None, "count": None, "regions": None, "region_counts": None} for c in CONDITIONS}
 
     for condition in CONDITIONS:
         question = presence_question(condition, mode)
         reply = runner.ask(path, question)
         _record(calls, "presence", condition, None, question, reply)
         findings[condition]["presence"] = graded(reply, extract_choice)
-
     positives = [c for c in CONDITIONS if findings[c]["presence"] == "A"]
-    for condition in positives:
-        if condition in COUNTABLE:
+
+    scheme, regions = protocol.region_scheme, protocol.regions
+    by_crop = protocol.region_prompt == "crop"
+    crops = make_crops(path, scheme, crop_dir) if (positives and regions and by_crop) else {}
+
+    def image_for(region: str):
+        return crops[region] if by_crop else path
+
+    def named(region: str) -> str | None:
+        return None if by_crop else region
+
+    if protocol.presence_level == "region" and positives:
+        for condition in positives:
+            findings[condition]["regions"] = {}
+        for region in regions:
+            for condition in positives:
+                question = presence_question(condition, mode, named(region), scheme)
+                reply = runner.ask(image_for(region), question)
+                _record(calls, "region", condition, region, question, reply)
+                findings[condition]["regions"][region] = graded(reply, extract_choice)
+
+    countable = [c for c in positives if c in COUNTABLE]
+    if protocol.count_level == "overall":
+        for condition in countable:
             question = count_question(condition, mode)
             reply = runner.ask(path, question)
             _record(calls, "count", condition, None, question, reply)
             findings[condition]["count"] = graded(reply, extract_count)
-
-    if location != "none" and positives:
-        crops = make_crops(path, location, crop_dir)
-        for condition in positives:
-            findings[condition]["regions"] = {}
-        for region, png in crops.items():  # region-major order keeps the image prefix cached
-            for condition in positives:
-                question = presence_question(condition, mode)
-                reply = runner.ask(png, question)
-                _record(calls, "region", condition, region, question, reply)
-                findings[condition]["regions"][region] = graded(reply, extract_choice)
+    else:
+        for condition in countable:
+            findings[condition]["region_counts"] = {}
+        for region in regions:
+            for condition in countable:
+                answered = findings[condition]["regions"]
+                if answered is not None and answered.get(region) != "A":
+                    continue  # the region did not answer A for this finding: nothing to count there
+                question = count_question(condition, mode, named(region), scheme)
+                reply = runner.ask(image_for(region), question)
+                _record(calls, "region_count", condition, region, question, reply)
+                findings[condition]["region_counts"][region] = graded(reply, extract_count)
+        for condition in countable:
+            counts = findings[condition]["region_counts"]
+            complete = bool(counts) and all(n is not None for n in counts.values())
+            findings[condition]["count"] = sum(counts.values()) if complete else None
 
     return {
         "image": str(path.resolve()),
         "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "mode": mode,
-        "location_level": location,
+        "protocol": asdict(protocol),
+        "region_scheme": scheme if regions else None,
         "findings": findings,
         "calls": calls,
         "call_count": len(calls),
     }
 
 
-def run_config(mode: str, location: str, runner_settings: dict, provenance: dict | None = None) -> dict:
+def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance: dict | None = None) -> dict:
     """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts."""
+    words = protocol.uses_regions and protocol.region_prompt == "words"
     config = {
-        "mode": mode, "location_level": location, "labels": LABELS, "presence_question": PRESENCE_QUESTION,
-        "count_questions": COUNT_QUESTIONS, "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
-        "crops": CROPS.get(location), "runner": runner_settings, "provenance": provenance or {},
+        "mode": mode, "protocol": asdict(protocol), "labels": LABELS,
+        "presence_question": PRESENCE_QUESTION,
+        "region_presence_question": REGION_PRESENCE_QUESTION if words and protocol.presence_level == "region" else None,
+        "region_phrases": {r: region_phrase(r, protocol.region_scheme) for r in protocol.regions} if words else None,
+        "count_questions": COUNT_QUESTIONS,
+        "count_templates": {c: t for c, (t, _) in COUNT_TEMPLATES.items()} if protocol.count_level == "region" else None,
+        "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
+        "crops": CROPS[protocol.region_scheme] if protocol.uses_regions and protocol.region_prompt == "crop" else None,
+        "runner": runner_settings, "provenance": provenance or {},
     }
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
 
 
 def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode: str = "plain",
-                location: str = "quadrant", resume: bool = True, provenance: dict | None = None) -> Path:
+                protocol: Protocol = Protocol(), resume: bool = True, provenance: dict | None = None) -> Path:
     """Analyze every image, one JSON per image, skipping finished ones on resume."""
     out = Path(out_dir)
     results_dir = out / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    config = run_config(mode, location, runner.settings(), provenance)
+    config = run_config(mode, protocol, runner.settings(), provenance)
     manifest_path = out / "manifest.json"
     if manifest_path.is_file():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -488,7 +629,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
         if resume and target.is_file():
             continue
         print(f"[{index}/{len(todo)}] {image_id}")
-        result = analyze_image(runner, path, mode=mode, location=location, crop_dir=out / "crops")
+        result = analyze_image(runner, path, mode=mode, protocol=protocol, crop_dir=out / "crops")
         result["image_id"] = image_id
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -512,10 +653,20 @@ def dentist_report(result: dict) -> str:
         label = LABELS[condition]
         if finding["presence"] == "A":
             parts = [label]
+            region_counts = finding.get("region_counts")
             if finding["count"] is not None:
-                parts.append(f"count {finding['count']}")
-            if finding["regions"] is not None:
+                text = f"count {finding['count']}"
+                if region_counts:
+                    text += " (" + ", ".join(f"{r} {n}" for r, n in region_counts.items()) + ")"
+                parts.append(text)
+            elif region_counts:
+                known = [f"{r} {n}" for r, n in region_counts.items() if n is not None]
+                parts.append("count incomplete" + (" (" + ", ".join(known) + ")" if known else ""))
+            if finding.get("regions") is not None:
                 hits = [r for r, a in finding["regions"].items() if a == "A"]
+                parts.append("location " + ", ".join(hits) if hits else "location not resolved")
+            elif region_counts:
+                hits = [r for r, n in region_counts.items() if n]
                 parts.append("location " + ", ".join(hits) if hits else "location not resolved")
             present.append(" - " + "; ".join(parts))
         elif finding["presence"] == "B":

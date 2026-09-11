@@ -2,14 +2,15 @@
 
 Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
 Metrics stay simple: image-level TP/FP/TN/FN per finding, count agreement on
-true positives, quadrant-level TP/FP/TN/FN for localized findings, and two
-per-image numbers a dentist cares about (complete-case rate, false alarms).
+true positives (whole-image counts, and per region when counts were taken per
+region), region-level TP/FP/TN/FN for localized findings, and two per-image
+numbers a dentist cares about (complete-case rate, false alarms).
 
 Unparseable answers are excluded from the per-finding confusion tables and
 reported as counts. The per-image complete-case rate and recall are strict: a
 true finding whose answer was unparseable counts as not caught.
 
-Location truth (which crop windows a true box occupies) comes, in this order,
+Location truth (which region windows a true box occupies) comes, in this order,
 from regions attached to the box by location_adapter (apply_adapted), from
 DENTEX FDI quadrant labels, or from the fixed crop windows. The evaluation
 summary reports which source placed how many boxes.
@@ -20,7 +21,8 @@ import csv
 import json
 from pathlib import Path
 
-from dental_pipeline import CONDITIONS, COUNTABLE, CROPS, UNIT_QUADRANT, quadrants_to_regions, units_to_regions
+from dental_pipeline import (CONDITIONS, COUNTABLE, CROPS, QUADRANT_WORDS_ARE_PATIENT_SIDE, UNIT_QUADRANT,
+                             quadrants_to_regions, units_to_regions)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -29,7 +31,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can de
 PAPER_COVERED = {"endodontic_treatment", "periapical_lesion", "impacted_tooth",
                  "periodontal_bone_loss", "carious_lesion", "dental_filling"}
 
-# Location truth is scored against the crop windows the model actually saw
+# Location truth is scored against the windows the regions are named after
 # (dental_pipeline.CROPS, which overlap on the midline and occlusal plane).
 OVERLAP_FRACTION = 0.25  # a box counts in every window holding >= 25% of its area
 
@@ -112,7 +114,7 @@ def fdi_quadrant(quadrant: int) -> str:
 
 
 def geometric_regions(box: dict, level: str) -> set[str]:
-    """Crop windows of the given level holding >= 25% of the box area (the model-free fallback)."""
+    """Windows of the given level holding >= 25% of the box area (the model-free fallback)."""
     left, top = box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2
     right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
     area = max(box["w"] * box["h"], 1e-9)
@@ -131,6 +133,12 @@ def box_regions(box: dict, level: str) -> set[str]:
     if box.get("fdi"):
         return set(quadrants_to_regions([fdi_quadrant(box["fdi"][0])], level))
     return geometric_regions(box, level)
+
+
+def box_primary_region(box: dict, level: str) -> str | None:
+    """The one window a box is counted in: the first, in window order, of the windows holding it."""
+    hits = box_regions(box, level)
+    return next((name for name in CROPS[level] if name in hits), None)
 
 
 def box_source(box: dict) -> str:
@@ -213,6 +221,39 @@ def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Reading saved results (both levels, and results saved before the levels existed)
+# ----------------------------------------------------------------------------
+def result_protocol(result: dict) -> dict:
+    """The protocol a result was produced with; results from before the two levels are translated."""
+    protocol = result.get("protocol")
+    if protocol:
+        return dict(protocol)
+    level = result.get("location_level", "none")
+    return {"presence_level": "overall" if level == "none" else "region", "count_level": "overall",
+            "region_scheme": "quadrant" if level == "none" else level, "region_prompt": "crop"}
+
+
+def result_scheme(result: dict) -> str:
+    """Region scheme of a saved result ("quadrant", "arch") or "none" when no region was asked."""
+    protocol = result_protocol(result)
+    if "region" in (protocol["presence_level"], protocol["count_level"]):
+        return protocol["region_scheme"]
+    return "none"
+
+
+def predicted_regions(finding: dict) -> tuple[dict | None, str | None]:
+    """{region: True | False | None (unparseable)} and its source, or (None, None) when no region
+    question was asked. Regions come from the region presence answers, or, when presence was
+    resolved on the whole image only, from the region counts (a count above zero is a hit)."""
+    if finding.get("regions") is not None:
+        return {r: (None if a is None else a == "A") for r, a in finding["regions"].items()}, "presence"
+    counts = finding.get("region_counts")
+    if counts:
+        return {r: (None if n is None else n > 0) for r, n in counts.items()}, "count"
+    return None, None
+
+
+# ----------------------------------------------------------------------------
 # Metrics
 # ----------------------------------------------------------------------------
 def _ratio(a: float, b: float):
@@ -231,17 +272,23 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, counts, regions, per_image = [], [], [], []
-    level = next((results[i]["location_level"] for i in ids), "none")
+    presence, counts, region_counts, regions, per_image = [], [], [], [], []
+    protocol = result_protocol(results[ids[0]]) if ids else None
+    level = result_scheme(results[ids[0]]) if ids else "none"
+    region_names = tuple(CROPS[level]) if level != "none" else ()
+    per_region_counts = bool(protocol) and protocol["count_level"] == "region" and level != "none"
 
     for condition in CONDITIONS:
         annotated = [i for i in ids if condition in gt[i]["annotated"]]
         if not annotated:
             continue
         tp = fp = tn = fn = unparseable = positives = 0
-        exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = 0
+        exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = unasked_count = 0
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = region_unparseable = 0
+        from_counts = pred_all = truth_all = 0
         jaccard_sum = 0.0
+        rc = {name: {"n": 0, "exact": 0, "within1": 0, "abs": 0, "signed": 0, "strict_n": 0, "strict_abs": 0,
+                     "unparseable": 0, "truth_positive": 0} for name in region_names}
         for image_id in annotated:
             boxes = [b for b in gt[image_id]["boxes"] if b["condition"] == condition]
             truth = len(boxes) > 0
@@ -260,7 +307,10 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             if condition in COUNTABLE and truth:
                 strict_pred = 0 if not positive else finding["count"]
                 if strict_pred is None:
-                    unparsed_count += 1
+                    if finding.get("region_counts") == {}:
+                        unasked_count += 1  # positive, but no region answered A, so no region was counted
+                    else:
+                        unparsed_count += 1
                 else:
                     strict_n += 1
                     strict_abs += abs(len(boxes) - strict_pred)
@@ -271,24 +321,48 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                     within1 += abs(diff) <= 1
                     abs_err += abs(diff)
                     signed_err += diff
+                if per_region_counts and positive and finding.get("region_counts") is not None:
+                    asked = finding["region_counts"]
+                    for name in region_names:
+                        truth_n = sum(box_primary_region(b, level) == name for b in boxes)
+                        cell = rc[name]
+                        cell["truth_positive"] += truth_n > 0
+                        if name in asked and asked[name] is None:
+                            cell["unparseable"] += 1
+                            continue
+                        pred_n = asked.get(name, 0)  # a region not asked answered B to presence: counted as 0
+                        cell["strict_n"] += 1
+                        cell["strict_abs"] += abs(truth_n - pred_n)
+                        if name in asked:
+                            cell["n"] += 1
+                            cell["exact"] += pred_n == truth_n
+                            cell["within1"] += abs(pred_n - truth_n) <= 1
+                            cell["abs"] += abs(pred_n - truth_n)
+                            cell["signed"] += pred_n - truth_n
 
-            if level != "none" and truth and positive and finding["regions"]:
-                if any(a is None for a in finding["regions"].values()):
+            if level != "none" and truth and positive:
+                pred_regions_map, source = predicted_regions(finding)
+                if not pred_regions_map:
+                    continue
+                if any(v is None for v in pred_regions_map.values()):
                     region_unparseable += 1
                     continue
                 n_loc += 1
+                from_counts += source == "count"
                 truth_regions = gt_regions(boxes, level)
-                pred_regions = {r for r, a in finding["regions"].items() if a == "A"}
+                pred_regions = {r for r, hit in pred_regions_map.items() if hit}
                 straddle += sum(straddling(b, level) for b in boxes)
                 if not pred_regions:
                     unlocalized += 1
-                for name in CROPS[level]:
+                for name in region_names:
                     t, p = name in truth_regions, name in pred_regions
                     r_tp += t and p
                     r_fp += (not t) and p
                     r_tn += (not t) and (not p)
                     r_fn += t and (not p)
                 set_match += truth_regions == pred_regions
+                pred_all += pred_regions == set(region_names)
+                truth_all += truth_regions == set(region_names)
                 union = truth_regions | pred_regions
                 jaccard_sum += len(truth_regions & pred_regions) / len(union) if union else 1.0
 
@@ -302,15 +376,30 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 "dataset": dataset, "condition": condition, "n_scored": n_count,
                 "exact_rate": _ratio(exact, n_count), "within_1_rate": _ratio(within1, n_count),
                 "mae": _ratio(abs_err, n_count), "mean_signed_error": _ratio(signed_err, n_count),
-                "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n), "count_unparseable": unparsed_count,
+                "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n),
+                "count_unparseable": unparsed_count, "count_unasked": unasked_count,
             })
+            if per_region_counts:
+                for name in region_names:
+                    cell = rc[name]
+                    region_counts.append({
+                        "dataset": dataset, "condition": condition, "region": name, "n_scored": cell["n"],
+                        "truth_positive_cases": cell["truth_positive"],
+                        "exact_rate": _ratio(cell["exact"], cell["n"]), "within_1_rate": _ratio(cell["within1"], cell["n"]),
+                        "mae": _ratio(cell["abs"], cell["n"]), "mean_signed_error": _ratio(cell["signed"], cell["n"]),
+                        "strict_n": cell["strict_n"], "strict_mae": _ratio(cell["strict_abs"], cell["strict_n"]),
+                        "count_unparseable": cell["unparseable"],
+                    })
         if level != "none":
             regions.append({
                 "dataset": dataset, "condition": condition, "level": level, "n_localized_cases": n_loc,
+                "from_counts": from_counts,
                 "TP": r_tp, "FP": r_fp, "TN": r_tn, "FN": r_fn, **_prf(r_tp, r_fp, r_tn, r_fn),
                 "exact_set_match_rate": _ratio(set_match, n_loc), "mean_jaccard": _ratio(jaccard_sum, n_loc),
-                "unlocalized_rate": _ratio(unlocalized, n_loc), "straddling_boxes": straddle,
-                "region_unparseable": region_unparseable,
+                "unlocalized_rate": _ratio(unlocalized, n_loc),
+                # A model that ignores the region clause answers A everywhere: compare the two rates.
+                "pred_all_regions_rate": _ratio(pred_all, n_loc), "truth_all_regions_rate": _ratio(truth_all, n_loc),
+                "straddling_boxes": straddle, "region_unparseable": region_unparseable,
             })
 
     for image_id in ids:
@@ -329,7 +418,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     f1s = [r["f1"] for r in presence if r["f1"] is not None]
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
-        "location_level": level, "location_truth": location_truth_summary({i: gt[i] for i in ids}),
+        "protocol": protocol, "location_level": level,
+        "location_truth": location_truth_summary({i: gt[i] for i in ids}),
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
@@ -340,11 +430,44 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         "images_with_false_alarm_rate": _ratio(sum(r["false_alarms"] > 0 for r in per_image), len(per_image)),
         "mean_calls_per_image": _ratio(sum(r["calls"] or 0 for r in per_image), len(per_image)),
     }
-    report = {"summary": summary, "presence": presence, "counts": counts, "regions": regions,
-              "per_image": per_image, "missing_results": missing}
+    if level == "quadrant":
+        summary["side_agreement"] = side_agreement(gt, results)
+    report = {"summary": summary, "presence": presence, "counts": counts, "region_counts": region_counts,
+              "regions": regions, "per_image": per_image, "missing_results": missing}
     if out_dir:
         write_report(report, out_dir)
     return report
+
+
+def side_agreement(gt: dict[str, dict], results: dict[str, dict]) -> dict:
+    """How often a quadrant the model answered for holds a true box on that image side.
+
+    The windows are fixed to the image (UR and LR are image-left), so this reads, for word-based
+    regions, whether the model takes "right" as the patient's right the way the phrases assume
+    (QUADRANT_WORDS_ARE_PATIENT_SIDE): a rate far above 50% confirms it, far below means the
+    words should be flipped. For crops it is plain localization accuracy. Only findings whose true
+    boxes all lie on one side of the image are informative, so the others are skipped.
+    """
+    named = agree = 0
+    for image_id in sorted(set(gt) & set(results)):
+        if result_scheme(results[image_id]) != "quadrant":
+            continue
+        for condition in CONDITIONS:
+            boxes = [b for b in gt[image_id]["boxes"] if b["condition"] == condition]
+            finding = results[image_id]["findings"][condition]
+            pred, _ = predicted_regions(finding)
+            if not boxes or finding["presence"] != "A" or not pred:
+                continue
+            box_sides = {"left" if b["xc"] < 0.5 else "right" for b in boxes}
+            if len(box_sides) != 1:
+                continue
+            for region, hit in pred.items():
+                if not hit:
+                    continue
+                named += 1
+                agree += ("left" if region in ("UR", "LR") else "right") in box_sides
+    return {"sides_named": named, "agree": agree, "agreement_rate": _ratio(agree, named),
+            "quadrant_words_are_patient_side": QUADRANT_WORDS_ARE_PATIENT_SIDE}
 
 
 def pooled_presence(reports: list[dict]) -> list[dict]:
@@ -368,8 +491,8 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "counts", "regions", "per_image"):
-        rows = report[name]
+    for name in ("presence", "counts", "region_counts", "regions", "per_image"):
+        rows = report.get(name) or []
         if not rows:
             continue
         with (out / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
