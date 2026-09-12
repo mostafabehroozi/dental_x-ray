@@ -39,6 +39,7 @@ from pathlib import Path
 
 import dental_eval as ev
 import dental_pipeline as dp
+import llm_api
 
 UNITS = dp.UNITS
 PALETTE = ("#ff3b30", "#34c759", "#00c7ff", "#ffcc00", "#ff2d95", "#ff9500", "#bf5af2", "#ffffff")
@@ -216,32 +217,37 @@ def _slug(text: str) -> str:
 class LLMAdapter:
     """Numbered boxes on the image -> units per box, from an OpenAI-compatible vision API.
 
-    token_param: "max_tokens" for most models, "max_completion_tokens" for OpenAI reasoning
-    models (GPT-5 family), which also reject a temperature (leave it None). Other request
-    fields (reasoning_effort, response_format, ...) go through request_options.
+    from_api() builds one from an llm_api spec. token_param: "max_tokens" for most models,
+    "max_completion_tokens" for OpenAI reasoning models (GPT-5 family), which also reject a
+    temperature (leave it None). Other request fields (reasoning_effort, response_format, ...)
+    go through request_options.
     """
 
     kind = "llm"
 
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = None, max_boxes_per_call: int = 12,
-                 max_side: int = 2048, corner_labels: bool = True, timeout: float = 300.0,
+                 max_side: int = 2048, corner_labels: bool = True, timeout: float = 600.0,
                  request_options: dict | None = None, client=None) -> None:
-        if token_param not in ("max_tokens", "max_completion_tokens"):
-            raise ValueError("token_param must be 'max_tokens' or 'max_completion_tokens'")
-        if client is None:
-            from openai import OpenAI
-
-            kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 3}
-            if base_url:
-                kwargs["base_url"] = base_url
-            client = OpenAI(**kwargs)
-        self.client = client
+        if token_param not in llm_api.TOKEN_PARAMS:
+            raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.base_url, self.model = base_url, model
         self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
         self.max_boxes_per_call, self.max_side, self.corner_labels = max_boxes_per_call, max_side, corner_labels
         self.request_options = dict(request_options or {})
         self.calls = 0
+
+    OPTIONS = ("token_param", "temperature", "max_output_tokens", "max_boxes_per_call", "max_side",
+               "corner_labels", "request_options")
+
+    @classmethod
+    def from_api(cls, spec: dict, timeout: float = 600.0, client=None) -> "LLMAdapter":
+        """Adapter for a hosted model. spec = {"provider", "model", ...} as documented in llm_api,
+        plus any of the constructor options named in OPTIONS."""
+        base_url, api_key = llm_api.resolve(spec)
+        options = {k: spec[k] for k in cls.OPTIONS if k in spec}
+        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
 
     @property
     def name(self) -> str:
@@ -264,10 +270,8 @@ class LLMAdapter:
                     {"type": "image_url", "image_url": {"url": dp.image_data_uri(jpeg, "image/jpeg")}},
                 ]},
             ],
-            self.token_param: self.max_output_tokens,
+            **llm_api.generation_fields(self.token_param, self.max_output_tokens, self.temperature),
         }
-        if self.temperature is not None:
-            request["temperature"] = self.temperature
         request.update(self.request_options)
         started = time.perf_counter()
         response = self.client.chat.completions.create(**request)

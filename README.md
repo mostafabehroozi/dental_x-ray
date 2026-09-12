@@ -56,8 +56,9 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics, side-convention check, CSV/JSON export |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
+| `llm_api.py` | hosted-model access shared by the runner and the adapter: provider table, key lookup (environment variable or Kaggle secret), client construction |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
-| `test_dental_pipeline.py`, `test_location_adapter.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Calls per image
 
@@ -93,8 +94,26 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 * No system prompt is sent; the chat template injects Qwen's default one, which
   the authors' vLLM script sets explicitly.
 * Radiographs must be JPEG, PNG, or BMP (what llama.cpp can decode).
-* `BACKEND="api"` in Cell 3 sends the same questions to an OpenAI-compatible
-  vision API instead, for a controlled comparison.
+* `BACKEND="api"` in Cell 3 sends the same questions to a hosted vision model
+  instead, for a controlled comparison (see "Hosted models").
+
+## Hosted models
+
+The model behind `BACKEND="api"` and the location-truth adapter are both
+described by a small spec dict in Cell 3, e.g.
+`{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
+`llm_api.PROVIDERS` holds the endpoints (`openai`, `nvidia`, `openrouter`,
+`gemini`) and the name of the key each one reads: an environment variable, else
+the Kaggle secret of the same name (`OPENAI_API_KEY`, `NVIDIA_API_KEY`,
+`OPENROUTER_API_KEY`, `GEMINI_API_KEY`; Add-ons > Secrets). Optional keys of a
+spec: `api_key` (paste one for a quick test, never commit it), `base_url` and
+`api_key_env` (any other OpenAI-compatible endpoint), `token_param` and
+`temperature` (`"max_completion_tokens"` and `None` for OpenAI reasoning
+models), `request_options` (extra request fields, e.g. OpenRouter routing under
+`extra_body`). `VisionRunner.from_api` and `LLMAdapter.from_api` build the
+clients; run manifests record `llm_api.public(spec)`, never the key. Transport
+errors, rate limits and 5xx replies are retried by the client with backoff; a
+bad request or key fails at once.
 
 ## Datasets
 
@@ -133,8 +152,9 @@ Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
   `LEFT_IS_IMAGE_LEFT` reading as the model's own words. One call per image
   (chunked above `max_boxes_per_call` boxes), strict JSON back, one retry when
   the reply is incomplete, and a box the model cannot place falls back to the
-  windows. For reasoning models set `token_param` to `max_completion_tokens`
-  and leave `temperature` at `None`.
+  windows. The model is a spec in Cell 3 (`ADAPTER_API`, see "Hosted models");
+  for reasoning models set `token_param` to `max_completion_tokens` and leave
+  `temperature` at `None`.
 * `"fdm"` (experimental): DentVLM itself. It has no question about a marked
   region, so the task is split into one in-distribution question per box: a
   full-frame "spotlight" copy that shows only the box and a margin, the

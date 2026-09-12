@@ -29,6 +29,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import llm_api
+
 # Stable ontology in YOLO class order of the UMFIH 14-class dataset.
 CONDITIONS = (
     "dental_implant",
@@ -378,7 +380,13 @@ def make_crops(image_path: str | Path, windows: dict | None = None,
 # Model runner (OpenAI-compatible chat completions; llama.cpp or a hosted API)
 # ----------------------------------------------------------------------------
 class VisionRunner:
-    """One image + one question -> one answer. No paraphrase or sampling retries."""
+    """One image + one question -> one answer. No paraphrase or sampling retries.
+
+    Local llama.cpp by default; from_api() builds one for a hosted model from an llm_api spec.
+    temperature None leaves the field out and token_param "max_completion_tokens" replaces
+    max_tokens, as OpenAI reasoning models require. Transport errors, rate limits and 5xx are
+    retried by the client with backoff; a bad request or key fails at once.
+    """
 
     def __init__(
         self,
@@ -386,30 +394,45 @@ class VisionRunner:
         api_key: str = "local-llama-cpp",
         model: str = "dentvlm",
         max_tokens: int = 512,
-        temperature: float = 0.0,
+        temperature: float | None = 0.0,
         timeout: float = 600.0,
         local: bool = True,
         cache_prompt: bool = True,
         request_options: dict | None = None,
+        token_param: str = "max_tokens",
+        client=None,
     ) -> None:
-        from openai import OpenAI
-
-        kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client = OpenAI(**kwargs)
+        if token_param not in llm_api.TOKEN_PARAMS:
+            raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.token_param = token_param
         self.local = local
         self.cache_prompt = cache_prompt
         self.request_options = dict(request_options or {})
         self.calls = 0
 
+    @classmethod
+    def from_api(cls, spec: dict, max_tokens: int = 4096, temperature: float | None = 0.0,
+                 timeout: float = 600.0, client=None) -> "VisionRunner":
+        """Runner for a hosted model. spec = {"provider", "model", ...} as documented in llm_api.
+
+        A "temperature" or "token_param" in the spec wins over the arguments, so the spec of a
+        reasoning model can say that it rejects a temperature.
+        """
+        base_url, api_key = llm_api.resolve(spec)
+        return cls(base_url=base_url, api_key=api_key, model=spec["model"], max_tokens=max_tokens,
+                   temperature=spec.get("temperature", temperature), timeout=timeout, local=False,
+                   cache_prompt=False, request_options=spec.get("request_options"),
+                   token_param=spec.get("token_param", "max_tokens"), client=client)
+
     def settings(self) -> dict:
         return {
-            "model": self.model, "max_tokens": self.max_tokens, "temperature": self.temperature,
-            "local": self.local, "cache_prompt": self.cache_prompt, "request_options": self.request_options,
+            "model": self.model, "max_tokens": self.max_tokens, "token_param": self.token_param,
+            "temperature": self.temperature, "local": self.local, "cache_prompt": self.cache_prompt,
+            "request_options": self.request_options,
         }
 
     def ask(self, image: str | Path | bytes, question: str) -> dict:
@@ -421,8 +444,7 @@ class VisionRunner:
                 {"type": "image_url", "image_url": {"url": image_data_uri(image)}},
                 {"type": "text", "text": question},
             ]}],
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
+            **llm_api.generation_fields(self.token_param, self.max_tokens, self.temperature),
         }
         if self.local:
             # Reuse the image KV prefix across the questions of one image; repetition penalty as
@@ -430,12 +452,7 @@ class VisionRunner:
             request["extra_body"] = {"cache_prompt": self.cache_prompt, "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
         started = time.perf_counter()
-        try:
-            response = self.client.chat.completions.create(**request)
-        except Exception as exc:  # transport or server error, never a format problem: retry once
-            print(f"CALL ERROR ({type(exc).__name__}: {exc}); retrying once")
-            time.sleep(2.0)
-            response = self.client.chat.completions.create(**request)
+        response = self.client.chat.completions.create(**request)
         choice = response.choices[0]
         usage = getattr(response, "usage", None)
         self.calls += 1
