@@ -87,9 +87,10 @@ so each crop's prefix is built once.
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. per-region counts and the side check, CSV/JSON export |
 | `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
-| `llm_api.py` | hosted-model access shared by the runner and the adapter: provider table, key lookup (environment variable or Kaggle secret), client construction |
+| `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
+| `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
 | `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Runtime settings that matter
 
@@ -113,17 +114,64 @@ so each crop's prefix is built once.
 
 Cell 3 has one `PROVIDERS` registry containing each provider's base URL and API
 key. The keys come from environment variables or Kaggle Secrets (Add-ons >
-Secrets), and unused providers may have no key. The small `ANALYZER` and
-`ADAPTER` role dictionaries then select any provider and exact model, e.g.
+Secrets), and unused providers may have no key. The small `ANALYZER`,
+`ADAPTER` and `REPORTER` role dictionaries then select any provider and exact model, e.g.
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
-routing under `request_options` stay with the role. `VisionRunner.from_api` and
-`LLMAdapter.from_api` build the clients; run manifests record the public role
-configuration, never the provider key. Transport
+routing under `request_options` stay with the role. `VisionRunner.from_api`,
+`LLMAdapter.from_api` and `ReportWriter.from_api` build the clients; run manifests
+record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once. With the API backend `MODE="auto"` resolves
 to `"plain"` without a probe: the `<think>/<answer>` suffix is a DentalGPT
 training artifact.
+
+## Dentist report
+
+The analyzer's answers are dozens of narrow facts per image; a dentist reads
+one report. Cell 15 sends the findings of each image to a text LLM (the
+`REPORTER` role in Cell 3, a spec dict like `ANALYZER` and `ADAPTER`; it never
+sees the image) and saves a classified report in the dentist's language
+(`REPORT_LANGUAGE`). `report_writer.py` does it in three fixed steps:
+
+1. **Structured input.** `structured_findings` condenses a result JSON into one
+   dense object: all 14 findings in seven sections (restorations and
+   prostheses, endodontic, caries, periodontal, periapical, teeth and eruption,
+   appliances and hardware), each with an explicit `status` (`present`,
+   `absent`, `unparseable`), the answer in every region, the count and the
+   per-region counts (numbers, or the words `not_asked`, `incomplete`,
+   `unparseable`, `not_countable`), the regions the finding was located in,
+   and a `detection` note saying whether the whole-image and the regional
+   answers agree. Region names are spelled out anatomically on the patient's
+   side. A legend, the analyzer's method and its limitations go with it, so
+   nothing is implicit and nothing is null.
+2. **One call, fixed prompt.** `SYSTEM_PROMPT` and `USER_PROMPT` ask for a
+   radiology-style report as JSON: a title and localized headings, one entry
+   per finding with its status copied and a statement in the dentist's
+   language, an impression with pathology before treatment history, the
+   unparseable findings under "not assessable", and limitations. The writer
+   may reword and organise; it may not add, drop, soften or upgrade a finding,
+   estimate a count, name a tooth, or give a diagnosis, severity or advice. A
+   regional-only detection must be called a weaker signal.
+3. **Verification and rendering.** `verify_report` checks the reply against
+   the input: every finding exactly once, in its section, with its status
+   unchanged, no unknown finding, impression and limitations present, "not
+   assessable" naming the unparseable findings and nothing else. A failing
+   reply goes back once with the list of problems (`REPAIR_PROMPT`); a reply
+   that still fails is saved with its problems and the deterministic
+   `dentist_report` takes its place in the Markdown, so the failure is visible
+   and the dentist still gets a summary. Verified JSON is rendered to Markdown
+   deterministically (sections in a fixed order; ● present, ○ absent,
+   ? unparseable).
+
+Reports resume like the other loops: one `.json` (structured input, prompt,
+every attempt with its problems, the verified report, the Markdown) and one
+`.md` per image under `<dataset>/reports/<model>-<language>/reports/`, with a
+manifest that hashes the writer settings, the prompts and the language.
+`summarize_reports` counts how many reports verified at once, after a repair,
+or fell back. Reports are for reading and are not scored: Cell 13 stays the
+measure of the analyzer. The language is not verified; read one report before
+trusting a batch.
 
 ## Datasets
 
