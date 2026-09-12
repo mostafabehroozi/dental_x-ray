@@ -205,3 +205,13 @@ not assessed.
   UMFIH and no DentVLM task; their rows are not statistically meaningful even
   with `ask_untrained=True`.
 * The weights are CC BY-NC 4.0: research use only.
+## Optional location scoring
+
+In notebook Cell 3, set `EVALUATE_LOCATION = True` (default) to score locations,
+or `False` to skip location scoring and location-truth adapter calls. Finding
+scores and total-count scores remain enabled; inference, counting questions,
+and saved predictions are unchanged.
+Re-run Cell 3, Cell 12, and Cell 13 to evaluate existing results with this setting;
+no inference rerun is required. Cell 14 also skips its side check when disabled.
+The report records `summary.evaluate_location`. Re-exporting a report with location
+scoring disabled removes its previous location CSVs so stale metrics are not shown.

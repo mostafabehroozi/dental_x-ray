@@ -246,7 +246,7 @@ def _tally(table: dict, truth: bool, answer: str | None) -> bool:
 
 
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
-             out_dir: str | Path | None = None) -> dict:
+             out_dir: str | Path | None = None, *, evaluate_location: bool = True) -> dict:
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
@@ -296,7 +296,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                     abs_err += abs(diff)
                     signed_err += diff
 
-            if level != "none" and truth and positive and finding["regions"] is not None:
+            if evaluate_location and level != "none" and truth and positive and finding["regions"] is not None:
                 n_loc += 1
                 truth_regions = gt_regions(boxes)
                 pred_regions = set(finding["regions"])
@@ -325,7 +325,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 "mae": _ratio(abs_err, n_count), "mean_signed_error": _ratio(signed_err, n_count),
                 "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n), "count_unparseable": unparsed_count,
             })
-        if level != "none":
+        if evaluate_location and level != "none":
             regions.append({
                 "dataset": dataset, "condition": condition, "level": level, "n_localized_cases": n_loc,
                 "TP": r_tp, "FP": r_fp, "TN": r_tn, "FN": r_fn, **_prf(r_tp, r_fp, r_tn, r_fn),
@@ -351,7 +351,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "location_level": level, "not_assessed": not_assessed,
-        "location_truth": location_truth_summary({i: gt[i] for i in ids}),
+        "evaluate_location": evaluate_location,
+        "location_truth": location_truth_summary({i: gt[i] for i in ids}) if evaluate_location else None,
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
@@ -422,6 +423,8 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     for name in ("presence", "whole_image", "counts", "regions", "per_image"):
         rows = report.get(name) or []
         if not rows:
+            if name == "regions":
+                (out / f"{name}.csv").unlink(missing_ok=True)
             continue
         with (out / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
