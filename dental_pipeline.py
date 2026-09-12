@@ -23,6 +23,14 @@ count, or one count per region). The whole-image answers never decide which
 regional questions are asked, so a finding missed with the model's attention
 spread over the whole image can be recovered in a region. Nothing else (JSON
 contracts, fallback paraphrases, forced zeros) is used.
+
+A hosted vision-language model (Protocol.question_form "combined") is asked presence
+and count in one question for the nine countable findings: the Figure 7 sentence and
+the Figure 9-shaped count sentence stay verbatim inside a longer prompt that defines
+the finding, fixes the scope and the display convention, and asks for two fixed reply
+lines ("Answer: A. True" / "Count: 3", or "Answer: B. False" / "Count: 0"). One reply
+then yields the presence and the count of one scope, so the separate count calls go
+away while the results keep the same fields. DentalGPT keeps the separate questions.
 """
 from __future__ import annotations
 
@@ -98,6 +106,112 @@ COUNT_TEMPLATES = {
 }
 COUNT_QUESTIONS = {c: template.format(scope=scope) for c, (template, scope) in COUNT_TEMPLATES.items()}  # whole image
 COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_TEMPLATES)  # the other five are presence-only
+
+# ----------------------------------------------------------------------------
+# Combined presence-and-count question (Protocol.question_form "combined", hosted models)
+# ----------------------------------------------------------------------------
+# A capable vision-language model can decide whether a finding is present and count the affected
+# teeth in one reply, so each countable finding is asked one question per scope instead of a presence
+# question followed by a count question. The Figure 7 sentence and the Figure 9-shaped count sentence
+# are kept verbatim inside a longer prompt that defines the finding, fixes the scope and the display
+# convention, and ends in two fixed reply lines the pipeline reads. The five presence-only findings
+# keep the bare Figure 7 question. DentalGPT keeps the separate questions ("separate"): the combined
+# prompt is outside its training distribution.
+QUESTION_FORMS = ("separate", "combined")
+
+# One-line radiographic definition and counting rule per countable finding. The counting unit is the
+# one the count sentence names (teeth, implants, residual roots). Edit here only.
+DEFINITIONS = {
+    "dental_implant": (
+        "A dental implant is a screw-shaped, uniformly radiopaque endosseous fixture placed in the alveolar "
+        "bone, with or without an abutment or a crown on it.",
+        "Count each implant fixture once; an implant-supported bridge counts one per fixture, not per pontic. "
+        "A root canal filling, a post and a fixation screw are not implants."),
+    "prosthetic_restoration": (
+        "A dental crown or bridge is a full-coverage artificial crown (metal, ceramic or metal-ceramic, "
+        "radiopaque with a smooth outline that follows the shape of the crown) on a natural tooth or an "
+        "implant, or a fixed bridge of such crowns joined by pontics.",
+        "Count each tooth that carries a crown or serves as a bridge abutment once; pontics replace missing "
+        "teeth and are not counted. An intracoronal filling is not a crown."),
+    "dental_filling": (
+        "A dental filling is intracoronal restorative material (radiopaque amalgam or composite, or an inlay) "
+        "inside the crown of a tooth.",
+        "Count each tooth with at least one filling once, however many fillings it carries. A full-coverage "
+        "crown and root canal filling material are not dental fillings."),
+    "endodontic_treatment": (
+        "Root canal treatment shows as radiopaque obturation material (gutta-percha, sealer, a post) filling "
+        "one or more root canals of a tooth.",
+        "Count each root-canal-treated tooth once, however many of its canals are filled."),
+    "carious_lesion": (
+        "Dental caries shows as a radiolucent (dark) defect in the enamel or dentine of a tooth crown or "
+        "root, including recurrent caries at the margin of a restoration.",
+        "Count each tooth with at least one carious lesion once. A radiolucent composite restoration, "
+        "cervical burn-out, the pulp chamber and an extraction socket are not caries."),
+    "impacted_tooth": (
+        "An impacted tooth has failed to erupt into its position in the arch and remains fully or partly in "
+        "bone or soft tissue, typically a third molar or a canine, often tilted or blocked by a neighbouring "
+        "tooth.",
+        "Count each impacted tooth once. A normally developing, not yet erupted tooth of a growing patient "
+        "is not impacted."),
+    "periapical_lesion": (
+        "A periapical lesion is a radiolucency centred on the apex of a root (periapical granuloma, cyst or "
+        "abscess), usually with loss of the lamina dura around the apex.",
+        "Count each tooth with a periapical lesion once, however many of its roots are involved. The mental "
+        "foramen, the incisive canal, the maxillary sinus and marrow spaces are not lesions."),
+    "root_fragment": (
+        "A residual root is a retained root or root remnant whose crown has been lost or removed, left in the "
+        "alveolar bone, usually in an otherwise edentulous space.",
+        "Count each residual root once. A tooth with an intact crown, and a root-canal-treated tooth under a "
+        "crown, are not residual roots."),
+    "root_resorption": (
+        "Root resorption is loss of root structure of a permanent tooth: shortening or blunting of the apex "
+        "or an irregular root outline (external resorption), or a widening of the canal (internal "
+        "resorption), often next to an impacted tooth or after orthodontic treatment.",
+        "Count each tooth with resorption once. The physiological resorption of the roots of primary "
+        "(deciduous) teeth is not counted."),
+}
+
+# The radiograph and its display convention, stated once so that "right" and "left" in a question are
+# the patient's sides. The combined form does not use QUADRANT_WORDS_ARE_PATIENT_SIDE: its quadrant words
+# are always the patient's, and the scope note names the image half as well.
+COMBINED_CONTEXT = ("The image is a panoramic dental radiograph (orthopantomogram) in the standard display "
+                    "orientation: the patient's right side is on the left of the image and the patient's left side "
+                    "on the right; the maxilla (upper jaw) is at the top and the mandible (lower jaw) at the bottom.")
+
+# What the model may look at, per window (words) or for the whole image and a crop.
+SCOPE_NOTES = {
+    "UR": "the patient's upper right quadrant (FDI quadrant 1): the upper teeth on the LEFT half of the image as "
+          "displayed, from the upper right central incisor back to the upper right third molar",
+    "UL": "the patient's upper left quadrant (FDI quadrant 2): the upper teeth on the RIGHT half of the image as "
+          "displayed, from the upper left central incisor back to the upper left third molar",
+    "LL": "the patient's lower left quadrant (FDI quadrant 3): the lower teeth on the RIGHT half of the image as "
+          "displayed, from the lower left central incisor back to the lower left third molar",
+    "LR": "the patient's lower right quadrant (FDI quadrant 4): the lower teeth on the LEFT half of the image as "
+          "displayed, from the lower right central incisor back to the lower right third molar",
+    "upper": "the upper jaw (maxilla): the upper teeth and the maxillary bone across the whole width of the image",
+    "lower": "the lower jaw (mandible): the lower teeth and the mandibular bone across the whole width of the image",
+}
+WHOLE_SCOPE = "the whole radiograph."
+CROP_SCOPE = "this image, which is a cropped region of the radiograph; consider only the teeth visible in it."
+
+# The template. {presence_question} is the Figure 7 question (whole image, or with the region named) and
+# {count_question} the Figure 9-shaped count sentence with the same scope, both verbatim; the reply ends
+# in the two lines extract_combined reads.
+COMBINED_QUESTION = """{context}
+
+Finding under review: {label}. {definition}
+
+Scope: {scope}
+
+{presence_question}
+
+If the answer is A, also answer: {count_question} {counting_rule} If the answer is B, the count is 0.
+
+Decide from what is visible in this image, not from what is usual for a patient. An answer of A requires a count of at least 1, and a count of 0 requires the answer B.
+
+You may reason briefly first, then end your reply with exactly these two lines and nothing after them:
+Answer: <exactly "A. True" or "B. False">
+Count: <a whole number written in digits; 0 when the answer is B>"""
 
 # The paper says a fixed sentence was appended during RL to request <think> and
 # <answer> tags but does not publish it. This is the common VLM-R1 wording and is
@@ -210,12 +324,13 @@ def presence_question(condition: str, mode: str = "plain", region: str | None = 
     return with_mode(text, mode)
 
 
-def count_scope(condition: str, region: str | None = None, scheme: str = "quadrant") -> str:
+def count_scope(condition: str, region: str | None = None, scheme: str = "quadrant",
+                patient_side: bool | None = None) -> str:
     """Scope words of a count question: the whole image, or a region ("... of the panoramic radiograph")."""
     _, whole = COUNT_TEMPLATES[condition]
     if region is None:
         return whole
-    phrase = region_phrase(region, scheme)
+    phrase = region_phrase(region, scheme, patient_side)
     return phrase if whole == "the image" else f"{phrase} of {whole}"
 
 
@@ -223,6 +338,30 @@ def count_question(condition: str, mode: str = "plain", region: str | None = Non
                    scheme: str = "quadrant") -> str:
     template, _ = COUNT_TEMPLATES[condition]
     return with_mode(template.format(scope=count_scope(condition, region, scheme)), mode)
+
+
+def combined_question(condition: str, mode: str = "plain", region: str | None = None,
+                      scheme: str = "quadrant", crop: bool = False) -> str:
+    """Presence-and-count question for one countable finding: the whole image, one named region
+    (words), or the whole-image wording on a crop (crop=True). Quadrant words are the patient's sides
+    and the scope note names the image half, so QUADRANT_WORDS_ARE_PATIENT_SIDE does not apply."""
+    if condition not in COUNTABLE:
+        raise ValueError(f"{condition!r} is presence-only; use presence_question")
+    if crop and region is not None:
+        raise ValueError("a crop carries the whole-image wording: give region or crop, not both")
+    label = LABELS[condition]
+    definition, counting_rule = DEFINITIONS[condition]
+    template, _ = COUNT_TEMPLATES[condition]
+    if region is None:
+        presence = PRESENCE_QUESTION.format(label=label)
+        scope = CROP_SCOPE if crop else WHOLE_SCOPE
+    else:
+        presence = REGION_PRESENCE_QUESTION.format(label=label, region=region_phrase(region, scheme, patient_side=True))
+        scope = f"only {SCOPE_NOTES[region]}; ignore every tooth outside it."
+    count = template.format(scope=count_scope(condition, region, scheme, patient_side=True))
+    text = COMBINED_QUESTION.format(context=COMBINED_CONTEXT, label=label, definition=definition, scope=scope,
+                                    presence_question=presence, count_question=count, counting_rule=counting_rule)
+    return with_mode(text, mode)
 
 
 # ----------------------------------------------------------------------------
@@ -309,6 +448,39 @@ def extract_count(text: str) -> int | None:
     if {"no", "none"} & set(words):
         return 0
     return None
+
+
+# The two closing lines of a combined reply ("Answer: A. True", "Count: 3"), also accepted mid-line,
+# bold, or with a full-width colon; the last occurrence of each wins.
+_ANSWER_LINE = re.compile(r"\banswer\b[\s*_]*[:=\uff1a]\s*([^\n;,]+)", re.I)
+_COUNT_LINE = re.compile(r"\bcount\b[\s*_]*[:=\uff1a]\s*([^\n;,.]+)", re.I)
+
+
+def extract_combined(text: str) -> tuple[str | None, int | None]:
+    """(choice, count) of a combined reply: the last "Answer:" and "Count:" lines, else the lenient
+    presence and count rules over the whole body. The count is what the reply says; whether it agrees
+    with the choice is judged by consistent_pair."""
+    body = answer_body(text)
+    answers, counts = _ANSWER_LINE.findall(body), _COUNT_LINE.findall(body)
+    choice = extract_choice(answers[-1]) if answers else extract_choice(body)
+    count = extract_count(counts[-1]) if counts else extract_count(_ANSWER_LINE.sub(" ", body))
+    return choice, count
+
+
+def consistent_pair(choice: str | None, count: int | None) -> tuple[str | None, int | None]:
+    """The (presence, count) kept from a combined reply. Never guesses: with the letter unreadable
+    nothing is kept, and a count that contradicts the letter (A with 0, B with more than 0) is
+    unparseable while the letter stands."""
+    if choice is None:
+        return None, None
+    if count is not None and (choice == "A") != (count > 0):
+        return choice, None
+    return choice, count
+
+
+def graded_pair(reply: dict) -> tuple[str | None, int | None]:
+    """Graded (presence, count) of a combined reply; truncated replies are unparseable as in graded()."""
+    return consistent_pair(*(graded(reply, extract_combined) or (None, None)))
 
 
 # ----------------------------------------------------------------------------
@@ -510,18 +682,29 @@ class Protocol:
     region_scheme   "quadrant" (UR, UL, LL, LR) or "arch" (upper, lower).
     region_prompt   "words": the region is named in the question and the whole image is sent.
                     "crop":  the whole-image question is sent with the region crop.
+    question_form   "separate": the Figure 7 presence question, then the Figure 9-shaped count question
+                                for a positive countable finding (DentalGPT's shapes).
+                    "combined": for hosted models. Wherever the separate form would ask a presence and
+                                then a count question in the same scope, one presence-and-count question
+                                is asked instead (the five presence-only findings keep the bare presence
+                                question); one reply gives both. A count that contradicts the letter is
+                                unparseable. With presence_level "region" and count_level "overall", a
+                                finding the whole image did not answer A but a region did still gets
+                                the whole-image count question.
     """
 
     presence_level: str = "region"
     count_level: str = "region"
     region_scheme: str = "quadrant"
     region_prompt: str = "words"
+    question_form: str = "separate"
 
     def __post_init__(self) -> None:
         for value, allowed, name in ((self.presence_level, PRESENCE_LEVELS, "presence_level"),
                                      (self.count_level, COUNT_LEVELS, "count_level"),
                                      (self.region_scheme, REGION_SCHEMES, "region_scheme"),
-                                     (self.region_prompt, REGION_PROMPTS, "region_prompt")):
+                                     (self.region_prompt, REGION_PROMPTS, "region_prompt"),
+                                     (self.question_form, QUESTION_FORMS, "question_form")):
             if value not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
 
@@ -538,8 +721,12 @@ class Protocol:
 # ----------------------------------------------------------------------------
 # Per-image analysis and dataset runs with resume
 # ----------------------------------------------------------------------------
-def _record(calls: list, stage: str, condition: str, region: str | None, question: str, reply: dict) -> None:
-    calls.append({"stage": stage, "condition": condition, "region": region, "question": question, **reply})
+def _record(calls: list, stage: str, condition: str, region: str | None, question: str, reply: dict,
+            parsed: dict | None = None) -> None:
+    call = {"stage": stage, "condition": condition, "region": region, "question": question, **reply}
+    if parsed is not None:
+        call["parsed"] = parsed
+    calls.append(call)
 
 
 def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol: Protocol = Protocol(),
@@ -548,22 +735,41 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
     says, every region for every finding: presence, and a count as soon as a region answers A. The
     whole-image answers never decide which regional questions are asked. Deterministic order:
     region-major, so with crops the crop's image prefix stays cached; with words every call shares
-    the whole image."""
+    the whole image. With question_form "combined", a slot that would take a presence question and
+    then a count question takes one presence-and-count question instead (countable findings only);
+    the call record keeps the raw pair, so a count rejected as contradictory stays visible."""
     path = Path(image_path)
     calls: list[dict] = []
     findings = {c: {"presence": None, "whole_image": None, "count": None, "regions": None, "region_counts": None}
                 for c in CONDITIONS}
-
-    for condition in CONDITIONS:
-        question = presence_question(condition, mode)
-        reply = runner.ask(path, question)
-        _record(calls, "presence", condition, None, question, reply)
-        findings[condition]["whole_image"] = findings[condition]["presence"] = graded(reply, extract_choice)
-
     scheme, regions = protocol.region_scheme, protocol.regions
     by_crop = protocol.region_prompt == "crop"
-    crops = make_crops(path, scheme, crop_dir) if (regions and by_crop) else {}
     region_counts = protocol.count_level == "region"
+    combined = protocol.question_form == "combined"
+
+    def ask(stage: str, condition: str, region: str | None, image, question: str) -> dict:
+        reply = runner.ask(image, question)
+        _record(calls, stage, condition, region, question, reply)
+        return reply
+
+    def ask_pair(stage: str, condition: str, region: str | None, image, question: str) -> tuple[str | None, int | None]:
+        reply = runner.ask(image, question)
+        raw = graded(reply, extract_combined) or (None, None)
+        consistent = None if None in raw else (raw[0] == "A") == (raw[1] > 0)
+        _record(calls, stage, condition, region, question, reply,
+                parsed={"choice": raw[0], "count": raw[1], "consistent": consistent})
+        return consistent_pair(*raw)
+
+    # Whole image. With overall counts the combined form takes the count in the same reply.
+    whole_counts: dict[str, int | None] = {}
+    for condition in CONDITIONS:
+        if combined and condition in COUNTABLE and not region_counts:
+            answer, whole_counts[condition] = ask_pair("presence", condition, None, path, combined_question(condition, mode))
+        else:
+            answer = graded(ask("presence", condition, None, path, presence_question(condition, mode)), extract_choice)
+        findings[condition]["whole_image"] = findings[condition]["presence"] = answer
+
+    crops = make_crops(path, scheme, crop_dir) if (regions and by_crop) else {}
 
     def image_for(region: str):
         return crops[region] if by_crop else path
@@ -578,41 +784,52 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
                 findings[condition]["region_counts"] = {}
         for region in regions:
             for condition in CONDITIONS:
-                question = presence_question(condition, mode, named(region), scheme)
-                reply = runner.ask(image_for(region), question)
-                _record(calls, "region", condition, region, question, reply)
-                answer = graded(reply, extract_choice)
+                if combined and region_counts and condition in COUNTABLE:
+                    answer, count = ask_pair("region", condition, region, image_for(region),
+                                             combined_question(condition, mode, named(region), scheme, crop=by_crop))
+                    if answer == "A":
+                        findings[condition]["region_counts"][region] = count
+                else:
+                    answer = graded(ask("region", condition, region, image_for(region),
+                                        presence_question(condition, mode, named(region), scheme)), extract_choice)
+                    if answer == "A" and region_counts and condition in COUNTABLE:
+                        reply = ask("region_count", condition, region, image_for(region),
+                                    count_question(condition, mode, named(region), scheme))
+                        findings[condition]["region_counts"][region] = graded(reply, extract_count)
                 findings[condition]["regions"][region] = answer
-                if answer == "A" and region_counts and condition in COUNTABLE:
-                    question = count_question(condition, mode, named(region), scheme)
-                    reply = runner.ask(image_for(region), question)
-                    _record(calls, "region_count", condition, region, question, reply)
-                    findings[condition]["region_counts"][region] = graded(reply, extract_count)
         for condition in CONDITIONS:
             answers = findings[condition]["regions"].values()
             # Present when any region answers A; absent only when every region answers B.
             findings[condition]["presence"] = "A" if "A" in answers else "B" if all(a == "B" for a in answers) else None
     elif region_counts:
-        # Whole-image presence with region counts: every countable finding is counted in every region.
+        # Whole-image presence with region counts: every countable finding is counted in every region. The
+        # combined form asks the region's presence-and-count question and keeps the count (0 with a B).
         for condition in COUNTABLE:
             findings[condition]["region_counts"] = {}
         for region in regions:
             for condition in COUNTABLE:
-                question = count_question(condition, mode, named(region), scheme)
-                reply = runner.ask(image_for(region), question)
-                _record(calls, "region_count", condition, region, question, reply)
-                findings[condition]["region_counts"][region] = graded(reply, extract_count)
+                if combined:
+                    _, count = ask_pair("region_count", condition, region, image_for(region),
+                                        combined_question(condition, mode, named(region), scheme, crop=by_crop))
+                else:
+                    reply = ask("region_count", condition, region, image_for(region),
+                                count_question(condition, mode, named(region), scheme))
+                    count = graded(reply, extract_count)
+                findings[condition]["region_counts"][region] = count
 
     for condition in COUNTABLE:
+        finding = findings[condition]
         if region_counts:
-            counts = findings[condition]["region_counts"]
+            counts = finding["region_counts"]
             complete = bool(counts) and all(n is not None for n in counts.values())
-            findings[condition]["count"] = sum(counts.values()) if complete else None
-        elif findings[condition]["presence"] == "A":
-            question = count_question(condition, mode)
-            reply = runner.ask(path, question)
-            _record(calls, "count", condition, None, question, reply)
-            findings[condition]["count"] = graded(reply, extract_count)
+            finding["count"] = sum(counts.values()) if complete else None
+        elif finding["presence"] == "A":
+            if combined and finding["whole_image"] == "A":
+                finding["count"] = whole_counts[condition]  # from the same reply; None when it contradicted the A
+            else:
+                # The separate form, or a finding the whole image did not answer A (found by the regions).
+                reply = ask("count", condition, None, path, count_question(condition, mode))
+                finding["count"] = graded(reply, extract_count)
 
     return {
         "image": str(path.resolve()),
@@ -631,13 +848,19 @@ def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}; run the probe or set MODE to one of them")
     words = protocol.uses_regions and protocol.region_prompt == "words"
+    combined = protocol.question_form == "combined"
     config = {
         "mode": mode, "protocol": asdict(protocol), "labels": LABELS,
         "presence_question": PRESENCE_QUESTION,
         "region_presence_question": REGION_PRESENCE_QUESTION if words and protocol.presence_level == "region" else None,
-        "region_phrases": {r: region_phrase(r, protocol.region_scheme) for r in protocol.regions} if words else None,
+        "region_phrases": ({r: region_phrase(r, protocol.region_scheme, patient_side=True if combined else None)
+                            for r in protocol.regions} if words else None),
         "count_questions": COUNT_QUESTIONS,
         "count_templates": {c: t for c, (t, _) in COUNT_TEMPLATES.items()} if protocol.count_level == "region" else None,
+        "combined": ({"question": COMBINED_QUESTION, "context": COMBINED_CONTEXT, "definitions": DEFINITIONS,
+                      "whole_scope": WHOLE_SCOPE, "crop_scope": CROP_SCOPE,
+                      "scope_notes": {r: SCOPE_NOTES[r] for r in protocol.regions} if words else None}
+                     if combined else None),
         "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
         "crops": CROPS[protocol.region_scheme] if protocol.uses_regions and protocol.region_prompt == "crop" else None,
         "runner": runner_settings, "provenance": provenance or {},

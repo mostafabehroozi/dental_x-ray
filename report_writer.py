@@ -116,13 +116,22 @@ def detection_note(status: str, whole_image: str, regional: bool) -> str:
 
 
 def method_text(protocol: dict, regions: tuple[str, ...]) -> str:
+    combined = protocol.get("question_form") == "combined"
     parts = ["one True/False question per finding on the whole image"]
     how = "named in the question" if protocol["region_prompt"] == "words" else "sent as a crop"
     if protocol["presence_level"] == "region":
         parts.append(f"the same question for every finding in each of the {len(regions)} regions ({how})")
     if protocol["count_level"] == "region" and regions:
-        parts.append("a count of affected teeth in every region that answered True" if protocol["presence_level"] == "region"
-                     else f"a count of affected teeth in each of the {len(regions)} regions ({how}) for every countable finding")
+        if protocol["presence_level"] == "region":
+            parts.append("for the nine countable findings the regional question also asks for the count of affected teeth"
+                         if combined else "a count of affected teeth in every region that answered True")
+        else:
+            parts.append(f"{'one presence-and-count question' if combined else 'a count of affected teeth'} in each of the "
+                         f"{len(regions)} regions ({how}) for every countable finding")
+    elif combined:
+        parts.append("for the nine countable findings the whole-image question also asks for the count of affected teeth"
+                     + (", with a separate whole-image count for a finding the whole image answered False but a region "
+                        "answered True" if protocol["presence_level"] == "region" else ""))
     else:
         parts.append("one whole-image count of affected teeth per countable finding answered True")
     return "; ".join(parts)

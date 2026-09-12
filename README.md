@@ -47,7 +47,7 @@ probe therefore decides once per run whether the suffix is needed ("plain" or
 
 ## Two levels
 
-`dental_pipeline.Protocol` (Cell 3) has four knobs:
+`dental_pipeline.Protocol` (Cell 3) has five knobs:
 
 | Knob | Values | Meaning |
 | --- | --- | --- |
@@ -55,6 +55,7 @@ probe therefore decides once per run whether the suffix is needed ("plain" or
 | `COUNT_LEVEL` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `PRESENCE_LEVEL="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
 | `REGION_SCHEME` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
 | `REGION_PROMPT` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
+| `QUESTION_FORM` | `separate`, `combined` | `separate`: the Figure 7 presence question, then the Figure 9-shaped count question for a positive countable finding (DentalGPT's shapes). `combined`: for hosted models, one presence-and-count question wherever the separate form would ask both in the same scope (see "Combined presence-and-count question"); the five presence-only findings keep the bare question. |
 
 The whole-image wording is byte-identical in every configuration; the region
 wording only fills a scope slot of the same sentence (`REGION_PHRASES`,
@@ -78,6 +79,70 @@ The regional calls never depend on what the whole image answered, so an
 all-negative image needs 14, 70, 50 or 70 calls. With `REGION_PROMPT="words"`
 every call reuses the cached image prefix; with crops the loop is region-major,
 so each crop's prefix is built once.
+
+With `QUESTION_FORM="combined"` the count calls disappear. Rf = findings a
+region answered A for while the whole image did not (only `region / overall`
+asks a count for those):
+
+| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (quadrants) |
+| --- | --- | --- |
+| overall / overall | 14 | 14 |
+| region / overall | 14 + R x 14 + Rf | 70 + Rf |
+| overall / region | 14 + R x 9 | 50 |
+| region / region | 14 + R x 14 | 70 |
+
+## Combined presence-and-count question (hosted models)
+
+DentalGPT is asked one fact per call because that is the shape it was trained
+on. A capable hosted model does not need the split: with
+`QUESTION_FORM="combined"` (Cell 3's default for `BACKEND="api"`) each of the
+nine countable findings is asked one presence-and-count question per scope, and
+the reply ends in two fixed lines:
+
+```text
+Answer: A. True
+Count: 3
+```
+
+or `Answer: B. False` / `Count: 0`. The five presence-only findings keep the
+bare Figure 7 question, and the local model keeps the separate questions. The
+prompt (`dental_pipeline.COMBINED_QUESTION`) is longer than anything sent to
+DentalGPT, but the two task sentences inside it are the ones the separate form
+sends, verbatim: the Figure 7 sentence (whole image, or with the region named)
+and the Figure 9-shaped count sentence with the same scope. Around them it
+states the display convention (the patient's right is on the image's left),
+defines the finding and its counting unit in one line each (`DEFINITIONS`; edit
+there only), pins the scope (the whole radiograph, a crop, or one quadrant or
+jaw named both anatomically and as an image half, `SCOPE_NOTES`), and forbids
+the two inconsistent pairs (A with 0, B with more than 0). The model may reason
+first; only the last `Answer:` and `Count:` lines are read, with the lenient
+rules of the separate form as a fallback.
+
+The combined question replaces a presence question exactly where the separate
+form would have followed it with a count question in the same scope, so the
+results keep the same fields:
+
+* `COUNT_LEVEL="overall"`: the whole-image question of a countable finding is
+  combined and yields `whole_image` and the count; the regional questions stay
+  presence-only. A finding the whole image answered B but a region answered A
+  is present by the regional rule and still gets the Figure 9 whole-image count
+  question, the only extra call the form ever makes.
+* `COUNT_LEVEL="region"`: the whole-image questions stay presence-only and the
+  regional question of a countable finding is combined. A region's count is
+  stored when it answers A (`PRESENCE_LEVEL="region"`), or for every region,
+  0 with a B (`PRESENCE_LEVEL="overall"`), as the separate form stores them.
+
+Grading never guesses: a reply without a readable letter yields nothing; a
+count that contradicts the letter is unparseable while the letter stands, and
+shows up under `count_unparseable`. Every combined call records the raw pair
+and whether it was consistent (`calls[*].parsed`), so a rejected count stays
+visible. The quadrant words of the combined form are always the patient's and
+the scope note names the image half, so `QUADRANT_WORDS_ARE_PATIENT_SIDE` does
+not apply to it; a low `side_agreement` on a combined run means the model
+ignored the scope note, and crops are the remedy. Force `"separate"` on the API
+backend for a prompt-for-prompt comparison with DentalGPT; the manifest hash
+follows the form and the combined wording, so the two never mix in one run
+directory.
 
 ## Files
 
@@ -124,7 +189,9 @@ record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once. With the API backend `MODE="auto"` resolves
 to `"plain"` without a probe: the `<think>/<answer>` suffix is a DentalGPT
-training artifact.
+training artifact. Cell 3 also switches `QUESTION_FORM` to `"combined"` for
+this backend, so the nine countable findings are asked presence and count in
+one question (see "Combined presence-and-count question").
 
 ## Dentist report
 
@@ -291,6 +358,10 @@ Two diagnostics decide whether word-based regions are being read:
   counted twice; use words for region counts.
 * Apical surgery, root resorption, and furcation have very few positives in
   UMFIH; their rows are not statistically meaningful.
+* The combined form's definitions and counting rules (`DEFINITIONS`) are
+  radiographic conventions written for this ontology, not the UMFIH annotation
+  guide (bridge pontics are not counted, for one); check them against it before
+  comparing count rows of a combined run with those of a separate run.
 ## Optional location scoring
 
 In notebook Cell 3, set `EVALUATE_LOCATION = True` (default) to score locations,

@@ -162,6 +162,23 @@ class StructuredInputTests(unittest.TestCase):
             self.assertNotIn(placeholder, prompt)
 
 
+class MethodTextTests(unittest.TestCase):
+    def test_method_text_names_the_combined_question(self):
+        regions = ("UR", "UL", "LL", "LR")
+        base = {"presence_level": "region", "count_level": "region", "region_scheme": "quadrant", "region_prompt": "words"}
+        self.assertIn("every region that answered True", rw.method_text({**base, "question_form": "separate"}, regions))
+        self.assertIn("every region that answered True", rw.method_text(base, regions))  # results saved before the form knob
+        self.assertIn("the regional question also asks for the count of affected teeth", rw.method_text({**base, "question_form": "combined"}, regions))
+        self.assertIn("one presence-and-count question in each of the 4 regions (named in the question)",
+                      rw.method_text({**base, "presence_level": "overall", "question_form": "combined"}, regions))
+        flat = rw.method_text({**base, "presence_level": "overall", "count_level": "overall", "question_form": "combined"}, ())
+        self.assertIn("the whole-image question also asks for the count of affected teeth", flat)
+        self.assertNotIn("separate whole-image count", flat)
+        self.assertIn("with a separate whole-image count for a finding the whole image answered False but a region answered True",
+                      rw.method_text({**base, "count_level": "overall", "question_form": "combined"}, regions))
+        self.assertIn("one whole-image count of affected teeth", rw.method_text({**base, "count_level": "overall"}, regions))
+
+
 class VerificationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

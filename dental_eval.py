@@ -229,10 +229,11 @@ def result_protocol(result: dict) -> dict:
     """The protocol a result was produced with; results from before the two levels are translated."""
     protocol = result.get("protocol")
     if protocol:
-        return dict(protocol)
+        return {**protocol, "question_form": protocol.get("question_form", "separate")}  # form knob added later
     level = result.get("location_level", "none")
     return {"presence_level": "overall" if level == "none" else "region", "count_level": "overall",
-            "region_scheme": "quadrant" if level == "none" else level, "region_prompt": "crop"}
+            "region_scheme": "quadrant" if level == "none" else level, "region_prompt": "crop",
+            "question_form": "separate"}
 
 
 def result_scheme(result: dict) -> str:
