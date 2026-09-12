@@ -243,3 +243,13 @@ Two diagnostics decide whether word-based regions are being read:
   counted twice; use words for region counts.
 * Apical surgery, root resorption, and furcation have very few positives in
   UMFIH; their rows are not statistically meaningful.
+## Optional location scoring
+
+In notebook Cell 3, set `EVALUATE_LOCATION = True` (default) to score locations,
+or `False` to skip location scoring and location-truth adapter calls. Finding
+scores and total-count scores remain enabled; inference, counting questions,
+and saved predictions are unchanged. Regional-count metrics and the side check also follow this switch.
+Re-run Cell 3, Cell 12, and Cell 13 to evaluate existing results with this setting;
+no inference rerun is required.
+The report records `summary.evaluate_location`. Re-exporting a report with location
+scoring disabled removes its previous location CSVs so stale metrics are not shown.

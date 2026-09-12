@@ -283,15 +283,15 @@ def _tally(table: dict, truth: bool, answer: str | None) -> bool:
 
 
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
-             out_dir: str | Path | None = None) -> dict:
+             out_dir: str | Path | None = None, *, evaluate_location: bool = True) -> dict:
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
     presence, whole_image, counts, region_counts, regions, per_image = [], [], [], [], [], []
     protocol = result_protocol(results[ids[0]]) if ids else None
     level = result_scheme(results[ids[0]]) if ids else "none"
-    region_names = tuple(CROPS[level]) if level != "none" else ()
-    per_region_counts = bool(protocol) and protocol["count_level"] == "region" and level != "none"
+    region_names = tuple(CROPS[level]) if evaluate_location and level != "none" else ()
+    per_region_counts = evaluate_location and bool(protocol) and protocol["count_level"] == "region" and level != "none"
     # The whole-image answers are a separate result only when presence was resolved per region.
     whole_image_kept = (bool(protocol) and protocol["presence_level"] == "region"
                         and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]])
@@ -353,7 +353,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                             cell["abs"] += abs(pred_n - truth_n)
                             cell["signed"] += pred_n - truth_n
 
-            if level != "none" and truth and positive:
+            if evaluate_location and level != "none" and truth and positive:
                 pred_regions_map, source = predicted_regions(finding)
                 if not pred_regions_map:
                     continue
@@ -403,7 +403,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                         "strict_n": cell["strict_n"], "strict_mae": _ratio(cell["strict_abs"], cell["strict_n"]),
                         "count_unparseable": cell["unparseable"],
                     })
-        if level != "none":
+        if evaluate_location and level != "none":
             regions.append({
                 "dataset": dataset, "condition": condition, "level": level, "n_localized_cases": n_loc,
                 "from_counts": from_counts,
@@ -432,7 +432,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "protocol": protocol, "location_level": level,
-        "location_truth": location_truth_summary({i: gt[i] for i in ids}),
+        "evaluate_location": evaluate_location,
+        "location_truth": location_truth_summary({i: gt[i] for i in ids}) if evaluate_location else None,
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
@@ -446,7 +447,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     if whole_image:
         micro_whole = {k: sum(r[k] for r in whole_image) for k in ("TP", "FP", "TN", "FN")}
         summary["whole_image"] = {**micro_whole, **_prf(*(micro_whole[k] for k in ("TP", "FP", "TN", "FN")))}
-    if level == "quadrant":
+    if evaluate_location and level == "quadrant":
         summary["side_agreement"] = side_agreement(gt, results)
     report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
               "region_counts": region_counts, "regions": regions, "per_image": per_image, "missing_results": missing}
@@ -510,6 +511,8 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     for name in ("presence", "whole_image", "counts", "region_counts", "regions", "per_image"):
         rows = report.get(name) or []
         if not rows:
+            if name in ("regions", "region_counts"):
+                (out / f"{name}.csv").unlink(missing_ok=True)
             continue
         with (out / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
