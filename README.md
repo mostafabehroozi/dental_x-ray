@@ -103,19 +103,15 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 
 ## Hosted models
 
-The model behind `BACKEND="api"` and the location-truth adapter are both
-described by a small spec dict in Cell 3, e.g.
+Cell 3 has one `PROVIDERS` registry containing each provider's base URL and API
+key. The keys come from environment variables or Kaggle Secrets (Add-ons >
+Secrets), and unused providers may have no key. The small `ANALYZER` and
+`ADAPTER` role dictionaries then select any provider and exact model, e.g.
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
-`llm_api.PROVIDERS` holds the endpoints (`openai`, `nvidia`, `openrouter`,
-`gemini`) and the name of the key each one reads: an environment variable, else
-the Kaggle secret of the same name (`OPENAI_API_KEY`, `NVIDIA_API_KEY`,
-`OPENROUTER_API_KEY`, `GEMINI_API_KEY`; Add-ons > Secrets). Optional keys of a
-spec: `api_key` (paste one for a quick test, never commit it), `base_url` and
-`api_key_env` (any other OpenAI-compatible endpoint), `token_param` and
-`temperature` (`"max_completion_tokens"` and `None` for OpenAI reasoning
-models), `request_options` (extra request fields, e.g. OpenRouter routing under
-`extra_body`). `VisionRunner.from_api` and `LLMAdapter.from_api` build the
-clients; run manifests record `llm_api.public(spec)`, never the key. Transport
+Model-specific options such as `token_param`, `temperature`, and OpenRouter
+routing under `request_options` stay with the role. `VisionRunner.from_api` and
+`LLMAdapter.from_api` build the clients; run manifests record the public role
+configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once.
 
@@ -156,7 +152,7 @@ Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
   `LEFT_IS_IMAGE_LEFT` reading as the model's own words. One call per image
   (chunked above `max_boxes_per_call` boxes), strict JSON back, one retry when
   the reply is incomplete, and a box the model cannot place falls back to the
-  windows. The model is a spec in Cell 3 (`ADAPTER_API`, see "Hosted models");
+  windows. The model is the `ADAPTER` role in Cell 3 (see "Hosted models");
   for reasoning models set `token_param` to `max_completion_tokens` and leave
   `temperature` at `None`.
 * `"fdm"` (experimental): DentVLM itself. It has no question about a marked

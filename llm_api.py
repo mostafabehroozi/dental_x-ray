@@ -1,13 +1,12 @@
 """Hosted-model access shared by the model runner and the location adapter.
 
-One table of OpenAI-compatible providers, one place that finds the key (an environment
-variable, else the Kaggle secret of the same name), one function that builds the client.
-A model is described by a small spec dict, edited in the notebook's configuration cell:
+The notebook keeps one registry of OpenAI-compatible providers (base URL plus API key),
+then assigns small model specs to roles such as ANALYZER and ADAPTER. A model spec is:
 
     {"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}
 
-Optional keys: "api_key" (paste one for a quick test; never commit it), "base_url" and
-"api_key_env" (any other OpenAI-compatible endpoint), "token_param" and "temperature"
+Optional model-spec overrides are "api_key", "base_url" and "api_key_env",
+"token_param" and "temperature"
 ("max_completion_tokens" and None for OpenAI reasoning models), "request_options" (extra
 request fields, e.g. OpenRouter routing under "extra_body"). The key never reaches a
 manifest: record public(spec), not the spec.
@@ -16,12 +15,7 @@ from __future__ import annotations
 
 import os
 
-PROVIDERS = {
-    "openai": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
-    "nvidia": {"base_url": "https://integrate.api.nvidia.com/v1", "api_key_env": "NVIDIA_API_KEY"},
-    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
-    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key_env": "GEMINI_API_KEY"},
-}
+PROVIDERS: dict[str, dict] = {}
 TOKEN_PARAMS = ("max_tokens", "max_completion_tokens")
 
 
@@ -35,10 +29,27 @@ def secret(name: str, required: bool = True) -> str | None:
             value = UserSecretsClient().get_secret(name)
         except Exception:  # not on Kaggle, or no secret of that name attached
             value = None
+    if isinstance(value, str):
+        value = value.strip()
     if not value and required:
         raise RuntimeError(f"secret {name!r} not found: export it as an environment variable, attach it as a "
                            f"Kaggle secret (Add-ons > Secrets), or put the key in the spec under 'api_key'")
     return value or None
+
+
+def configure_providers(providers: dict[str, dict]) -> None:
+    """Replace the provider registry with the notebook's single source of configuration."""
+    if not isinstance(providers, dict) or not providers:
+        raise ValueError("providers must be a non-empty dictionary")
+    normalized = {}
+    for name, row in providers.items():
+        if not isinstance(name, str) or not name or not isinstance(row, dict):
+            raise ValueError("each provider needs a non-empty name and a configuration dictionary")
+        if not row.get("base_url"):
+            raise ValueError(f"provider {name!r} needs a base_url")
+        normalized[name] = dict(row)
+    PROVIDERS.clear()
+    PROVIDERS.update(normalized)
 
 
 def resolve(spec: dict) -> tuple[str, str]:
@@ -48,10 +59,12 @@ def resolve(spec: dict) -> tuple[str, str]:
     if not row and not spec.get("base_url"):
         raise ValueError(f"unknown provider {provider!r}: use one of {sorted(PROVIDERS)} or give base_url")
     base_url = spec.get("base_url") or row["base_url"]
-    api_key = spec.get("api_key")
+    api_key = spec.get("api_key") or row.get("api_key")
     if not api_key:
         key_env = spec.get("api_key_env") or row.get("api_key_env")
         if not key_env:
+            if provider in PROVIDERS:
+                raise RuntimeError(f"API key for provider {provider!r} is empty; configure it in PROVIDERS")
             raise ValueError("spec needs 'api_key', or 'api_key_env' naming the environment variable / Kaggle secret")
         api_key = secret(key_env)
     return base_url, api_key
