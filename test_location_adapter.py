@@ -70,7 +70,7 @@ class AdapterTests(unittest.TestCase):
         (self.root / "images").mkdir()
         (self.root / "labels").mkdir()
         _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png")
+        _blank_image(self.root / "images" / "img2.png", shade=100)
         # img1: two fillings in the upper image-left cell (geometry), one impacted tooth lower image-right.
         (self.root / "labels" / "img1.txt").write_text(
             "2 0.20 0.25 0.05 0.05\n2 0.30 0.30 0.05 0.05\n6 0.80 0.80 0.10 0.10\n")

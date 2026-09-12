@@ -12,6 +12,9 @@ Communications 2026; arXiv 2509.23344) was trained and evaluated on:
   as the authors' scorer does; nothing about location is ever asked in words.
 * Multiplicity is the number of distinct regions the model names (0-6). A
   tooth-count question exists only as an explicitly out-of-distribution option.
+* The crop comparison asks every task on each of the six cell crops, whatever
+  the whole image answered (kept as a separate result), so a finding missed on
+  the whole image can be recovered in a cell.
 
 Nothing else (JSON contracts, <think> tags, region wording, paraphrase
 retries, forced zeros) is used. Findings the model has no task for are not
@@ -478,7 +481,7 @@ class Protocol:
 
     phrasings: int = 1            # 1, or up to 3 verbatim wordings per task with a majority vote
     region_vote: str = "union"    # with phrasings > 1: "union" (matching voting) or "majority"
-    location: str = "rationale"   # "rationale" (free, in-distribution) | "crops" (comparison) | "none"
+    location: str = "rationale"   # "rationale" (free, in-distribution) | "crops" (every cell, every task) | "none"
     count_question: bool = False  # out-of-distribution tooth-count question for positive countables
     ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
     extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
@@ -521,17 +524,20 @@ def _record(calls: list, stage: str, task: str, cell: str | None, question: str,
     calls.append({"stage": stage, "task": task, "cell": cell, "question": question, **reply})
 
 
+def _any_yes(answers) -> str | None:
+    """'yes' when any answer is yes, 'no' when every answer is no, else None (unparseable)."""
+    answers = list(answers)
+    if "yes" in answers:
+        return "yes"
+    return "no" if all(a == "no" for a in answers) else None
+
+
 def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
     keys = condition_tasks(condition, protocol.ask_untrained)
     if not keys or any(k not in tasks for k in keys):
-        return {"asked": False, "tasks": [], "presence": None, "regions": None, "region_count": None, "count": None}
-    answers = [tasks[k]["presence"] for k in keys]
-    if "yes" in answers:
-        presence = "yes"
-    elif all(a == "no" for a in answers):
-        presence = "no"
-    else:
-        presence = None
+        return {"asked": False, "tasks": [], "presence": None, "whole_image": None, "regions": None,
+                "region_count": None, "count": None}
+    presence = _any_yes(tasks[k]["presence"] for k in keys)
     regions = None
     if presence == "yes" and protocol.location != "none":
         named = set()
@@ -539,13 +545,15 @@ def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
             if tasks[k]["presence"] == "yes":
                 named.update(tasks[k]["regions"] or [])
         regions = [c for c in CELLS if c in named]
-    return {"asked": True, "tasks": list(keys), "presence": presence, "regions": regions,
+    return {"asked": True, "tasks": list(keys), "presence": presence,
+            "whole_image": _any_yes(tasks[k]["whole_image"] for k in keys), "regions": regions,
             "region_count": len(regions) if regions is not None else None, "count": None}
 
 
 def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(),
                   crop_dir: str | Path | None = None) -> dict:
-    """One yes/no question per task on the whole image; regions from the rationale. Deterministic order."""
+    """One yes/no question per task on the whole image; regions from the rationale, or from every cell
+    crop asked every task (the whole-image answers are then kept under "whole_image"). Deterministic order."""
     path = Path(image_path)
     calls: list[dict] = []
     tasks: dict[str, dict] = {}
@@ -558,20 +566,23 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
             answers.append({"answer": extract_answer(reply["text"]), "regions": extract_regions(reply["text"]),
                             "truncated": reply["truncated"]})
         tasks[task] = {"name": task_name(task), "answers": answers, **vote(answers, protocol.region_vote)}
+        tasks[task]["whole_image"] = tasks[task]["presence"]
 
-    positives = [t for t in tasks if tasks[t]["presence"] == "yes"]
-    if protocol.location == "crops" and positives:
-        # Comparison only: cropped panoramics are outside DentVLM's image distribution.
+    if protocol.location == "crops":
+        # Comparison only: cropped panoramics are outside DentVLM's image distribution. Every cell is
+        # asked every task, whatever the whole image answered, so a task missed on the whole image can
+        # be recovered in a cell: it is present when any cell says yes, absent when every cell says no.
         crops = make_crops(path, CELL_WINDOWS, crop_dir)
-        for task in positives:
-            tasks[task]["regions"] = []
+        cell_answers = {task: {} for task in tasks}
         for cell, png in crops.items():  # cell-major order keeps the image prefix cached
-            for task in positives:
+            for task in tasks:
                 question = questions_for(task)[0]
                 reply = runner.ask(png, question)
                 _record(calls, "crop", task, cell, question, reply)
-                if extract_answer(reply["text"]) == "yes":
-                    tasks[task]["regions"].append(cell)
+                cell_answers[task][cell] = extract_answer(reply["text"])
+        for task, answers in cell_answers.items():
+            presence = tasks[task]["presence"] = _any_yes(answers.values())
+            tasks[task]["regions"] = [c for c in CELLS if answers[c] == "yes"] if presence == "yes" else None
     elif protocol.location == "none":
         for task in tasks:
             tasks[task]["regions"] = None

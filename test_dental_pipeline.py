@@ -97,11 +97,11 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(dp.cell_windows(False)["upper-left"], dp.cell_windows(True)["upper-right"])
 
 
-def _blank_image(path: Path, size=(560, 280)) -> None:
+def _blank_image(path: Path, size=(560, 280), shade: int = 128) -> None:
     """A test radiograph whose regions differ, so crops are distinguishable bytes."""
     from PIL import Image, ImageDraw
 
-    image = Image.new("L", size, color=128)
+    image = Image.new("L", size, color=shade)
     draw = ImageDraw.Draw(image)
     for index, (left, top, right, bottom) in enumerate(dp.CELL_WINDOWS.values()):
         x, y = int(left * size[0]) + 5 + index * 3, int(top * size[1]) + 5
@@ -110,7 +110,7 @@ def _blank_image(path: Path, size=(560, 280)) -> None:
 
 
 class FakeRunner:
-    """Answers from a script keyed by (stage, task, cell); crops are recognised by bytes."""
+    """Answers from a script keyed by (stage, task, cell); the scripted image's crops are recognised by bytes."""
 
     def __init__(self, script: dict, cell_of: dict | None = None, scripted_image: str = "img1"):
         self.script, self.cell_of, self.log = script, cell_of or {}, []
@@ -125,13 +125,15 @@ class FakeRunner:
         if task is None:
             stage = "count"
             task = next(c for c, q in dp.COUNT_QUESTIONS.items() if q == question)
-        cell = self.cell_of.get(image) if isinstance(image, bytes) else None
-        if cell:
-            stage = "crop"
+        if isinstance(image, bytes):  # a crop; only the scripted image's crops are known
+            cell, stage = self.cell_of.get(image), "crop"
+            scripted = cell is not None
+        else:
+            cell, scripted = None, Path(image).stem == self.scripted_image
         key = (stage, task, cell)
         self.log.append(key)
         text = "0" if stage == "count" else "No\nNothing of the kind is seen."
-        if cell or Path(image).stem == self.scripted_image:
+        if scripted:
             text = self.script.get(key, text)
         return {"text": text, "finish_reason": "stop", "truncated": False,
                 "prompt_tokens": 100, "completion_tokens": 5, "latency_seconds": 0.0}
@@ -156,7 +158,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         (self.root / "images").mkdir()
         (self.root / "labels").mkdir()
         _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png")
+        _blank_image(self.root / "images" / "img2.png", shade=100)  # different bytes, so its crops are not img1's
         # img1: two fillings in the upper image-left cell, one impacted tooth in the lower image-right cell.
         (self.root / "labels" / "img1.txt").write_text(
             "2 0.20 0.25 0.05 0.05\n2 0.30 0.30 0.05 0.05\n6 0.80 0.80 0.10 0.10\n")
@@ -174,7 +176,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         results = dp.load_results(out)
         self.assertEqual(set(results), {"img1", "img2"})
         f = results["img1"]["findings"]
-        self.assertEqual(f["dental_filling"], {"asked": True, "tasks": ["fillings"], "presence": "yes",
+        self.assertEqual(f["dental_filling"], {"asked": True, "tasks": ["fillings"], "presence": "yes", "whole_image": "yes",
                                                "regions": ["upper-left"], "region_count": 1, "count": None})
         self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right", "lower-left"])
         self.assertEqual(f["prosthetic_restoration"]["tasks"], ["prosthetic_crown", "prosthetic_bridge"])
@@ -183,7 +185,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(f["carious_lesion"]["regions"], [])
         self.assertIsNone(f["dental_implant"]["presence"])
         self.assertEqual(f["surgical_device"]["asked"], False)
-        self.assertEqual(f["root_fragment"], {"asked": True, "tasks": ["residual_root"], "presence": "no",
+        self.assertEqual(f["root_fragment"], {"asked": True, "tasks": ["residual_root"], "presence": "no", "whole_image": "no",
                                              "regions": None, "region_count": None, "count": None})
         self.assertEqual(results["img1"]["tasks"]["residual_crown"]["presence"], "yes")
         self.assertEqual(results["img1"]["call_count"], 13)
@@ -207,7 +209,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertTrue(presence["dental_filling"]["trained_task"])
         self.assertEqual(presence["carious_lesion"]["FP"], 1)
         self.assertEqual((presence["dental_implant"]["unparseable"], presence["dental_implant"]["TN"]), (1, 1))
-        self.assertEqual(report["counts"], [])
+        self.assertEqual((report["counts"], report["whole_image"]), ([], []))  # presence is the whole-image answer here
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual(regions["dental_filling"]["exact_set_match_rate"], 1.0)
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
@@ -246,21 +248,38 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(counts["impacted_tooth"]["mae"], 1.0)
 
     def test_crop_location_mode(self):
+        """Every cell is asked every task, whatever the whole image answered; the whole image is kept separately."""
         cell_of = {png: cell for cell, png in dp.make_crops(self.images["img1"]).items()}
         self.assertEqual(len(cell_of), 6)
         script = dict(SCRIPT)
         script[("crop", "fillings", "upper-left")] = "Yes\nFillings are visible."
         script[("crop", "impacted_tooth", "lower-right")] = "Yes"
+        script[("crop", "root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, recovered in a cell
         runner = FakeRunner(script, cell_of)
         out = dp.run_dataset(runner, self.images, self.root / "run_crops", protocol=dp.Protocol(location="crops"))
         results = dp.load_results(out)
         f = results["img1"]["findings"]
-        self.assertEqual(f["dental_filling"]["regions"], ["upper-left"])
+        self.assertEqual((f["dental_filling"]["presence"], f["dental_filling"]["regions"]), ("yes", ["upper-left"]))
         self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right"])
-        self.assertEqual(f["prosthetic_restoration"]["regions"], [])
-        # 13 presence calls + 6 crops x 5 positive tasks (fillings, impacted, caries, bridge, residual crown).
-        self.assertEqual(results["img1"]["call_count"], 43)
+        self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["whole_image"],
+                          f["endodontic_treatment"]["regions"]), ("yes", "no", ["upper-right"]))
+        # Caries and the bridge were yes on the whole image only: no cell answers yes, so they are absent.
+        self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["whole_image"]), ("no", "yes"))
+        self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]), ("no", None))
+        self.assertEqual(results["img1"]["tasks"]["implant"]["presence"], "no")  # unparseable on the whole image only
+        # 13 whole-image calls + 6 cells x 13 tasks, for every image.
+        self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (91, 91))
         self.assertTrue((out / "crops" / "img1_upper-left.png").is_file())
+
+        gt = ev.load_yolo(self.root / "images", self.root / "labels")
+        report = ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
+        presence = {r["condition"]: r for r in report["presence"]}
+        whole = {r["condition"]: r for r in report["whole_image"]}
+        self.assertEqual((presence["carious_lesion"]["FP"], whole["carious_lesion"]["FP"]), (0, 1))
+        self.assertEqual((presence["endodontic_treatment"]["FP"], whole["endodontic_treatment"]["TN"]), (1, 2))
+        self.assertEqual((presence["dental_implant"]["unparseable"], whole["dental_implant"]["unparseable"]), (0, 1))
+        self.assertEqual(report["summary"]["whole_image"]["FP"], 2)  # caries and the bridge
+        self.assertTrue((out / "evaluation" / "whole_image.csv").is_file())
 
 
 class GeometryAndDentexTests(unittest.TestCase):

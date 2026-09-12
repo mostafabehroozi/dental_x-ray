@@ -70,9 +70,13 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
   its majority voting). 39 calls per image. In-distribution.
 * `count_question=True`: one count call per positive countable finding.
   Out-of-distribution.
-* `location="crops"`: the primary question on six cell crops per positive task,
-  scored on the same cells for comparison. Cropped panoramics are outside the
-  model's image distribution.
+* `location="crops"`: the primary question for every task on each of the six
+  cell crops, whatever the whole image answered (kept as `whole_image`). A task
+  is present when any cell answers Yes, so a finding missed with the model's
+  attention spread over the whole image can be recovered in a cell, and the
+  cells answering Yes are its regions. 13 + 6 x 13 = 91 calls per image.
+  Cropped panoramics are outside the model's image distribution, so this is a
+  comparison, not the default.
 * `location="none"`: presence only.
 
 ## Runtime settings that matter
@@ -181,7 +185,10 @@ each source placed.
 
 `<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
-`trained_task` flag), `regions.csv` (per-cell TP, FP, TN, FN, exact-set match,
+`trained_task` flag), `whole_image.csv` (the same table for the whole-image
+answers alone with `location="crops"`: read the two side by side to see what
+the cells recovered and what it cost in specificity), `regions.csv` (per-cell
+TP, FP, TN, FN, exact-set match,
 Jaccard, unlocalized rate), `counts.csv` (only when the count question was
 asked), `per_image.csv`, and `evaluation.json` with a summary: micro and macro
 F1, complete-case rate, mean false alarms per image, and the list of findings
