@@ -388,6 +388,12 @@ class RunAndEvaluateTests(unittest.TestCase):
         question = next(c["question"] for c in results["img1"]["calls"] if c["stage"] == "region_count")
         self.assertEqual(question.split("\n")[0], WHOLE_IMAGE_COUNTS["dental_filling"])
 
+    def test_unresolved_mode_is_rejected_before_anything_is_written(self):
+        out = self.root / "run_auto"
+        with self.assertRaises(ValueError):
+            dp.run_dataset(FakeRunner({}), self.images, out, mode="auto", protocol=dp.Protocol())
+        self.assertFalse((out / "manifest.json").exists())
+
     def test_results_saved_before_the_levels_still_evaluate(self):
         blank = {c: {"presence": "B", "count": None, "regions": None} for c in dp.CONDITIONS}
         img1 = {c: dict(v) for c, v in blank.items()}
