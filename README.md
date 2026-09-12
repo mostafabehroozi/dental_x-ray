@@ -18,7 +18,11 @@ per jaw and walks "the right upper quadrant ... the left lower quadrant" by
 name. So:
 
 * **Presence** uses the Figure 7 wording verbatim, one finding per call, on the
-  whole image. This is the screening pass in every configuration.
+  whole image and, with regions on, again for every finding in every region.
+  The whole-image answers are kept as a separate result and never decide which
+  regional questions are asked, so a finding the model misses with its
+  attention spread over the whole image can be recovered when the question is
+  narrowed to one region and one finding.
 * **Counts** use the Figure 9 wording for fillings and the same "How many teeth
   ..." shape for the other tooth-anchored findings. Findings whose boxes are
   regions or devices (bone loss, furcation, apical surgery, appliances, plates)
@@ -47,8 +51,8 @@ probe therefore decides once per run whether the suffix is needed ("plain" or
 
 | Knob | Values | Meaning |
 | --- | --- | --- |
-| `PRESENCE_LEVEL` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: whole image first, then the same question per region for every positive finding; the region set is the regions that answer A. Presence stays the whole-image answer. |
-| `COUNT_LEVEL` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region (the regions that answered A when `PRESENCE_LEVEL="region"`, else every region); the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
+| `PRESENCE_LEVEL` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: the same question for every finding in every region, region by region, independent of the whole-image answers (kept under `whole_image`). A finding is present when any region answers A and absent only when every region answers B; the region set is the regions that answer A. |
+| `COUNT_LEVEL` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `PRESENCE_LEVEL="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
 | `REGION_SCHEME` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
 | `REGION_PROMPT` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
 
@@ -60,18 +64,20 @@ that reading and the DENTEX side check (below) confirms it.
 
 ## Calls per image
 
-R = regions in the scheme (4 or 2), P = positive findings, Pc = positive
-countable findings, Rp = regions that answered A for a finding.
+R = regions in the scheme (4 or 2), Pc = positive countable findings, Rp =
+region-finding pairs that answered A for a countable finding.
 
-| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (P=5, Pc=4, quadrants) |
+| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (Pc=4, Rp=6, quadrants) |
 | --- | --- | --- |
 | overall / overall | 14 + Pc | 18 |
-| region / overall | 14 + R x P + Pc | 38 |
-| overall / region | 14 + R x Pc | 30 |
-| region / region | 14 + R x P + sum(Rp) | 34 to 50 |
+| region / overall | 14 + R x 14 + Pc | 74 |
+| overall / region | 14 + R x 9 | 50 |
+| region / region | 14 + R x 14 + Rp | 76 |
 
-An all-negative image always needs 14. With `REGION_PROMPT="words"` every call
-reuses the cached image prefix; with crops the prefix is rebuilt per region.
+The regional calls never depend on what the whole image answered, so an
+all-negative image needs 14, 70, 50 or 70 calls. With `REGION_PROMPT="words"`
+every call reuses the cached image prefix; with crops the loop is region-major,
+so each crop's prefix is built once.
 
 ## Files
 
@@ -193,16 +199,18 @@ UL, LL, LR order) that holds it.
 
 `<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
-`paper_covered` flag), `counts.csv` (exact, within-1, MAE on true positives, a
-strict MAE that scores misses as zero, and `count_unasked` for positives no
-region answered A for), `region_counts.csv` (the same per finding and region
+`paper_covered` flag), `whole_image.csv` (the same table for the whole-image
+answers alone when `PRESENCE_LEVEL="region"`: read the two side by side to see
+what the regional pass recovered and what it cost in specificity),
+`counts.csv` (exact, within-1, MAE on true positives, and a strict MAE that
+scores misses as zero), `region_counts.csv` (the same per finding and region
 when `COUNT_LEVEL="region"`; a region that answered B to presence counts as 0
 in the strict MAE), `regions.csv` (per-region TP, FP, TN, FN, exact-set match,
 Jaccard, unlocalized rate, `from_counts` for regions derived from counts, and
 `pred_all_regions_rate` next to `truth_all_regions_rate`), `per_image.csv`,
 and `evaluation.json` with a summary: the protocol, micro and macro F1,
-complete-case rate, mean false alarms per image, and, for the quadrant scheme,
-`side_agreement`.
+complete-case rate, mean false alarms per image, the whole-image micro numbers
+under `whole_image`, and, for the quadrant scheme, `side_agreement`.
 
 Two diagnostics decide whether word-based regions are being read:
 
@@ -231,8 +239,9 @@ Two diagnostics decide whether word-based regions are being read:
 * Ground-truth boxes are per instance while the model counts teeth, so counts
   for crowns/bridges and multi-box fillings carry definitional error; region
   counts inherit it.
-* Region questions are asked only for whole-image positives, so region recall
-  is capped by whole-image recall.
+* Every region is asked about every finding, so one region false alarm makes
+  the finding present: compare `whole_image.csv` with `presence.csv` before
+  reading the regional numbers as an improvement.
 * With `REGION_PROMPT="crop"` and `COUNT_LEVEL="region"`, the windows overlap
   by 10% of the width and 20% of the height, so teeth on the seams can be
   counted twice; use words for region counts.

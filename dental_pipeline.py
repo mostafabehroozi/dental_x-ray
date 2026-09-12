@@ -16,10 +16,13 @@ paper (arXiv 2512.11558) or in the panoramic benchmark it was scored on
   in its own reasoning, Figure 9). The region is either named in the question
   on the whole image ("words") or implied by sending a crop ("crop").
 
-Two levels are set independently (Protocol): where presence is resolved (whole
-image only, or whole image and then each region for the positives) and where
-counts are taken (one whole-image count, or one count per region). Nothing
-else (JSON contracts, fallback paraphrases, forced zeros) is used.
+Two levels are set independently (Protocol): where presence is resolved (the
+whole image only, or every region for every finding, with the whole-image
+answers kept as a separate result) and where counts are taken (one whole-image
+count, or one count per region). The whole-image answers never decide which
+regional questions are asked, so a finding missed with the model's attention
+spread over the whole image can be recovered in a region. Nothing else (JSON
+contracts, fallback paraphrases, forced zeros) is used.
 """
 from __future__ import annotations
 
@@ -494,12 +497,16 @@ class Protocol:
     """What the wrapper may vary. Defaults are the recommended run.
 
     presence_level  "overall": presence from the whole-image question only.
-                    "region":  whole image first, then the same question per region for every
-                               positive finding; the region set is the regions answering A.
+                    "region":  the same question for every finding in every region, region by
+                               region, independent of the whole-image answers (kept as a separate
+                               result). A finding is present when any region answers A and absent
+                               only when every region answers B; the region set is the regions
+                               answering A.
     count_level     "overall": one whole-image count per positive countable finding.
-                    "region":  one count per region; in the regions that answered A when
-                               presence_level is "region", else in every region. The finding's
-                               count is the sum. A region count of 0 is a valid answer.
+                    "region":  one count per region: right after a region answers A when
+                               presence_level is "region", else in every region for every
+                               countable finding. The finding's count is the sum. A region count
+                               of 0 is a valid answer.
     region_scheme   "quadrant" (UR, UL, LL, LR) or "arch" (upper, lower).
     region_prompt   "words": the region is named in the question and the whole image is sent.
                     "crop":  the whole-image question is sent with the region crop.
@@ -537,23 +544,26 @@ def _record(calls: list, stage: str, condition: str, region: str | None, questio
 
 def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol: Protocol = Protocol(),
                   crop_dir: str | Path | None = None) -> dict:
-    """Whole-image presence for all 14 findings, then regions and counts for the positives as the
-    protocol says. Deterministic order: with crops, region-major so the crop's image prefix stays
-    cached; with words every call shares the whole image."""
+    """Whole-image presence for all 14 findings (kept under "whole_image"), then, as the protocol
+    says, every region for every finding: presence, and a count as soon as a region answers A. The
+    whole-image answers never decide which regional questions are asked. Deterministic order:
+    region-major, so with crops the crop's image prefix stays cached; with words every call shares
+    the whole image."""
     path = Path(image_path)
     calls: list[dict] = []
-    findings = {c: {"presence": None, "count": None, "regions": None, "region_counts": None} for c in CONDITIONS}
+    findings = {c: {"presence": None, "whole_image": None, "count": None, "regions": None, "region_counts": None}
+                for c in CONDITIONS}
 
     for condition in CONDITIONS:
         question = presence_question(condition, mode)
         reply = runner.ask(path, question)
         _record(calls, "presence", condition, None, question, reply)
-        findings[condition]["presence"] = graded(reply, extract_choice)
-    positives = [c for c in CONDITIONS if findings[c]["presence"] == "A"]
+        findings[condition]["whole_image"] = findings[condition]["presence"] = graded(reply, extract_choice)
 
     scheme, regions = protocol.region_scheme, protocol.regions
     by_crop = protocol.region_prompt == "crop"
-    crops = make_crops(path, scheme, crop_dir) if (positives and regions and by_crop) else {}
+    crops = make_crops(path, scheme, crop_dir) if (regions and by_crop) else {}
+    region_counts = protocol.count_level == "region"
 
     def image_for(region: str):
         return crops[region] if by_crop else path
@@ -561,39 +571,48 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
     def named(region: str) -> str | None:
         return None if by_crop else region
 
-    if protocol.presence_level == "region" and positives:
-        for condition in positives:
+    if protocol.presence_level == "region":
+        for condition in CONDITIONS:
             findings[condition]["regions"] = {}
+            if region_counts and condition in COUNTABLE:
+                findings[condition]["region_counts"] = {}
         for region in regions:
-            for condition in positives:
+            for condition in CONDITIONS:
                 question = presence_question(condition, mode, named(region), scheme)
                 reply = runner.ask(image_for(region), question)
                 _record(calls, "region", condition, region, question, reply)
-                findings[condition]["regions"][region] = graded(reply, extract_choice)
-
-    countable = [c for c in positives if c in COUNTABLE]
-    if protocol.count_level == "overall":
-        for condition in countable:
-            question = count_question(condition, mode)
-            reply = runner.ask(path, question)
-            _record(calls, "count", condition, None, question, reply)
-            findings[condition]["count"] = graded(reply, extract_count)
-    else:
-        for condition in countable:
+                answer = graded(reply, extract_choice)
+                findings[condition]["regions"][region] = answer
+                if answer == "A" and region_counts and condition in COUNTABLE:
+                    question = count_question(condition, mode, named(region), scheme)
+                    reply = runner.ask(image_for(region), question)
+                    _record(calls, "region_count", condition, region, question, reply)
+                    findings[condition]["region_counts"][region] = graded(reply, extract_count)
+        for condition in CONDITIONS:
+            answers = findings[condition]["regions"].values()
+            # Present when any region answers A; absent only when every region answers B.
+            findings[condition]["presence"] = "A" if "A" in answers else "B" if all(a == "B" for a in answers) else None
+    elif region_counts:
+        # Whole-image presence with region counts: every countable finding is counted in every region.
+        for condition in COUNTABLE:
             findings[condition]["region_counts"] = {}
         for region in regions:
-            for condition in countable:
-                answered = findings[condition]["regions"]
-                if answered is not None and answered.get(region) != "A":
-                    continue  # the region did not answer A for this finding: nothing to count there
+            for condition in COUNTABLE:
                 question = count_question(condition, mode, named(region), scheme)
                 reply = runner.ask(image_for(region), question)
                 _record(calls, "region_count", condition, region, question, reply)
                 findings[condition]["region_counts"][region] = graded(reply, extract_count)
-        for condition in countable:
+
+    for condition in COUNTABLE:
+        if region_counts:
             counts = findings[condition]["region_counts"]
             complete = bool(counts) and all(n is not None for n in counts.values())
             findings[condition]["count"] = sum(counts.values()) if complete else None
+        elif findings[condition]["presence"] == "A":
+            question = count_question(condition, mode)
+            reply = runner.ask(path, question)
+            _record(calls, "count", condition, None, question, reply)
+            findings[condition]["count"] = graded(reply, extract_count)
 
     return {
         "image": str(path.resolve()),

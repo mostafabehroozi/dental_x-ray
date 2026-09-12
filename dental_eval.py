@@ -1,8 +1,10 @@
 """Deterministic evaluation of saved pipeline results against box-level ground truth.
 
 Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
-Metrics stay simple: image-level TP/FP/TN/FN per finding, count agreement on
-true positives (whole-image counts, and per region when counts were taken per
+Metrics stay simple: image-level TP/FP/TN/FN per finding (and the same table
+for the whole-image answers when presence was resolved per region, to show what
+the regional pass recovered and what it cost), count agreement on true
+positives (whole-image counts, and per region when counts were taken per
 region), region-level TP/FP/TN/FN for localized findings, and two per-image
 numbers a dentist cares about (complete-case rate, false alarms).
 
@@ -267,23 +269,41 @@ def _prf(tp, fp, tn, fn) -> dict:
     }
 
 
+def _tally(table: dict, truth: bool, answer: str | None) -> bool:
+    """Add one image to a TP/FP/TN/FN table; False (and counted) when the answer was unparseable."""
+    if answer is None:
+        table["unparseable"] += 1
+        return False
+    positive = answer == "A"
+    table["TP"] += truth and positive
+    table["FP"] += (not truth) and positive
+    table["TN"] += (not truth) and (not positive)
+    table["FN"] += truth and (not positive)
+    return True
+
+
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
              out_dir: str | Path | None = None) -> dict:
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, counts, region_counts, regions, per_image = [], [], [], [], []
+    presence, whole_image, counts, region_counts, regions, per_image = [], [], [], [], [], []
     protocol = result_protocol(results[ids[0]]) if ids else None
     level = result_scheme(results[ids[0]]) if ids else "none"
     region_names = tuple(CROPS[level]) if level != "none" else ()
     per_region_counts = bool(protocol) and protocol["count_level"] == "region" and level != "none"
+    # The whole-image answers are a separate result only when presence was resolved per region.
+    whole_image_kept = (bool(protocol) and protocol["presence_level"] == "region"
+                        and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]])
 
     for condition in CONDITIONS:
         annotated = [i for i in ids if condition in gt[i]["annotated"]]
         if not annotated:
             continue
-        tp = fp = tn = fn = unparseable = positives = 0
-        exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = unasked_count = 0
+        table = {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0}
+        whole = dict(table)
+        positives = 0
+        exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = 0
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = region_unparseable = 0
         from_counts = pred_all = truth_all = 0
         jaccard_sum = 0.0
@@ -294,23 +314,16 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             truth = len(boxes) > 0
             positives += truth
             finding = results[image_id]["findings"][condition]
-            pred = finding["presence"]
-            if pred is None:
-                unparseable += 1
+            if whole_image_kept:
+                _tally(whole, truth, finding["whole_image"])
+            if not _tally(table, truth, finding["presence"]):
                 continue
-            positive = pred == "A"
-            tp += truth and positive
-            fp += (not truth) and positive
-            tn += (not truth) and (not positive)
-            fn += truth and (not positive)
+            positive = finding["presence"] == "A"
 
             if condition in COUNTABLE and truth:
                 strict_pred = 0 if not positive else finding["count"]
                 if strict_pred is None:
-                    if finding.get("region_counts") == {}:
-                        unasked_count += 1  # positive, but no region answered A, so no region was counted
-                    else:
-                        unparsed_count += 1
+                    unparsed_count += 1
                 else:
                     strict_n += 1
                     strict_abs += abs(len(boxes) - strict_pred)
@@ -366,18 +379,18 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 union = truth_regions | pred_regions
                 jaccard_sum += len(truth_regions & pred_regions) / len(union) if union else 1.0
 
-        presence.append({
-            "dataset": dataset, "condition": condition, "paper_covered": condition in PAPER_COVERED,
-            "images": len(annotated), "positives": positives,
-            "TP": tp, "FP": fp, "TN": tn, "FN": fn, "unparseable": unparseable, **_prf(tp, fp, tn, fn),
-        })
+        row = {"dataset": dataset, "condition": condition, "paper_covered": condition in PAPER_COVERED,
+               "images": len(annotated), "positives": positives}
+        presence.append({**row, **table, **_prf(table["TP"], table["FP"], table["TN"], table["FN"])})
+        if whole_image_kept:
+            whole_image.append({**row, **whole, **_prf(whole["TP"], whole["FP"], whole["TN"], whole["FN"])})
         if condition in COUNTABLE:
             counts.append({
                 "dataset": dataset, "condition": condition, "n_scored": n_count,
                 "exact_rate": _ratio(exact, n_count), "within_1_rate": _ratio(within1, n_count),
                 "mae": _ratio(abs_err, n_count), "mean_signed_error": _ratio(signed_err, n_count),
                 "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n),
-                "count_unparseable": unparsed_count, "count_unasked": unasked_count,
+                "count_unparseable": unparsed_count,
             })
             if per_region_counts:
                 for name in region_names:
@@ -430,10 +443,13 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         "images_with_false_alarm_rate": _ratio(sum(r["false_alarms"] > 0 for r in per_image), len(per_image)),
         "mean_calls_per_image": _ratio(sum(r["calls"] or 0 for r in per_image), len(per_image)),
     }
+    if whole_image:
+        micro_whole = {k: sum(r[k] for r in whole_image) for k in ("TP", "FP", "TN", "FN")}
+        summary["whole_image"] = {**micro_whole, **_prf(*(micro_whole[k] for k in ("TP", "FP", "TN", "FN")))}
     if level == "quadrant":
         summary["side_agreement"] = side_agreement(gt, results)
-    report = {"summary": summary, "presence": presence, "counts": counts, "region_counts": region_counts,
-              "regions": regions, "per_image": per_image, "missing_results": missing}
+    report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
+              "region_counts": region_counts, "regions": regions, "per_image": per_image, "missing_results": missing}
     if out_dir:
         write_report(report, out_dir)
     return report
@@ -491,7 +507,7 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "counts", "region_counts", "regions", "per_image"):
+    for name in ("presence", "whole_image", "counts", "region_counts", "regions", "per_image"):
         rows = report.get(name) or []
         if not rows:
             continue

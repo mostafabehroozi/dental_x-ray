@@ -1,5 +1,5 @@
 """Offline tests: extraction rules, question wording, crops, the run loop with a fake model at both
-levels and in both region prompts, and evaluation."""
+levels and in both region prompts (every region asked about every finding), and evaluation."""
 from __future__ import annotations
 
 import json
@@ -145,11 +145,11 @@ class QuestionTests(unittest.TestCase):
                             dp.run_config("tagged", default, {"model": "x"})["hash"])
 
 
-def _blank_image(path: Path, size=(560, 280)) -> None:
+def _blank_image(path: Path, size=(560, 280), shade: int = 128) -> None:
     """A test radiograph whose four quadrants differ, so crops are distinguishable bytes."""
     from PIL import Image, ImageDraw
 
-    image = Image.new("L", size, color=128)
+    image = Image.new("L", size, color=shade)
     draw = ImageDraw.Draw(image)
     for index, (x, y) in enumerate([(0, 0), (size[0] // 2, 0), (size[0] // 2, size[1] // 2), (0, size[1] // 2)]):
         draw.rectangle((x + 10, y + 10, x + 40, y + 40), fill=30 + 50 * index)
@@ -161,8 +161,8 @@ class FakeRunner:
 
     stage is "presence" (whole image), "region" (region presence), "count" (whole-image count) or
     "region_count". Word-based region questions are recognised by their text, crops by their bytes
-    (region_of maps crop bytes to the region name). Unscripted answers are B and 0; images other
-    than scripted_image always answer B / 0 on the whole image.
+    (region_of maps the scripted image's crop bytes to the region name). Unscripted answers are B
+    and 0; images other than scripted_image always answer B / 0.
     """
 
     def __init__(self, script: dict, region_of: dict | None = None, scripted_image: str = "img1"):
@@ -185,12 +185,15 @@ class FakeRunner:
     def ask(self, image, question):
         stage, condition, region = self.lookup[question.replace(f"\n\n{dp.THINK_SUFFIX}", "")]
         if isinstance(image, bytes):  # a crop carries the whole-image question; the region is the picture
-            region = self.region_of[image]
+            region = self.region_of.get(image)
             stage = "region" if stage == "presence" else "region_count"
+            scripted = region is not None
+        else:
+            scripted = Path(image).stem == self.scripted_image
         key = (stage, condition, region)
         self.log.append(key)
         text = "0" if stage in ("count", "region_count") else "B"
-        if region or Path(image).stem == self.scripted_image:
+        if scripted:
             text = self.script.get(key, text)
         return {"text": text, "finish_reason": "stop", "truncated": False,
                 "prompt_tokens": 100, "completion_tokens": 5, "latency_seconds": 0.0}
@@ -207,7 +210,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         (self.root / "images").mkdir()
         (self.root / "labels").mkdir()
         _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png")
+        _blank_image(self.root / "images" / "img2.png", shade=100)  # different bytes, so its crops are not img1's
         # img1: two fillings in the patient's upper-right (image left), one root canal treatment in the
         # upper-left (image right), one impacted tooth lower-left.
         (self.root / "labels" / "img1.txt").write_text(
@@ -239,66 +242,87 @@ class RunAndEvaluateTests(unittest.TestCase):
             ("presence", "dental_filling", None): "<think>..</think><answer>A</answer>",
             ("region", "dental_filling", "UR"): "A",
             ("region_count", "dental_filling", "UR"): "<answer>The quadrant shows 2 teeth with fillings.</answer>",
-            ("presence", "endodontic_treatment", None): "A",  # true, but no region answers A
+            # Root canal treatment is missed on the whole image (default B) and recovered in UL.
+            ("region", "endodontic_treatment", "UL"): "A",
+            ("region_count", "endodontic_treatment", "UL"): "1",
             ("presence", "impacted_tooth", None): "A. True",
             ("region", "impacted_tooth", "LL"): "<answer>A</answer>",
             ("region", "impacted_tooth", "LR"): "A. True",  # false region
             ("region_count", "impacted_tooth", "LL"): "1",
             ("region_count", "impacted_tooth", "LR"): "0",
-            ("presence", "carious_lesion", None): "A",  # false alarm, no region answers A
-            ("presence", "surgical_device", None): "???",  # unparseable presence
+            ("presence", "carious_lesion", None): "A",  # whole-image false alarm; no region answers A
+            ("presence", "surgical_device", None): "???",  # unparseable on the whole image; every region answers B
+            ("region", "dental_implant", "UR"): "???",  # one unparseable region and no A: unparseable finding
         }
         runner, results = self._run(script, dp.Protocol())  # region / region / quadrant / words
         f = results["img1"]["findings"]
-        self.assertEqual(f["dental_filling"], {"presence": "A", "count": 2, "regions": {"UR": "A", "UL": "B", "LL": "B", "LR": "B"},
-                                               "region_counts": {"UR": 2}})
+        self.assertEqual(f["dental_filling"], {"presence": "A", "whole_image": "A", "count": 2,
+                                               "regions": {"UR": "A", "UL": "B", "LL": "B", "LR": "B"}, "region_counts": {"UR": 2}})
+        self.assertEqual(f["endodontic_treatment"], {"presence": "A", "whole_image": "B", "count": 1,
+                                                     "regions": {"UR": "B", "UL": "A", "LL": "B", "LR": "B"}, "region_counts": {"UL": 1}})
         self.assertEqual(f["impacted_tooth"]["region_counts"], {"LL": 1, "LR": 0})
         self.assertEqual(f["impacted_tooth"]["count"], 1)
-        self.assertEqual(f["endodontic_treatment"], {"presence": "A", "count": None, "region_counts": {},
-                                                     "regions": {"UR": "B", "UL": "B", "LL": "B", "LR": "B"}})
-        self.assertIsNone(f["surgical_device"]["presence"])
-        self.assertEqual(f["dental_implant"], {"presence": "B", "count": None, "regions": None, "region_counts": None})
-        # 14 presence + 4 positives x 4 regions + 3 region counts (UR filling, LL and LR impacted) = 33; img2: 14.
-        self.assertEqual(results["img1"]["call_count"], 33)
-        self.assertEqual(results["img2"]["call_count"], 14)
+        self.assertEqual(f["carious_lesion"], {"presence": "B", "whole_image": "A", "count": None,
+                                               "regions": {"UR": "B", "UL": "B", "LL": "B", "LR": "B"}, "region_counts": {}})
+        self.assertEqual((f["surgical_device"]["presence"], f["surgical_device"]["whole_image"]), ("B", None))
+        self.assertEqual((f["dental_implant"]["presence"], f["dental_implant"]["regions"]["UR"]), (None, None))
+        self.assertEqual(f["periodontal_bone_loss"], {"presence": "B", "whole_image": "B", "count": None,
+                                                      "regions": {"UR": "B", "UL": "B", "LL": "B", "LR": "B"}, "region_counts": None})
+        # 14 whole image + 14 findings x 4 regions + 4 region counts (UR filling, UL root canal, LL and LR
+        # impacted) = 74; img2: 70. Every region is asked about every finding, whatever the whole image said.
+        self.assertEqual(results["img1"]["call_count"], 74)
+        self.assertEqual(results["img2"]["call_count"], 70)
         self.assertEqual(results["img1"]["region_scheme"], "quadrant")
         # Every call sent the whole image: no crop was made.
         self.assertFalse((self.root / "run" / "crops").exists())
         self.assertIn("in the upper right quadrant of this image", next(
             c["question"] for c in results["img1"]["calls"] if c["stage"] == "region" and c["region"] == "UR"))
+        # The count follows its region's presence question at once (region-major order).
+        stages = [(c["stage"], c["region"]) for c in results["img1"]["calls"]]
+        self.assertEqual(stages.index(("region_count", "UR")), stages.index(("region", "UR")) + 3)
 
         gt = ev.load_yolo(self.root / "images", self.root / "labels")
         report = ev.evaluate(gt, results, dataset="toy", out_dir=self.root / "run" / "evaluation")
         presence = {r["condition"]: r for r in report["presence"]}
         self.assertEqual((presence["dental_filling"]["TP"], presence["dental_filling"]["TN"]), (1, 1))
-        self.assertEqual(presence["carious_lesion"]["FP"], 1)
-        self.assertEqual(presence["surgical_device"]["unparseable"], 1)
+        self.assertEqual((presence["endodontic_treatment"]["TP"], presence["endodontic_treatment"]["FN"]), (1, 0))
+        self.assertEqual((presence["carious_lesion"]["FP"], presence["carious_lesion"]["TN"]), (0, 2))
+        self.assertEqual((presence["surgical_device"]["unparseable"], presence["dental_implant"]["unparseable"]), (0, 1))
+        # The whole-image answers are scored on their own: the root canal miss and the caries false alarm show there.
+        whole = {r["condition"]: r for r in report["whole_image"]}
+        self.assertEqual((whole["endodontic_treatment"]["TP"], whole["endodontic_treatment"]["FN"]), (0, 1))
+        self.assertEqual((whole["carious_lesion"]["FP"], whole["surgical_device"]["unparseable"]), (1, 1))
+        self.assertEqual(list(whole["dental_filling"]), list(presence["dental_filling"]))
         counts = {r["condition"]: r for r in report["counts"]}
         self.assertEqual((counts["dental_filling"]["exact_rate"], counts["impacted_tooth"]["mae"]), (1.0, 0.0))
-        self.assertEqual((counts["endodontic_treatment"]["count_unasked"], counts["endodontic_treatment"]["count_unparseable"]), (1, 0))
+        self.assertEqual((counts["endodontic_treatment"]["exact_rate"], counts["endodontic_treatment"]["count_unparseable"]), (1.0, 0))
         region_counts = {(r["condition"], r["region"]): r for r in report["region_counts"]}
         self.assertEqual(region_counts[("dental_filling", "UR")]["exact_rate"], 1.0)
         self.assertEqual((region_counts[("dental_filling", "UL")]["n_scored"], region_counts[("dental_filling", "UL")]["strict_mae"]), (0, 0.0))
         self.assertEqual(region_counts[("impacted_tooth", "LR")]["exact_rate"], 1.0)  # 0 predicted, 0 true
-        self.assertEqual(region_counts[("endodontic_treatment", "UL")]["strict_mae"], 1.0)  # UL never counted, 1 true box
+        self.assertEqual(region_counts[("endodontic_treatment", "UL")]["exact_rate"], 1.0)
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual(regions["dental_filling"]["exact_set_match_rate"], 1.0)
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
-        self.assertEqual((regions["endodontic_treatment"]["FN"], regions["endodontic_treatment"]["unlocalized_rate"]), (1, 1.0))
+        self.assertEqual((regions["endodontic_treatment"]["TP"], regions["endodontic_treatment"]["unlocalized_rate"]), (1, 0.0))
         self.assertEqual(regions["dental_filling"]["from_counts"], 0)
         self.assertEqual(regions["dental_filling"]["pred_all_regions_rate"], 0.0)
         summary = report["summary"]
         self.assertEqual(summary["protocol"], {"presence_level": "region", "count_level": "region",
                                                "region_scheme": "quadrant", "region_prompt": "words"})
-        # UR (image left) holds the fillings, LL (image right) the impacted tooth, LR does not: 2 of 3 sides agree.
-        self.assertEqual(summary["side_agreement"], {"sides_named": 3, "agree": 2, "agreement_rate": 0.6667,
+        self.assertEqual((summary["sensitivity"], summary["whole_image"]["sensitivity"]), (1.0, 0.6667))
+        # UR (image left) holds the fillings, UL and LL (image right) the root canal and the impacted tooth,
+        # LR does not: 3 of 4 sides agree.
+        self.assertEqual(summary["side_agreement"], {"sides_named": 4, "agree": 3, "agreement_rate": 0.75,
                                                      "quadrant_words_are_patient_side": True})
         self.assertEqual(summary["complete_case_rate"], 1.0)
-        self.assertTrue((self.root / "run" / "evaluation" / "region_counts.csv").is_file())
+        for name in ("region_counts", "whole_image"):
+            self.assertTrue((self.root / "run" / "evaluation" / f"{name}.csv").is_file())
         text = dp.dentist_report(results["img1"])
         self.assertIn("Dental filling; count 2 (UR 2); location UR", text)
+        self.assertIn("Root canal treatment; count 1 (UL 1); location UL", text)
         self.assertIn("Impacted tooth; count 1 (LL 1, LR 0); location LL, LR", text)
-        self.assertIn("Root canal treatment; location not resolved", text)
+        self.assertIn("Dental caries", text.split("Not seen: ")[1])
 
         # Resume skips finished images and rejects a different protocol.
         before = len(runner.log)
@@ -309,11 +333,13 @@ class RunAndEvaluateTests(unittest.TestCase):
                            protocol=dp.Protocol(count_level="overall"))
 
     def test_overall_presence_with_region_counts(self):
+        """Whole-image presence; every countable finding is counted in every region, whatever the whole image said."""
         script = {
             ("presence", "dental_filling", None): "A",
             ("region_count", "dental_filling", "UR"): "2 teeth",
             ("presence", "impacted_tooth", None): "A",
             ("region_count", "impacted_tooth", "LL"): "one",
+            ("region_count", "endodontic_treatment", "UL"): "1",  # counted although missed on the whole image
             ("presence", "periodontal_bone_loss", None): "A",  # presence-only finding: no counts, no regions
         }
         _, results = self._run(script, dp.Protocol(presence_level="overall", count_level="region"))
@@ -321,11 +347,17 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertIsNone(f["dental_filling"]["regions"])
         self.assertEqual(f["dental_filling"]["region_counts"], {"UR": 2, "UL": 0, "LL": 0, "LR": 0})
         self.assertEqual((f["dental_filling"]["count"], f["impacted_tooth"]["count"]), (2, 1))
-        self.assertEqual(f["periodontal_bone_loss"], {"presence": "A", "count": None, "regions": None, "region_counts": None})
-        self.assertEqual(results["img1"]["call_count"], 14 + 2 * 4)
+        self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["region_counts"]["UL"]), ("B", 1))
+        self.assertEqual(f["periodontal_bone_loss"], {"presence": "A", "whole_image": "A", "count": None,
+                                                      "regions": None, "region_counts": None})
+        # 14 whole image + 9 countable findings x 4 regions.
+        self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (50, 50))
 
         gt = ev.load_yolo(self.root / "images", self.root / "labels")
         report = ev.evaluate(gt, results, dataset="toy")
+        self.assertEqual(report["whole_image"], [])  # presence is the whole-image answer: nothing separate to score
+        presence = {r["condition"]: r for r in report["presence"]}
+        self.assertEqual(presence["endodontic_treatment"]["FN"], 1)
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual((regions["dental_filling"]["from_counts"], regions["dental_filling"]["exact_set_match_rate"]), (1, 1.0))
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 0))
@@ -334,7 +366,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertIn("Dental filling; count 2 (UR 2, UL 0, LL 0, LR 0); location UR", dp.dentist_report(results["img1"]))
 
     def test_crop_prompt_with_whole_image_counts(self):
-        """The previous behaviour: presence on quadrant crops, one whole-image count per positive."""
+        """Presence on quadrant crops for every finding, one whole-image count per positive."""
         region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "quadrant").items()}
         script = {
             ("presence", "dental_filling", None): "<think>..</think><answer>A</answer>",
@@ -344,17 +376,19 @@ class RunAndEvaluateTests(unittest.TestCase):
             ("count", "impacted_tooth", None): "1",
             ("region", "impacted_tooth", "LL"): "<answer>A</answer>",
             ("region", "impacted_tooth", "LR"): "A. True",
-            ("presence", "carious_lesion", None): "A",
-            ("count", "carious_lesion", None): "unclear",
+            ("presence", "carious_lesion", None): "A",  # whole image only: no crop answers A, so it is not counted
+            ("region", "endodontic_treatment", "UL"): "A",  # recovered on the UL crop
+            ("count", "endodontic_treatment", None): "unclear",
         }
         protocol = dp.Protocol(presence_level="region", count_level="overall", region_prompt="crop")
         runner, results = self._run(script, protocol, region_of)
         f = results["img1"]["findings"]
-        self.assertEqual(f["dental_filling"], {"presence": "A", "count": 2, "regions": {"UR": "A", "UL": "B", "LL": "B", "LR": "B"},
-                                               "region_counts": None})
-        self.assertEqual(f["carious_lesion"]["count"], None)
-        # 14 presence + 4 crops x 3 positives + 3 counts = 29; img2: 14.
-        self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (29, 14))
+        self.assertEqual(f["dental_filling"], {"presence": "A", "whole_image": "A", "count": 2,
+                                               "regions": {"UR": "A", "UL": "B", "LL": "B", "LR": "B"}, "region_counts": None})
+        self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["count"]), ("B", None))
+        self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["count"]), ("A", None))
+        # 14 whole image + 4 crops x 14 findings + 3 counts (filling, impacted, root canal) = 73; img2: 70.
+        self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (73, 70))
         self.assertTrue((self.root / "run" / "crops" / "img1_LL.png").is_file())
         self.assertIn(("region", "impacted_tooth", "LL"), runner.log)
 
@@ -362,19 +396,23 @@ class RunAndEvaluateTests(unittest.TestCase):
         report = ev.evaluate(gt, results, dataset="toy")
         counts = {r["condition"]: r for r in report["counts"]}
         self.assertEqual((counts["dental_filling"]["exact_rate"], counts["impacted_tooth"]["mae"]), (1.0, 0.0))
+        self.assertEqual(counts["endodontic_treatment"]["count_unparseable"], 1)
         self.assertEqual(report["region_counts"], [])
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
-        self.assertEqual(report["summary"]["mean_false_alarms_per_image"], 0.5)
+        whole = {r["condition"]: r for r in report["whole_image"]}
+        self.assertEqual((whole["carious_lesion"]["FP"], whole["endodontic_treatment"]["FN"]), (1, 1))
+        self.assertEqual((report["summary"]["mean_false_alarms_per_image"], report["summary"]["whole_image"]["FP"]), (0.0, 1))
         self.assertIn("Dental filling; count 2; location UR", dp.dentist_report(results["img1"]))
 
     def test_arch_scheme_and_crop_region_counts(self):
-        script = {("presence", "dental_filling", None): "A", ("region", "dental_filling", "upper"): "A",
-                  ("region_count", "dental_filling", "upper"): "2"}
+        # The whole image answers B for fillings (the fake's default); the upper jaw recovers them.
+        script = {("region", "dental_filling", "upper"): "A", ("region_count", "dental_filling", "upper"): "2"}
         _, results = self._run(script, dp.Protocol(region_scheme="arch"))
         f = results["img1"]["findings"]["dental_filling"]
+        self.assertEqual((f["presence"], f["whole_image"]), ("A", "B"))
         self.assertEqual((f["regions"], f["region_counts"], f["count"]), ({"upper": "A", "lower": "B"}, {"upper": 2}, 2))
-        self.assertEqual(results["img1"]["call_count"], 14 + 2 + 1)
+        self.assertEqual(results["img1"]["call_count"], 14 + 2 * 14 + 1)
         report = ev.evaluate(ev.load_yolo(self.root / "images", self.root / "labels"), results, dataset="toy")
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual((regions["dental_filling"]["level"], regions["dental_filling"]["TP"]), ("arch", 1))
@@ -403,7 +441,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         report = ev.evaluate(ev.load_yolo(self.root / "images", self.root / "labels"), results, dataset="old")
         self.assertEqual(report["summary"]["protocol"]["region_prompt"], "crop")
         self.assertEqual({r["condition"]: r["TP"] for r in report["regions"]}["dental_filling"], 1)
-        self.assertEqual(report["region_counts"], [])
+        self.assertEqual((report["region_counts"], report["whole_image"]), ([], []))
 
 
 class GeometryAndDentexTests(unittest.TestCase):
