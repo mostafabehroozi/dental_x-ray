@@ -64,8 +64,16 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def _text_bbox(draw, text: str, font) -> tuple[int, int, int, int]:
+    try:
+        return draw.textbbox((0, 0), text, font=font)
+    except (AttributeError, ValueError):
+        width, height = draw.textsize(text, font=font)
+        return 0, 0, width, height
+
+
 def _label(draw, text: str, x: int, y: int, fill: str, font) -> None:
-    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    left, top, right, bottom = _text_bbox(draw, text, font)
     width, height = right - left, bottom - top
     draw.rectangle((x, y, x + width + 6, y + height + 4), fill=fill)
     draw.text((x + 3 - left, y + 2 - top), text, fill="black", font=font)
@@ -102,7 +110,7 @@ def draw_boxes(image_path: str | Path, boxes: list[dict], max_side: int = 2048, 
         draw.rectangle((x1, y1, x2, y2), outline=colour, width=stroke)
         if numbered:
             text = str(index + 1)
-            _, top, _, bottom = draw.textbbox((0, 0), text, font=font)
+            _, top, _, bottom = _text_bbox(draw, text, font)
             text_height = bottom - top + 4
             y = y1 - text_height - stroke if y1 - text_height - stroke >= 0 else y1 + stroke
             _label(draw, text, min(x1, width - 3 * text_height), y, colour, font)
@@ -110,7 +118,7 @@ def draw_boxes(image_path: str | Path, boxes: list[dict], max_side: int = 2048, 
 
     if corner_labels:
         margin = stroke * 2
-        _, top, right, bottom = draw.textbbox((0, 0), "Q4", font=font)
+        _, top, right, bottom = _text_bbox(draw, "Q4", font)
         text_width, text_height = right + 6, bottom - top + 4
         for text, x, y in (("Q1", margin, margin), ("Q2", width - text_width - margin, margin),
                            ("Q4", margin, height - text_height - margin),
@@ -191,6 +199,35 @@ def parse_units(text: str, n_boxes: int) -> dict[int, dict]:
     return parsed
 
 
+def parse_units_checked(text: str, n_boxes: int) -> tuple[dict[int, dict], str | None]:
+    payload = _extract_json(text)
+    parsed = parse_units(text, n_boxes)
+    if payload is None:
+        return parsed, "invalid_json"
+    entries = payload.get("boxes")
+    if not isinstance(entries, list):
+        return parsed, "boxes_must_be_a_list"
+    ids = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+    try:
+        normalized_ids = [int(value) for value in ids]
+    except (TypeError, ValueError):
+        return parsed, "invalid_box_id"
+    if len(normalized_ids) != len(set(normalized_ids)):
+        return parsed, "duplicate_box_ids"
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("units"), list) or not isinstance(entry.get("teeth"), list):
+            return parsed, "invalid_box_schema"
+        if any(not isinstance(unit, str) or unit not in UNITS for unit in entry["units"]):
+            return parsed, "unknown_unit"
+        if any(not isinstance(tooth, (int, float, str)) or not str(tooth).strip().isdigit() for tooth in entry["teeth"]):
+            return parsed, "invalid_tooth_number"
+    missing = [str(i) for i in range(1, n_boxes + 1) if i not in parsed]
+    extras = [str(i) for i in normalized_ids if not 1 <= i <= n_boxes]
+    if missing or extras or len(entries) != n_boxes:
+        return parsed, "box_id_mismatch"
+    return parsed, None
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9.]+", "-", text).strip("-").lower() or "model"
 
@@ -209,18 +246,24 @@ class LLMAdapter:
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = None, max_boxes_per_call: int = 12,
                  max_side: int = 2048, corner_labels: bool = True, timeout: float = 600.0,
-                 request_options: dict | None = None, client=None) -> None:
+                 request_options: dict | None = None, parse_retries: int = 1, api_call_retries: int = 2,
+                 failure_policy: str = "geometry", client=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        llm_api.validate_parse_retries(parse_retries)
+        llm_api.validate_api_retries(api_call_retries)
+        if failure_policy not in ("geometry", "exclude", "error"):
+            raise ValueError("failure_policy must be 'geometry', 'exclude', or 'error'")
         self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.base_url, self.model = base_url, model
         self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
         self.max_boxes_per_call, self.max_side, self.corner_labels = max_boxes_per_call, max_side, corner_labels
         self.request_options = dict(request_options or {})
+        self.parse_retries, self.api_call_retries, self.failure_policy = parse_retries, api_call_retries, failure_policy
         self.calls = 0
 
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "max_boxes_per_call", "max_side",
-               "corner_labels", "request_options")
+               "corner_labels", "request_options", "parse_retries", "api_call_retries", "failure_policy")
 
     @classmethod
     def from_api(cls, spec: dict, timeout: float = 600.0, client=None) -> "LLMAdapter":
@@ -239,9 +282,11 @@ class LLMAdapter:
                 "max_output_tokens": self.max_output_tokens, "temperature": self.temperature,
                 "max_boxes_per_call": self.max_boxes_per_call, "max_side": self.max_side,
                 "corner_labels": self.corner_labels, "request_options": self.request_options,
+                "parse_retries": self.parse_retries, "api_call_retries": self.api_call_retries,
+                "failure_policy": self.failure_policy,
                 "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT}
 
-    def _ask(self, jpeg: bytes, text: str) -> str:
+    def _ask(self, jpeg: bytes, text: str) -> dict:
         request = {
             "model": self.model,
             "messages": [
@@ -255,16 +300,19 @@ class LLMAdapter:
         }
         request.update(self.request_options)
         started = time.perf_counter()
-        response = self.client.chat.completions.create(**request)
+        normalized = llm_api.call_with_retries(
+            lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)),
+            self.api_call_retries, f"location model={self.model}")
         self.calls += 1
-        content = response.choices[0].message.content or ""
-        print(f"adapter call {self.calls} | {time.perf_counter() - started:.1f}s | finish={response.choices[0].finish_reason}")
-        return content if isinstance(content, str) else str(content)
+        reply = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
+        print(f"location call {self.calls} | {reply['latency_seconds']}s | finish={reply['finish_reason']}")
+        return reply
 
     def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
               drawn_dir: str | Path | None = None) -> list[dict]:
         """One record per box: regions (quadrants) from the units, or regions=None when the reply lacked the box."""
-        rows: list[dict] = [{"regions": None, "units": None, "teeth": [], "source": None, "raw": None} for _ in boxes]
+        rows: list[dict] = [{"regions": None, "units": None, "teeth": [], "source": None, "raw": None,
+                            "attempts": [], "fallback_reason": None} for _ in boxes]
         for start in range(0, len(boxes), self.max_boxes_per_call):
             chunk = boxes[start:start + self.max_boxes_per_call]
             jpeg, width, height, pixels = draw_boxes(image_path, chunk, self.max_side, True, self.corner_labels)
@@ -274,21 +322,37 @@ class LLMAdapter:
                 Path(drawn_dir, f"{image_id}{part}.jpg").write_bytes(jpeg)
             lines = [f"{i + 1}. {dp.LABELS[box['condition']]} - {pixel}" for i, (box, pixel) in enumerate(zip(chunk, pixels))]
             prompt = USER_PROMPT.format(width=width, height=height, box_lines="\n".join(lines))
-            parsed, text = {}, ""
-            for _attempt in range(2):  # a second try only when the reply is not complete JSON
-                text = self._ask(jpeg, prompt)
-                parsed = parse_units(text, len(chunk))
-                if len(parsed) == len(chunk):
+            parsed, reply, attempts = {}, {"text": ""}, []
+            for attempt in range(self.parse_retries + 1):
+                reply = self._ask(jpeg, prompt)
+                parsed, error = parse_units_checked(reply["text"], len(chunk))
+                attempts.append({**reply, "error": error})
+                if not error:
+                    if attempt:
+                        llm_api.monitor("LOCATION PARSE RECOVERED", f"image={image_id or Path(image_path).name}",
+                                        attempt=attempt + 1)
                     break
+                llm_api.monitor("LOCATION PARSE WARNING", f"image={image_id or Path(image_path).name}",
+                                attempt=f"{attempt + 1}/{self.parse_retries + 1}", reason=error)
+                llm_api.failure_details("SYSTEM:\n" + SYSTEM_PROMPT + "\n\nUSER:\n" + prompt, reply["text"])
+            if error and self.failure_policy == "error":
+                raise ValueError(f"location reply remained unparseable for {image_id or image_path}: {error}")
+            if error:
+                llm_api.monitor("LOCATION FALLBACK", f"image={image_id or Path(image_path).name}",
+                                policy=self.failure_policy, reason=error)
             for i in range(len(chunk)):
                 entry = parsed.get(i + 1)
                 row = rows[start + i]
-                row["raw"] = text
+                row["raw"], row["attempts"] = reply["text"], attempts
                 if entry and entry["units"]:
                     row.update(regions=dp.units_to_regions(entry["units"]), units=entry["units"], teeth=entry["teeth"],
                                source="llm")
                 elif entry:
                     row.update(units=[], teeth=entry["teeth"])  # answered but unplaceable -> geometry
+                if entry is None:
+                    row["fallback_reason"] = error or "missing_box"
+                    if self.failure_policy == "exclude":
+                        row.update(regions=[], source="excluded")
         return rows
 
 
@@ -337,10 +401,15 @@ class FdmAdapter:
 
     kind = "fdm"
 
-    def __init__(self, runner, mode: str = "plain") -> None:
+    def __init__(self, runner, mode: str = "plain", parse_retries: int = 0,
+                 failure_policy: str = "geometry") -> None:
         if mode not in dp.MODES:
             raise ValueError(f"mode must be one of {dp.MODES}")
+        llm_api.validate_parse_retries(parse_retries)
+        if failure_policy not in ("geometry", "exclude", "error"):
+            raise ValueError("failure_policy must be 'geometry', 'exclude', or 'error'")
         self.runner, self.mode = runner, mode
+        self.parse_retries, self.failure_policy = parse_retries, failure_policy
         self.calls = 0
 
     @property
@@ -348,7 +417,9 @@ class FdmAdapter:
         return "fdm-mcq"
 
     def settings(self) -> dict:
-        return {"kind": self.kind, "method": "mcq", "mode": self.mode, "runner": self.runner.settings(),
+        return {"kind": self.kind, "method": "mcq", "mode": self.mode,
+                "parse_retries": self.parse_retries, "failure_policy": self.failure_policy,
+                "runner": self.runner.settings(),
                 "questions": [dp.with_mode(JAW_QUESTION, self.mode), dp.with_mode(SIDE_QUESTION, self.mode)]}
 
     def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
@@ -359,16 +430,37 @@ class FdmAdapter:
             if drawn_dir and image_id:
                 Path(drawn_dir).mkdir(parents=True, exist_ok=True)
                 Path(drawn_dir, f"{image_id}_{index + 1}.jpg").write_bytes(jpeg)
-            answers, replies = [], []
+            answers, replies, attempts = [], [], []
             for question, options in ((JAW_QUESTION, JAW_OPTIONS), (SIDE_QUESTION, SIDE_OPTIONS)):
-                reply = self.runner.ask(jpeg, dp.with_mode(question, self.mode))
-                self.calls += 1
-                replies.append(reply["text"])
-                answers.append(dp.graded(reply, lambda t, o=options: extract_option(t, o)))
-            row = {"regions": None, "units": None, "teeth": [], "source": None, "raw": "\n---\n".join(replies)}
+                effective = dp.with_mode(question, self.mode)
+                answer = None
+                for attempt in range(self.parse_retries + 1):
+                    reply = self.runner.ask(jpeg, effective)
+                    self.calls += 1
+                    answer = dp.graded(reply, lambda t, o=options: extract_option(t, o))
+                    attempts.append({"question": effective, **reply, "error": None if answer else "missing_or_ambiguous_option"})
+                    replies.append(reply["text"])
+                    if answer:
+                        if attempt:
+                            llm_api.monitor("LOCATION PARSE RECOVERED", f"image={image_id} box={index + 1}", attempt=attempt + 1)
+                        break
+                    llm_api.monitor("LOCATION PARSE WARNING", f"image={image_id} box={index + 1}",
+                                    attempt=f"{attempt + 1}/{self.parse_retries + 1}", reason="missing_or_ambiguous_option")
+                    llm_api.failure_details(effective, reply["text"])
+                    effective = dp.with_mode(question, self.mode) + "\n\nReturn exactly one option letter."
+                answers.append(answer)
+            row = {"regions": None, "units": None, "teeth": [], "source": None,
+                   "raw": "\n---\n".join(replies), "attempts": attempts, "fallback_reason": None}
             if all(answers):
                 names = {_QUADRANT[(jaw, side)] for jaw in _JAWS[answers[0]] for side in _SIDES[answers[1]]}
                 row.update(regions=[q for q in QUADRANTS if q in names], source="fdm")
+            else:
+                row["fallback_reason"] = "parse_exhausted"
+                if self.failure_policy == "error":
+                    raise ValueError(f"location answer remained unparseable for {image_id} box {index + 1}")
+                if self.failure_policy == "exclude":
+                    row.update(regions=[], source="excluded")
+                llm_api.monitor("LOCATION FALLBACK", f"image={image_id} box={index + 1}", policy=self.failure_policy)
             rows.append(row)
         return rows
 
@@ -395,11 +487,14 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
     for index, (image_id, entry) in enumerate(todo, start=1):
         target = boxes_dir / f"{image_id}.json"
         if resume and target.is_file():
+            _load_adapted_file(target, image_id)
             continue
         boxes = entry["boxes"]
         if boxes:
             print(f"[{index}/{len(todo)}] {image_id}: {len(boxes)} boxes")
         rows = adapter.adapt(entry["path"], boxes, image_id, drawn_dir) if boxes else []
+        if len(rows) != len(boxes):
+            raise ValueError(f"adapter returned {len(rows)} rows for {len(boxes)} boxes in {image_id}")
         records = []
         for box, row in zip(boxes, rows):
             geometry = dp.quadrants_to_regions(ev.geometric_regions(box, "quadrant"))
@@ -415,11 +510,27 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
     return load_adapted(out)
 
 
+def _load_adapted_file(path: Path, expected_id: str | None = None) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        llm_api.monitor("ARTIFACT ERROR", str(path), reason=str(exc))
+        raise ValueError(f"invalid adapted-truth artifact {path}: {exc}") from exc
+    image_id = payload.get("image_id") if isinstance(payload, dict) else None
+    if not isinstance(image_id, str) or image_id != path.stem or (expected_id and image_id != expected_id):
+        raise llm_api.artifact_error(path, "adapted image_id does not match filename/expected id")
+    if not isinstance(payload.get("boxes"), list):
+        raise llm_api.artifact_error(path, "adapted boxes must be a list")
+    return payload
+
+
 def load_adapted(out_dir: str | Path) -> dict[str, dict]:
     adapted = {}
     for path in sorted(Path(out_dir, "boxes").glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        adapted[payload.get("image_id", path.stem)] = payload
+        payload = _load_adapted_file(path)
+        if payload["image_id"] in adapted:
+            raise llm_api.artifact_error(path, f"duplicate adapted image_id {payload['image_id']!r}")
+        adapted[payload["image_id"]] = payload
     return adapted
 
 

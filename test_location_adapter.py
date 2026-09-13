@@ -126,7 +126,7 @@ class AdapterTests(unittest.TestCase):
         adapter = la.LLMAdapter(base_url=None, api_key="x", model="fake/model-1", max_boxes_per_call=2, client=client)
         self.assertEqual(adapter.name, "llm-fake-model-1")
         rows = adapter.adapt(self.images["img1"], self.gt["img1"]["boxes"], "img1", self.root / "drawn")
-        self.assertEqual({k: v for k, v in rows[0].items() if k != "raw"},
+        self.assertEqual({k: v for k, v in rows[0].items() if k not in ("raw", "attempts", "fallback_reason")},
                          {"regions": ["UL"], "units": ["Q2-posterior"], "teeth": [26], "source": "llm"})
         self.assertIn('"Q2-posterior"', rows[0]["raw"])
         self.assertEqual(rows[1]["regions"], ["UR"])
@@ -149,6 +149,18 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual((request["max_completion_tokens"], request["temperature"], request["reasoning_effort"]), (4096, 0.0, "low"))
         with self.assertRaises(ValueError):
             la.LLMAdapter(None, "x", "m", token_param="max_new_tokens", client=client)
+
+    def test_location_parse_failure_policy_and_attempt_audit(self):
+        adapter = la.LLMAdapter(None, "x", "fake", parse_retries=0, failure_policy="exclude",
+                                client=FakeClient(["not json"]))
+        row = adapter.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["source"], row["regions"], row["fallback_reason"]),
+                         ("excluded", [], "invalid_json"))
+        self.assertEqual(len(row["attempts"]), 1)
+        with self.assertRaisesRegex(ValueError, "remained unparseable"):
+            la.LLMAdapter(None, "x", "fake", parse_retries=0, failure_policy="error",
+                          client=FakeClient(["not json"])).adapt(
+                              self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")
 
     def test_adapt_dataset_then_evaluate(self):
         client = FakeClient([_reply([(1, ["Q2-posterior"], [26]), (2, ["Q2-posterior"], [27]), (3, ["Q4-posterior"], [46])])])
@@ -196,6 +208,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(ev.box_regions(truth["img1"]["boxes"][2], "arch"), {"lower"})
         with self.assertRaises(ValueError):
             ev.apply_adapted(self.gt, {"img1": {"boxes": records[:1]}})
+        misaligned = json.loads(json.dumps(adapted))
+        misaligned["img1"]["boxes"][0]["condition"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "order/content"):
+            ev.apply_adapted(self.gt, misaligned)
 
     def test_truth_agreement_on_fdi_boxes(self):
         gt = {"a": {"path": str(self.images["img1"]), "annotated": set(dp.CONDITIONS), "boxes": [

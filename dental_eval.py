@@ -8,9 +8,9 @@ positives (whole-image counts, and per region when counts were taken per
 region), region-level TP/FP/TN/FN for localized findings, and two per-image
 numbers a dentist cares about (complete-case rate, false alarms).
 
-Unparseable answers are excluded from the per-finding confusion tables and
-reported as counts. The per-image complete-case rate and recall are strict: a
-true finding whose answer was unparseable counts as not caught.
+Unparseable answers are neutral: excluded from confusion tables and per-image
+recall, with coverage reported separately. Complete-case rate excludes images
+with unresolved findings rather than treating them as a success or failure.
 
 Location truth (which region windows a true box occupies) comes, in this order,
 from regions attached to the box by location_adapter (apply_adapted), from
@@ -178,6 +178,13 @@ def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, di
             raise ValueError(f"{image_id}: {len(boxes)} boxes but adapted truth for "
                              f"{len(records) if records else 0}; run the adapter on every image of this dataset")
         for box, record in zip(boxes, records):
+            expected = [box["xc"], box["yc"], box["w"], box["h"]]
+            if record.get("condition") != box["condition"] or record.get("box") != expected:
+                raise ValueError(f"{image_id}: adapted box order/content does not match ground truth")
+            if record["source"] == "excluded":
+                box["regions"], box["location_excluded"] = [], True
+                box["region_source"] = "excluded"
+                continue
             if record["source"] == "llm" and record.get("units"):
                 box["regions"] = units_to_regions(record["units"])
             elif record["source"] == "fdm":
@@ -306,6 +313,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         positives = 0
         exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = 0
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = region_unparseable = 0
+        location_truth_excluded = 0
         from_counts = pred_all = truth_all = 0
         jaccard_sum = 0.0
         rc = {name: {"n": 0, "exact": 0, "within1": 0, "abs": 0, "signed": 0, "strict_n": 0, "strict_abs": 0,
@@ -355,6 +363,10 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                             cell["signed"] += pred_n - truth_n
 
             if evaluate_location and level != "none" and truth and positive:
+                location_boxes = [b for b in boxes if not b.get("location_excluded")]
+                if not location_boxes:
+                    location_truth_excluded += 1
+                    continue
                 pred_regions_map, source = predicted_regions(finding)
                 if not pred_regions_map:
                     continue
@@ -363,9 +375,9 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                     continue
                 n_loc += 1
                 from_counts += source == "count"
-                truth_regions = gt_regions(boxes, level)
+                truth_regions = gt_regions(location_boxes, level)
                 pred_regions = {r for r, hit in pred_regions_map.items() if hit}
-                straddle += sum(straddling(b, level) for b in boxes)
+                straddle += sum(straddling(b, level) for b in location_boxes)
                 if not pred_regions:
                     unlocalized += 1
                 for name in region_names:
@@ -392,6 +404,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 "mae": _ratio(abs_err, n_count), "mean_signed_error": _ratio(signed_err, n_count),
                 "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n),
                 "count_unparseable": unparsed_count,
+                "expected_count_checks": strict_n + unparsed_count,
+                "excluded_count_checks": unparsed_count,
             })
             if per_region_counts:
                 for name in region_names:
@@ -414,6 +428,10 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 # A model that ignores the region clause answers A everywhere: compare the two rates.
                 "pred_all_regions_rate": _ratio(pred_all, n_loc), "truth_all_regions_rate": _ratio(truth_all, n_loc),
                 "straddling_boxes": straddle, "region_unparseable": region_unparseable,
+                "expected_location_checks": n_loc + region_unparseable + location_truth_excluded,
+                "scored_location_checks": n_loc,
+                "excluded_location_checks": region_unparseable + location_truth_excluded,
+                "location_truth_excluded": location_truth_excluded,
             })
 
     for image_id in ids:
@@ -421,15 +439,20 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         truths = {c for c in annotated if any(b["condition"] == c for b in gt[image_id]["boxes"])}
         preds = {c for c in annotated if results[image_id]["findings"][c]["presence"] == "A"}
         unparsed = sum(results[image_id]["findings"][c]["presence"] is None for c in annotated)
+        scored = {c for c in annotated if results[image_id]["findings"][c]["presence"] is not None}
         caught = truths & preds
         per_image.append({
             "dataset": dataset, "image_id": image_id, "gt_present": len(truths), "caught": len(caught),
-            "complete_case": truths <= preds, "false_alarms": len(preds - truths), "unparseable": unparsed,
+            "gt_present_scored": len(truths & scored), "scored_findings": len(scored),
+            "complete_case": (truths <= preds) if scored and not unparsed else None,
+            "false_alarms": len(preds - truths), "unparseable": unparsed,
             "calls": results[image_id].get("call_count"),
         })
 
     micro = {k: sum(r[k] for r in presence) for k in ("TP", "FP", "TN", "FN")}
     f1s = [r["f1"] for r in presence if r["f1"] is not None]
+    complete_images = [r for r in per_image if r["complete_case"] is not None]
+    scored_images = [r for r in per_image if r["scored_findings"]]
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "protocol": protocol, "location_level": level,
@@ -438,11 +461,19 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
-        "complete_case_rate": _ratio(sum(r["complete_case"] for r in per_image), len(per_image)),
-        "mean_recall_per_image": _ratio(sum(_ratio(r["caught"], r["gt_present"]) or 0 for r in per_image if r["gt_present"]),
-                                        sum(1 for r in per_image if r["gt_present"])),
-        "mean_false_alarms_per_image": _ratio(sum(r["false_alarms"] for r in per_image), len(per_image)),
-        "images_with_false_alarm_rate": _ratio(sum(r["false_alarms"] > 0 for r in per_image), len(per_image)),
+        "unparseable_policy": "exclude",
+        "expected_finding_checks": sum(r["images"] for r in presence),
+        "scored_finding_checks": sum(micro.values()),
+        "excluded_unparseable_checks": sum(r["unparseable"] for r in presence),
+        "finding_check_invariant_ok": (sum(r["images"] for r in presence)
+                                       == sum(micro.values()) + sum(r["unparseable"] for r in presence)),
+        "complete_case_images_scored": len(complete_images),
+        "complete_case_rate": _ratio(sum(r["complete_case"] for r in complete_images), len(complete_images)),
+        "mean_recall_per_image": _ratio(sum(_ratio(r["caught"], r["gt_present_scored"]) or 0
+                                          for r in per_image if r["gt_present_scored"]),
+                                        sum(1 for r in per_image if r["gt_present_scored"])),
+        "mean_false_alarms_per_image": _ratio(sum(r["false_alarms"] for r in scored_images), len(scored_images)),
+        "images_with_false_alarm_rate": _ratio(sum(r["false_alarms"] > 0 for r in scored_images), len(scored_images)),
         "mean_calls_per_image": _ratio(sum(r["calls"] or 0 for r in per_image), len(per_image)),
     }
     if whole_image:

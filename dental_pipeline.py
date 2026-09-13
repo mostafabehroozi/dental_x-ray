@@ -22,7 +22,7 @@ answers kept as a separate result) and where counts are taken (one whole-image
 count, or one count per region). The whole-image answers never decide which
 regional questions are asked, so a finding missed with the model's attention
 spread over the whole image can be recovered in a region. Nothing else (JSON
-contracts, fallback paraphrases, forced zeros) is used.
+contracts or forced zeros) is used. Optional parse retries append a format reminder.
 
 A hosted vision-language model (Protocol.question_form "combined") is asked presence
 and count in one question for the nine countable findings: the Figure 7 sentence and
@@ -546,10 +546,12 @@ class VisionRunner:
         cache_prompt: bool = True,
         request_options: dict | None = None,
         token_param: str = "max_tokens",
+        api_call_retries: int = 2,
         client=None,
     ) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        llm_api.validate_api_retries(api_call_retries)
         self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.model = model
         self.max_tokens = max_tokens
@@ -558,11 +560,12 @@ class VisionRunner:
         self.local = local
         self.cache_prompt = cache_prompt
         self.request_options = dict(request_options or {})
+        self.api_call_retries = api_call_retries
         self.calls = 0
 
     @classmethod
     def from_api(cls, spec: dict, max_tokens: int = 4096, temperature: float | None = 0.0,
-                 timeout: float = 600.0, client=None) -> "VisionRunner":
+                 timeout: float = 600.0, api_call_retries: int = 2, client=None) -> "VisionRunner":
         """Runner for a hosted model. spec = {"provider", "model", ...} as documented in llm_api.
 
         A "temperature" or "token_param" in the spec wins over the arguments, so the spec of a
@@ -572,13 +575,15 @@ class VisionRunner:
         return cls(base_url=base_url, api_key=api_key, model=spec["model"], max_tokens=max_tokens,
                    temperature=spec.get("temperature", temperature), timeout=timeout, local=False,
                    cache_prompt=False, request_options=spec.get("request_options"),
-                   token_param=spec.get("token_param", "max_tokens"), client=client)
+                   token_param=spec.get("token_param", "max_tokens"),
+                   api_call_retries=spec.get("api_call_retries", api_call_retries), client=client)
 
     def settings(self) -> dict:
         return {
             "model": self.model, "max_tokens": self.max_tokens, "token_param": self.token_param,
             "temperature": self.temperature, "local": self.local, "cache_prompt": self.cache_prompt,
             "request_options": self.request_options,
+            "api_call_retries": self.api_call_retries,
         }
 
     def ask(self, image: str | Path | bytes, question: str) -> dict:
@@ -598,18 +603,11 @@ class VisionRunner:
                                      "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
         started = time.perf_counter()
-        response = self.client.chat.completions.create(**request)
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
+        normalized = llm_api.call_with_retries(
+            lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)), self.api_call_retries,
+            f"analyzer model={self.model}")
         self.calls += 1
-        result = {
-            "text": (choice.message.content or "").strip(),
-            "finish_reason": choice.finish_reason,
-            "truncated": choice.finish_reason == "length",
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "latency_seconds": round(time.perf_counter() - started, 3),
-        }
+        result = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
         print(f"call {self.calls} | {result['latency_seconds']}s | prompt_tokens={result['prompt_tokens']} "
               f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
         return result
@@ -698,8 +696,10 @@ class Protocol:
     region_scheme: str = "quadrant"
     region_prompt: str = "words"
     question_form: str = "separate"
+    parse_retries: int = 0  # extra attempts per failed question; notebook defaults to 1
 
     def __post_init__(self) -> None:
+        llm_api.validate_parse_retries(self.parse_retries)
         for value, allowed, name in ((self.presence_level, PRESENCE_LEVELS, "presence_level"),
                                      (self.count_level, COUNT_LEVELS, "count_level"),
                                      (self.region_scheme, REGION_SCHEMES, "region_scheme"),
@@ -747,18 +747,66 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
     region_counts = protocol.count_level == "region"
     combined = protocol.question_form == "combined"
 
-    def ask(stage: str, condition: str, region: str | None, image, question: str) -> dict:
-        reply = runner.ask(image, question)
-        _record(calls, stage, condition, region, question, reply)
-        return reply
+    def ask(stage: str, condition: str, region: str | None, image, question: str):
+        counting = stage in {"count", "region_count"}
+        extract = extract_count if counting else extract_choice
+        hint = ("Return only the whole-number count in digits." if counting else
+                "Return only Answer: A. True or Answer: B. False, choosing one option.")
+        if mode == "tagged":
+            hint += " Put the final answer inside a closed <answer>...</answer> block."
+
+        def parse(reply):
+            value = graded(reply, extract)
+            return value, None if value is not None else "missing_count" if counting else "missing_decision"
+
+        value, _ = llm_api.ask_parsed(
+            runner, image, question, parse=parse, retries=protocol.parse_retries,
+            context=f"image={path.name} | condition={condition} | stage={stage} | region={region or 'whole'}",
+            record=lambda q, r: _record(calls, stage, condition, region, q, r),
+            fallback=lambda _: question + "\n\n" + hint)
+        return value
 
     def ask_pair(stage: str, condition: str, region: str | None, image, question: str) -> tuple[str | None, int | None]:
-        reply = runner.ask(image, question)
-        raw = graded(reply, extract_combined) or (None, None)
-        consistent = None if None in raw else (raw[0] == "A") == (raw[1] > 0)
-        _record(calls, stage, condition, region, question, reply,
-                parsed={"choice": raw[0], "count": raw[1], "consistent": consistent})
-        return consistent_pair(*raw)
+        locked_choice = None
+        count_only = False
+
+        def parse(reply):
+            nonlocal locked_choice
+            reply["parse_target"] = "count" if count_only else "combined"
+            raw = ((locked_choice, graded(reply, extract_count)) if count_only else
+                   graded(reply, extract_combined) or (None, None))
+            consistent = None if None in raw else (raw[0] == "A") == (raw[1] > 0)
+            reply["parsed"] = {"choice": raw[0], "count": raw[1], "consistent": consistent}
+            value = consistent_pair(*raw)
+            if value[0] is not None:
+                locked_choice = value[0]
+            error = ("missing_decision" if value[0] is None else
+                     "invalid_count_pair" if consistent is False else
+                     "missing_count" if value[1] is None else None)
+            return value, error
+
+        def fallback(value):
+            nonlocal count_only
+            count_only = value[0] is not None
+            if count_only:
+                template, _ = COUNT_TEMPLATES[condition]
+                # Preserve the combined prompt's patient-side scope, including crop mode.
+                scope_region = region if region is not None and not by_crop else None
+                text = template.format(scope=count_scope(condition, scope_region, scheme, patient_side=True))
+                definition, counting_rule = DEFINITIONS[condition]
+                text += f"\n\n{definition}\n{counting_rule}"
+                hint = "Return only the whole-number count in digits."
+                if mode == "tagged":
+                    hint += " Put it inside a closed <answer>...</answer> block."
+                return with_mode(text, mode) + "\n\n" + hint
+            return question + ("\n\nReturn exactly two lines: Answer: A. True or Answer: B. False "
+                               "(choose one), then Count: <integer>. No explanation.")
+
+        value, _ = llm_api.ask_parsed(
+            runner, image, question, parse=parse, retries=protocol.parse_retries,
+            context=f"image={path.name} | condition={condition} | stage={stage} | region={region or 'whole'}",
+            record=lambda q, r: _record(calls, stage, condition, region, q, r), fallback=fallback)
+        return value
 
     # Whole image. With overall counts the combined form takes the count in the same reply.
     whole_counts: dict[str, int | None] = {}
@@ -766,7 +814,7 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
         if combined and condition in COUNTABLE and not region_counts:
             answer, whole_counts[condition] = ask_pair("presence", condition, None, path, combined_question(condition, mode))
         else:
-            answer = graded(ask("presence", condition, None, path, presence_question(condition, mode)), extract_choice)
+            answer = ask("presence", condition, None, path, presence_question(condition, mode))
         findings[condition]["whole_image"] = findings[condition]["presence"] = answer
 
     crops = make_crops(path, scheme, crop_dir) if (regions and by_crop) else {}
@@ -790,12 +838,12 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
                     if answer == "A":
                         findings[condition]["region_counts"][region] = count
                 else:
-                    answer = graded(ask("region", condition, region, image_for(region),
-                                        presence_question(condition, mode, named(region), scheme)), extract_choice)
+                    answer = ask("region", condition, region, image_for(region),
+                                 presence_question(condition, mode, named(region), scheme))
                     if answer == "A" and region_counts and condition in COUNTABLE:
-                        reply = ask("region_count", condition, region, image_for(region),
-                                    count_question(condition, mode, named(region), scheme))
-                        findings[condition]["region_counts"][region] = graded(reply, extract_count)
+                        findings[condition]["region_counts"][region] = ask(
+                            "region_count", condition, region, image_for(region),
+                            count_question(condition, mode, named(region), scheme))
                 findings[condition]["regions"][region] = answer
         for condition in CONDITIONS:
             answers = findings[condition]["regions"].values()
@@ -812,9 +860,8 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
                     _, count = ask_pair("region_count", condition, region, image_for(region),
                                         combined_question(condition, mode, named(region), scheme, crop=by_crop))
                 else:
-                    reply = ask("region_count", condition, region, image_for(region),
+                    count = ask("region_count", condition, region, image_for(region),
                                 count_question(condition, mode, named(region), scheme))
-                    count = graded(reply, extract_count)
                 findings[condition]["region_counts"][region] = count
 
     for condition in COUNTABLE:
@@ -828,8 +875,7 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
                 finding["count"] = whole_counts[condition]  # from the same reply; None when it contradicted the A
             else:
                 # The separate form, or a finding the whole image did not answer A (found by the regions).
-                reply = ask("count", condition, None, path, count_question(condition, mode))
-                finding["count"] = graded(reply, extract_count)
+                finding["count"] = ask("count", condition, None, path, count_question(condition, mode))
 
     return {
         "image": str(path.resolve()),
@@ -840,6 +886,7 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
         "findings": findings,
         "calls": calls,
         "call_count": len(calls),
+        "parse_recovery": llm_api.parse_recovery_summary(calls),
     }
 
 
@@ -864,6 +911,7 @@ def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance:
         "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
         "crops": CROPS[protocol.region_scheme] if protocol.uses_regions and protocol.region_prompt == "crop" else None,
         "runner": runner_settings, "provenance": provenance or {},
+        "parse_recovery_version": 1,
     }
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
@@ -888,6 +936,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
     for index, (image_id, path) in enumerate(todo, start=1):
         target = results_dir / f"{image_id}.json"
         if resume and target.is_file():
+            _load_result_file(target, image_id)
             continue
         print(f"[{index}/{len(todo)}] {image_id}")
         result = analyze_image(runner, path, mode=mode, protocol=protocol, crop_dir=out / "crops")
@@ -898,11 +947,31 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
     return out
 
 
+def _load_result_file(path: Path, expected_id: str | None = None) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        llm_api.monitor("ARTIFACT ERROR", str(path), reason=str(exc))
+        raise ValueError(f"invalid result artifact {path}: {exc}") from exc
+    image_id = payload.get("image_id") if isinstance(payload, dict) else None
+    if not isinstance(image_id, str) or not image_id:
+        raise llm_api.artifact_error(path, "missing non-empty image_id")
+    if image_id != path.stem or (expected_id is not None and image_id != expected_id):
+        raise llm_api.artifact_error(path, f"image_id {image_id!r} does not match filename/expected id")
+    findings = payload.get("findings")
+    if not isinstance(findings, dict) or any(c not in findings for c in CONDITIONS):
+        raise llm_api.artifact_error(path, "incomplete findings schema")
+    return payload
+
+
 def load_results(out_dir: str | Path) -> dict[str, dict]:
     results = {}
     for path in sorted(Path(out_dir, "results").glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        results[payload.get("image_id", path.stem)] = payload
+        payload = _load_result_file(path)
+        image_id = payload["image_id"]
+        if image_id in results:
+            raise llm_api.artifact_error(path, f"duplicate result image_id {image_id!r}")
+        results[image_id] = payload
     return results
 
 

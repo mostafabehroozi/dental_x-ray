@@ -14,6 +14,7 @@ manifest: record public(spec), not the spec.
 from __future__ import annotations
 
 import os
+import time
 
 PROVIDERS: dict[str, dict] = {}
 TOKEN_PARAMS = ("max_tokens", "max_completion_tokens")
@@ -70,8 +71,8 @@ def resolve(spec: dict) -> tuple[str, str]:
     return base_url, api_key
 
 
-def connect(base_url: str | None, api_key: str, timeout: float = 600.0, max_retries: int = 2):
-    """OpenAI client for one endpoint. The SDK retries connection errors, 408/409/429 and 5xx with backoff."""
+def connect(base_url: str | None, api_key: str, timeout: float = 600.0, max_retries: int = 0):
+    """OpenAI client for one endpoint. Retries are controlled visibly by call_with_retries()."""
     from openai import OpenAI
 
     kwargs = {"api_key": api_key, "timeout": timeout, "max_retries": max_retries}
@@ -99,3 +100,130 @@ def generation_fields(token_param: str, max_tokens: int, temperature: float | No
     if temperature is not None:
         fields["temperature"] = temperature
     return fields
+
+
+def validate_parse_retries(retries: int) -> None:
+    if type(retries) is not int or retries < 0:
+        raise ValueError("parse_retries must be a non-negative integer")
+
+
+def validate_api_retries(retries: int) -> None:
+    if type(retries) is not int or retries < 0:
+        raise ValueError("api_call_retries must be a non-negative integer")
+
+
+def monitor(event: str, message: str = "", **fields) -> None:
+    """Compact, consistent console event; normal calls keep their existing one-line progress."""
+    parts = [f"[{event}]"]
+    if message:
+        parts.append(message)
+    parts.extend(f"{key}={value}" for key, value in fields.items() if value is not None)
+    print(" | ".join(parts), flush=True)
+
+
+def failure_details(prompt: str, response: str, problems=None) -> None:
+    """Print full failure evidence only when recovery is needed."""
+    if problems:
+        print("Problems: " + "; ".join(str(p) for p in problems), flush=True)
+    print("PROMPT (full):\n" + prompt, flush=True)
+    print("RESPONSE (full):\n" + response, flush=True)
+
+
+def artifact_error(path, reason: str) -> ValueError:
+    monitor("ARTIFACT ERROR", str(path), reason=reason)
+    return ValueError(f"invalid artifact {path}: {reason}")
+
+
+def call_with_retries(call, retries: int, context: str):
+    """Retry transient API/transport failures visibly; permanent request errors fail immediately."""
+    validate_api_retries(retries)
+    for attempt in range(retries + 1):
+        try:
+            return call()
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            permanent = status in {400, 401, 403, 404, 405, 422} or str(exc).startswith(
+                ("refusal:", "content_filter", "non_text_content:"))
+            if permanent or attempt == retries:
+                monitor("API FAILED", context, attempt=attempt + 1, reason=type(exc).__name__, status=status)
+                raise
+            delay = min(2 ** attempt, 8)
+            monitor("API RETRY", context, attempt=f"{attempt + 1}/{retries + 1}",
+                    reason=type(exc).__name__, status=status, wait=f"{delay}s")
+            time.sleep(delay)
+
+
+def chat_reply(response) -> dict:
+    """Validate an OpenAI-compatible response envelope and return normalized reply metadata."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise RuntimeError("invalid_response_shape: empty_choices")
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise RuntimeError("invalid_response_shape: missing_message")
+    refusal = getattr(message, "refusal", None)
+    finish = getattr(choice, "finish_reason", None)
+    if refusal:
+        raise RuntimeError(f"refusal: {refusal}")
+    if finish == "content_filter":
+        raise RuntimeError("content_filter")
+    content = getattr(message, "content", None)
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        raise RuntimeError(f"non_text_content: {type(content).__name__}")
+    usage = getattr(response, "usage", None)
+    return {"text": content.strip(), "finish_reason": finish, "truncated": finish == "length",
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None)}
+
+
+def ask_parsed(runner, image, question, *, parse, record, retries, context, fallback):
+    """Retry format failures only. Keep all attempts and return (value, final reply).
+
+    parse(reply) returns (value, error_or_None). A value may be partially usable.
+    fallback(value) supplies the exact next question; it never sees ground truth.
+    Transport errors propagate to the caller (the client owns transport retries).
+    """
+    validate_parse_retries(retries)
+    for attempt in range(retries + 1):
+        reply = dict(runner.ask(image, question))
+        value, error = parse(reply)
+        if error:
+            if not reply.get("text", "").strip():
+                error = "empty_response"
+            elif reply.get("truncated"):
+                error = "truncated_output"
+            elif "<think>" in reply.get("text", "").lower() and "</think>" not in reply["text"].lower():
+                error = "unclosed_think"
+        exhausted = bool(error) and attempt == retries
+        reply["parse_recovery"] = {
+            "attempt": attempt + 1, "max_attempts": retries + 1,
+            "error": error, "value": value,
+            "status": "exhausted" if exhausted else "retrying" if error else "parsed",
+            "recovered": not error and attempt > 0,
+        }
+        record(question, reply)
+        if not error:
+            if attempt:
+                print(f"PARSE RECOVERED | {context} | attempt={attempt + 1}", flush=True)
+            return value, reply
+        monitor("PARSE WARNING", context, attempt=f"{attempt + 1}/{retries + 1}",
+                reason=error, finish=reply.get("finish_reason"))
+        failure_details(question, reply.get("text", ""))
+        if exhausted:
+            monitor("PARSE EXHAUSTED", context, policy="neutral/excluded")
+            return value, reply
+        monitor("PARSE RETRY", context, action="format reminder")
+        question = fallback(value)
+
+
+def parse_recovery_summary(calls):
+    attempts = [c["parse_recovery"] for c in calls if "parse_recovery" in c]
+    return {
+        "first_pass_failures": sum(a["attempt"] == 1 and bool(a["error"]) for a in attempts),
+        "retry_calls": sum(a["attempt"] > 1 for a in attempts),
+        "recovered_checks": sum(a["recovered"] for a in attempts),
+        "unresolved_checks": sum(a["status"] == "exhausted" for a in attempts),
+    }

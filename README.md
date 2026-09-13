@@ -33,11 +33,22 @@ name. So:
   words on the whole image (the image stays in distribution, no seams for
   counts) or as a crop with the verbatim whole-image question (the question
   stays verbatim, the picture does not).
-* **No JSON, no paraphrase retries, no forced zeros.** One greedy call per
-  question. Unparseable answers are recorded as such and excluded from the
-  per-finding TP/FP/TN/FN tables, never converted into a negative there. The
-  per-image complete-case rate and recall are strict: a true finding whose
-  answer was unparseable counts as not caught.
+* **Bounded parse recovery.** The notebook sets `PARSE_RETRIES = 1`: one extra
+  attempt for an unparseable answer, on the same image/model with an output-format
+  reminder. `0` means warn only. Each failure prints the full prompt and response.
+  All attempts and the recovery summary are saved. A valid presence decision is
+  retained when only its count needs repair. Exhausted fields remain `None`, never
+  a forced zero or negative. TP/FP/TN/FN and per-image recall exclude unresolved
+  findings; complete-case rate excludes images with unresolved findings.
+  `expected_finding_checks = scored_finding_checks + excluded_unparseable_checks`.
+  This means confusion-table totals can still differ when final coverage differs.
+  The recovery policy is hashed into the manifest; use a new output directory
+  after changing it. Direct Python `Protocol()` keeps retries off unless specified.
+* **Visible failure control.** `API_CALL_RETRIES` retries transient API failures without hidden SDK
+  retries. `LOCATION_PARSE_RETRIES` controls location-format retries and
+  `LOCATION_FAILURE_POLICY` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
+  print the full prompt and response; saved JSON keeps every attempt. Invalid resumed artifacts stop
+  with `ARTIFACT ERROR`. Use a new `OUTPUT_DIR` after changing any hashed control.
 
 The only public weights are the GGUF conversion of `DentalGPT-7B-1026`. That
 checkpoint may predate the reinforcement-learning stage, and the exact sentence
@@ -276,8 +287,7 @@ shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
   onto the pipeline's names is deterministic (`dental_pipeline.unit_region`),
   and the same output serves the six-cell vocabulary of the DentVLM branch.
   One call per image (chunked above `max_boxes_per_call` boxes), strict JSON
-  back, one retry when the reply is incomplete, and a box the model cannot
-  place falls back to the windows. The model is the `ADAPTER` role in Cell 3
+  back, with bounded retries and the configured location failure policy. The model is the `ADAPTER` role in Cell 3
   (see "Hosted models"); for reasoning models set `token_param` to
   `max_completion_tokens` and leave `temperature` at `None`.
 * `"fdm"` (experimental): DentalGPT itself. It was trained with reinforcement
@@ -287,8 +297,7 @@ shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
   image (left / right / both). Sides are asked as image sides so the model never
   resolves the patient-side convention; the quadrant follows in Python. The
   probe's `<think>/<answer>` mode is reused. Drawn boxes are outside the
-  model's training images, and an unparseable answer leaves the box to the
-  windows.
+  model's training images; unparseable answers follow `LOCATION_FAILURE_POLICY`.
 * `"geometry"`: the fixed crop windows (a box counts in every window holding at
   least a quarter of its area; the windows overlap on the midline and the
   occlusal plane). No model calls.

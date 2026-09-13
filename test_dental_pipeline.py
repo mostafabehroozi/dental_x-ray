@@ -398,7 +398,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         summary = report["summary"]
         self.assertEqual(summary["protocol"], {"presence_level": "region", "count_level": "region",
                                                "region_scheme": "quadrant", "region_prompt": "words",
-                                               "question_form": "separate"})
+                                               "question_form": "separate", "parse_retries": 0})
         self.assertEqual((summary["sensitivity"], summary["whole_image"]["sensitivity"]), (1.0, 0.6667))
         # UR (image left) holds the fillings, UL and LL (image right) the root canal and the impacted tooth,
         # LR does not: 3 of 4 sides agree.
