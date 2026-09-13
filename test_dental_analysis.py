@@ -12,6 +12,7 @@ from unittest.mock import patch
 import dental_analysis as da
 import dental_eval as ev
 import dental_pipeline as dp
+import experiments as xp
 
 
 CONDITION = "dental_filling"
@@ -186,24 +187,26 @@ class AnalysisTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     da.compare_runs(gt, {"a": a, "b": b})
 
-    def test_notebook_cell_runs_offline_and_exports_comparisons(self):
+    def test_notebook_cell_ranks_experiments_offline(self):
         gt, results = fixture()
         nb = json.loads(Path(__file__).with_name("main_notebook.ipynb").read_text(encoding="utf-8"))
-        source = next("".join(c["source"]) for c in nb["cells"] if "# CELL 13 -" in "".join(c["source"]))
+        source = next("".join(c["source"]) for c in nb["cells"] if "# CELL 10 -" in "".join(c["source"]))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             save_run(root / "a" / "toy", results)
             save_run(root / "b" / "toy", results)
-            # Keep the actual notebook logic, replacing just its optional user setting.
-            start = source.index("COMPARE_RUN_DIRS = {")
-            end = source.index("\n}", start) + 2
-            source = source[:start] + "COMPARE_RUN_DIRS = " + repr({"a": str(root / "a"), "b": str(root / "b")}) + source[end:]
-            scope = {"DATASETS": [{"name": "toy"}], "GT": {"toy": gt}, "OUTPUT_DIR": root / "a",
-                     "ADAPTED": {}, "EVALUATE_LOCATION": False, "dp": dp, "ev": ev, "Path": Path}
+            configs = xp.build([{"name": "a", "evaluate_location": False},
+                                {"name": "b", "evaluate_location": False}], {"output_root": tmp})
+            scope = {"EXPERIMENTS": configs, "DATASETS": [{"name": "toy"}], "GT": {"toy": gt}, "ADAPTED": {},
+                     "OUTPUT_ROOT": tmp, "xp": xp, "dp": dp, "ev": ev, "da": da, "Path": Path}
             with redirect_stdout(io.StringIO()), patch("IPython.display.display"):
                 exec(compile(source, "<evaluation cell>", "exec"), scope)
-            self.assertEqual(len(scope["REPORTS"]["toy"]["run_comparison"]), 2)
-            self.assertTrue((root / "a" / "toy" / "evaluation" / "run_changes.csv").is_file())
+            self.assertEqual(sorted(scope["REPORTS"]), [("a", "toy"), ("b", "toy")])
+            self.assertEqual(len(scope["LEADERBOARD"]), 2)
+            self.assertEqual(len(scope["COMPARISONS"]["toy"]["run_comparison"]), 2)
+            self.assertTrue((root / "leaderboard.csv").is_file())
+            self.assertTrue((root / "comparison" / "toy" / "run_changes.csv").is_file())
+            self.assertTrue((root / "a" / "toy" / "evaluation" / "presence.csv").is_file())
 
 
 if __name__ == "__main__":

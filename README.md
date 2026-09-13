@@ -5,6 +5,58 @@ DentalGPT (a 7B dental vision-language model) on panoramic radiographs, while
 sending it only question shapes it was trained and evaluated on. Everything else
 (task decomposition, location, aggregation, scoring) happens in Python.
 
+## Experiments
+
+The notebook runs a list of configurations, not one. Cell 3 holds one dictionary
+per experiment: a name, plus the knobs that experiment changes. Everything it
+does not mention comes from the `SHARED` dictionary above it, and then from
+`experiments.DEFAULTS`:
+
+```python
+EXPERIMENTS = xp.build([
+    {"name": "base"},
+    {"name": "separate-questions", "question_form": "separate"},
+    {"name": "whole-image-only", "presence_level": "overall", "count_level": "overall"},
+    {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
+    {"name": "dentalgpt-local", "backend": "local"},
+], shared=SHARED)
+```
+
+Anything in `experiments.DEFAULTS` may vary per experiment: the backend (local
+DentalGPT through llama.cpp or a hosted model), the analyzer, adapter and
+reporter models, the five protocol knobs, the retry budgets, the location truth,
+the report language, and the local checkpoint, context size and image-token cap.
+A dictionary knob (`analyzer`, `adapter`, `reporter`) merges key by key, so
+changing the model keeps the provider and its request options; every other knob
+is replaced. An unknown knob name is an error rather than a silent default, and
+so are a duplicate name, an invalid value, and `location_truth="fdm"` without
+the local backend.
+
+Every experiment writes into `<output_root>/<name>/<dataset>/`, with its
+resolved configuration saved as `<output_root>/<name>/experiment.json`, so two
+configurations never share a run directory and each of them resumes on its own.
+Cell 8 runs them one at a time (an experiment that fails is reported and the
+sweep continues with the next one, and local experiments restart the llama.cpp
+server only when their server settings differ). Cell 9 translates the
+ground-truth boxes once per adapter instead of once per experiment. Cell 10 then
+scores every experiment and ranks them:
+
+* `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
+  sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
+  rate, coverage, count MAE, exact region-set rate, calls per image. Each row is
+  scored against that experiment's own location truth.
+* `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
+  on the same images against the first one - `paired_f1_delta`, checks corrected
+  and worsened, newly unresolved, recorded calls and tokens.
+
+Cells 11 to 13 look at one experiment at a time: `INSPECT_EXPERIMENT` selects it
+for the per-finding tables, for one image's raw answers, and for the dentist
+report (one report call per image, so it defaults to the inspected experiment).
+
+Running several experiments multiplies model calls. `"limit"` in `DATASETS`
+keeps a first sweep cheap, and every cell resumes, so a sweep can be extended,
+or an experiment added, without recomputing what is already saved.
+
 ## Why it looks like this
 
 DentalGPT (arXiv 2512.11558) was fine-tuned from Qwen2.5-VL-7B and then trained
@@ -33,7 +85,7 @@ name. So:
   words on the whole image (the image stays in distribution, no seams for
   counts) or as a crop with the verbatim whole-image question (the question
   stays verbatim, the picture does not).
-* **Bounded parse recovery.** The notebook sets `PARSE_RETRIES = 1`: one extra
+* **Bounded parse recovery.** The notebook sets `parse_retries = 1`: one extra
   attempt for an unparseable answer, on the same image/model with an output-format
   reminder. `0` means warn only. Each failure prints the full prompt and response.
   All attempts and the recovery summary are saved. A valid presence decision is
@@ -42,31 +94,33 @@ name. So:
   findings; complete-case rate excludes images with unresolved findings.
   `expected_finding_checks = scored_finding_checks + excluded_unparseable_checks`.
   This means confusion-table totals can still differ when final coverage differs.
-  The recovery policy is hashed into the manifest; use a new output directory
-  after changing it. Direct Python `Protocol()` keeps retries off unless specified.
-* **Visible failure control.** `API_CALL_RETRIES` retries transient API failures without hidden SDK
-  retries. `LOCATION_PARSE_RETRIES` controls location-format retries and
-  `LOCATION_FAILURE_POLICY` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
+  The recovery policy is hashed into the manifest; give the changed setting a new
+  experiment name (its own directory) rather than reusing one. Direct Python `Protocol()` keeps retries off unless specified.
+* **Visible failure control.** `api_call_retries` retries transient API failures without hidden SDK
+  retries. `location_parse_retries` controls location-format retries and
+  `location_failure_policy` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
   print the full prompt and response; saved JSON keeps every attempt. Invalid resumed artifacts stop
-  with `ARTIFACT ERROR`. Use a new `OUTPUT_DIR` after changing any hashed control.
+  with `ARTIFACT ERROR`. A hashed control that changed under an existing experiment name
+  stops the run instead of mixing two configurations.
 
 The only public weights are the GGUF conversion of `DentalGPT-7B-1026`. That
 checkpoint may predate the reinforcement-learning stage, and the exact sentence
 the authors appended to request `<think>/<answer>` tags is unpublished. A short
-probe therefore decides once per run whether the suffix is needed ("plain" or
-"tagged"), and the run manifest records the choice.
+probe therefore decides once per local experiment whether the suffix is needed
+("plain" or "tagged"), and the run manifest records the choice, so a resumed
+experiment keeps it.
 
 ## Two levels
 
-`dental_pipeline.Protocol` (Cell 3) has five knobs:
+`dental_pipeline.Protocol`, built from the five question knobs of an experiment, has:
 
 | Knob | Values | Meaning |
 | --- | --- | --- |
-| `PRESENCE_LEVEL` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: the same question for every finding in every region, region by region, independent of the whole-image answers (kept under `whole_image`). A finding is present when any region answers A and absent only when every region answers B; the region set is the regions that answer A. |
-| `COUNT_LEVEL` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `PRESENCE_LEVEL="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
-| `REGION_SCHEME` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
-| `REGION_PROMPT` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
-| `QUESTION_FORM` | `separate`, `combined` | `separate`: the Figure 7 presence question, then the Figure 9-shaped count question for a positive countable finding (DentalGPT's shapes). `combined`: for hosted models, one presence-and-count question wherever the separate form would ask both in the same scope (see "Combined presence-and-count question"); the five presence-only findings keep the bare question. |
+| `presence_level` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: the same question for every finding in every region, region by region, independent of the whole-image answers (kept under `whole_image`). A finding is present when any region answers A and absent only when every region answers B; the region set is the regions that answer A. |
+| `count_level` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `presence_level="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
+| `region_scheme` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
+| `region_prompt` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
+| `question_form` | `separate`, `combined` | `separate`: the Figure 7 presence question, then the Figure 9-shaped count question for a positive countable finding (DentalGPT's shapes). `combined`: for hosted models, one presence-and-count question wherever the separate form would ask both in the same scope (see "Combined presence-and-count question"); the five presence-only findings keep the bare question. |
 
 The whole-image wording is byte-identical in every configuration; the region
 wording only fills a scope slot of the same sentence (`REGION_PHRASES`,
@@ -79,7 +133,7 @@ that reading and the DENTEX side check (below) confirms it.
 R = regions in the scheme (4 or 2), Pc = positive countable findings, Rp =
 region-finding pairs that answered A for a countable finding.
 
-| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (Pc=4, Rp=6, quadrants) |
+| `presence_level` / `count_level` | Calls | Example (Pc=4, Rp=6, quadrants) |
 | --- | --- | --- |
 | overall / overall | 14 + Pc | 18 |
 | region / overall | 14 + R x 14 + Pc | 74 |
@@ -87,15 +141,15 @@ region-finding pairs that answered A for a countable finding.
 | region / region | 14 + R x 14 + Rp | 76 |
 
 The regional calls never depend on what the whole image answered, so an
-all-negative image needs 14, 70, 50 or 70 calls. With `REGION_PROMPT="words"`
+all-negative image needs 14, 70, 50 or 70 calls. With `region_prompt="words"`
 every call reuses the cached image prefix; with crops the loop is region-major,
 so each crop's prefix is built once.
 
-With `QUESTION_FORM="combined"` the count calls disappear. Rf = findings a
+With `question_form="combined"` the count calls disappear. Rf = findings a
 region answered A for while the whole image did not (only `region / overall`
 asks a count for those):
 
-| `PRESENCE_LEVEL` / `COUNT_LEVEL` | Calls | Example (quadrants) |
+| `presence_level` / `count_level` | Calls | Example (quadrants) |
 | --- | --- | --- |
 | overall / overall | 14 | 14 |
 | region / overall | 14 + R x 14 + Rf | 70 + Rf |
@@ -106,7 +160,7 @@ asks a count for those):
 
 DentalGPT is asked one fact per call because that is the shape it was trained
 on. A capable hosted model does not need the split: with
-`QUESTION_FORM="combined"` (Cell 3's default for `BACKEND="api"`) each of the
+`question_form="combined"` (Cell 3's default for `backend="api"`) each of the
 nine countable findings is asked one presence-and-count question per scope, and
 the reply ends in two fixed lines:
 
@@ -133,15 +187,15 @@ The combined question replaces a presence question exactly where the separate
 form would have followed it with a count question in the same scope, so the
 results keep the same fields:
 
-* `COUNT_LEVEL="overall"`: the whole-image question of a countable finding is
+* `count_level="overall"`: the whole-image question of a countable finding is
   combined and yields `whole_image` and the count; the regional questions stay
   presence-only. A finding the whole image answered B but a region answered A
   is present by the regional rule and still gets the Figure 9 whole-image count
   question, the only extra call the form ever makes.
-* `COUNT_LEVEL="region"`: the whole-image questions stay presence-only and the
+* `count_level="region"`: the whole-image questions stay presence-only and the
   regional question of a countable finding is combined. A region's count is
-  stored when it answers A (`PRESENCE_LEVEL="region"`), or for every region,
-  0 with a B (`PRESENCE_LEVEL="overall"`), as the separate form stores them.
+  stored when it answers A (`presence_level="region"`), or for every region,
+  0 with a B (`presence_level="overall"`), as the separate form stores them.
 
 Grading never guesses: a reply without a readable letter yields nothing; a
 count that contradicts the letter is unparseable while the letter stands, and
@@ -165,9 +219,10 @@ directory.
 | `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
+| `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment, the probe decision |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
-| `main_notebook.ipynb` | Kaggle runner; configure generation in Cell 3, optional saved-run comparison in Cell 13 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
+| `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 10 |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Runtime settings that matter
 
@@ -184,34 +239,36 @@ directory.
   matching the authors' published inference snippet.
 * Use Q6_K or Q8_0 weights with the f16 projector for reported numbers.
 * Radiographs must be JPEG, PNG, or BMP (what llama.cpp can decode).
-* `BACKEND="api"` in Cell 3 sends the same prompts to a hosted vision model
-  instead, for a controlled comparison against DentalGPT (see "Hosted models").
+* `"backend": "api"` in an experiment sends the same prompts to a hosted vision
+  model instead, for a controlled comparison against DentalGPT (see "Hosted
+  models"); local and hosted experiments can sit in the same list.
 
 ## Hosted models
 
 Cell 3 has one `PROVIDERS` registry containing each provider's base URL and API
 key. The keys come from environment variables or Kaggle Secrets (Add-ons >
-Secrets), and unused providers may have no key. The small `ANALYZER`,
-`ADAPTER` and `REPORTER` role dictionaries then select any provider and exact model, e.g.
+Secrets), and unused providers may have no key. The small `analyzer`,
+`adapter` and `reporter` role dictionaries of an experiment then select any provider and exact model, e.g.
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
 routing under `request_options` stay with the role. `VisionRunner.from_api`,
 `LLMAdapter.from_api` and `ReportWriter.from_api` build the clients; run manifests
 record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
-bad request or key fails at once. With the API backend `MODE="auto"` resolves
+bad request or key fails at once. With the API backend `mode="auto"` resolves
 to `"plain"` without a probe: the `<think>/<answer>` suffix is a DentalGPT
-training artifact. Cell 3 also switches `QUESTION_FORM` to `"combined"` for
-this backend, so the nine countable findings are asked presence and count in
-one question (see "Combined presence-and-count question").
+training artifact. `question_form="auto"` (the default) resolves to `"combined"`
+on this backend, so the nine countable findings are asked presence and count in
+one question (see "Combined presence-and-count question"), and to `"separate"`
+on the local one; set it explicitly for a prompt-for-prompt comparison.
 
 ## Dentist report
 
 The analyzer's answers are dozens of narrow facts per image; a dentist reads
-one report. Cell 15 sends the findings of each image to a text LLM (the
-`REPORTER` role in Cell 3, a spec dict like `ANALYZER` and `ADAPTER`; it never
-sees the image) and saves a classified report in the dentist's language
-(`REPORT_LANGUAGE`). `report_writer.py` does it in three fixed steps:
+one report. Cell 13 sends the findings of each image to a text LLM (the
+`reporter` role of the experiment, a spec dict like `analyzer` and `adapter`; it
+never sees the image) and saves a classified report in the dentist's language
+(`report_language`). `report_writer.py` does it in three fixed steps:
 
 1. **Structured input.** `structured_findings` condenses a result JSON into one
    dense object: all 14 findings in seven sections (restorations and
@@ -248,7 +305,7 @@ every attempt with its problems, the verified report, the Markdown) and one
 `.md` per image under `<dataset>/reports/<model>-<language>/reports/`, with a
 manifest that hashes the writer settings, the prompts and the language.
 `summarize_reports` counts how many reports verified at once, after a repair,
-or fell back. Reports are for reading and are not scored: Cell 13 stays the
+or fell back. Reports are for reading and are not scored: Cell 10 stays the
 measure of the analyzer. The language is not verified; read one report before
 trusting a batch.
 
@@ -276,7 +333,7 @@ Ground truth is numeric (boxes); the pipeline localizes a finding as the set of
 regions that answer True (or count above zero). Scoring location means deciding
 which region windows each true box occupies, and fixed image fractions do that
 badly: the midline and the occlusal plane move with patient positioning and the
-shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
+shape of the arch. `location_truth` in Cell 3 picks how it is done:
 
 * `"llm"` (recommended): `location_adapter.LLMAdapter` draws numbered boxes on
   the radiograph, burns the FDI quadrant names into the corners, and asks a
@@ -288,7 +345,7 @@ shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
   onto the pipeline's names is deterministic (`dental_pipeline.unit_region`),
   and the same output serves the six-cell vocabulary of the DentVLM branch.
   One call per image (chunked above `max_boxes_per_call` boxes), strict JSON
-  back, with bounded retries and the configured location failure policy. The model is the `ADAPTER` role in Cell 3
+  back, with bounded retries and the configured location failure policy. The model is the `adapter` role in Cell 3
   (see "Hosted models"); for reasoning models set `token_param` to
   `max_completion_tokens` and leave `temperature` at `None`.
 * `"fdm"` (experimental): DentalGPT itself. It was trained with reinforcement
@@ -298,17 +355,17 @@ shape of the arch. `LOCATION_TRUTH` in Cell 3 picks how it is done:
   image (left / right / both). Sides are asked as image sides so the model never
   resolves the patient-side convention; the quadrant follows in Python. The
   probe's `<think>/<answer>` mode is reused. Drawn boxes are outside the
-  model's training images; unparseable answers follow `LOCATION_FAILURE_POLICY`.
+  model's training images; unparseable answers follow `location_failure_policy`.
 * `"geometry"`: the fixed crop windows (a box counts in every window holding at
   least a quarter of its area; the windows overlap on the midline and the
   occlusal plane). No model calls.
 
-The adapter runs once per dataset and adapter (Cell 12), independently of the
+The adapter runs once per dataset and adapter (Cell 9), independently of the
 model run, and resumes: one JSON per image under
 `<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
 quadrants, the windows' answer and the source that placed the box; the drawn
 images are kept under `.../drawn` for audit. DENTEX boxes carry FDI quadrant
-labels, which are exact, so on a DENTEX dataset Cell 12 also prints the
+labels, which are exact, so on a DENTEX dataset Cell 9 also prints the
 adapter's and the windows' agreement with that truth
 (`dental_eval.truth_agreement`): the check that the adapter is worth its calls.
 `evaluation.json` records under `summary.location_truth` how many true boxes
@@ -318,14 +375,14 @@ UL, LL, LR order) that holds it.
 
 ## Evaluation outputs
 
-`<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
+`<output_root>/<experiment>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
 `paper_covered` flag), `whole_image.csv` (the same table for the whole-image
-answers alone when `PRESENCE_LEVEL="region"`: read the two side by side to see
+answers alone when `presence_level="region"`: read the two side by side to see
 what the regional pass recovered and what it cost in specificity),
 `counts.csv` (exact, within-1, MAE on true positives, and a strict MAE that
 scores misses as zero), `region_counts.csv` (the same per finding and region
-when `COUNT_LEVEL="region"`; a region that answered B to presence counts as 0
+when `count_level="region"`; a region that answered B to presence counts as 0
 in the strict MAE), `regions.csv` (per-region TP, FP, TN, FN, exact-set match,
 Jaccard, unlocalized rate, `from_counts` for regions derived from counts, and
 `pred_all_regions_rate` next to `truth_all_regions_rate`), `per_image.csv`,
@@ -343,12 +400,12 @@ Two diagnostics decide whether word-based regions are being read:
   FDI quadrant labels are exact.
 * `pred_all_regions_rate` far above `truth_all_regions_rate` means the model
   answered A in every region whenever the whole image was positive, i.e. it
-  ignored the region clause; switch to `REGION_PROMPT="crop"` for that finding
+  ignored the region clause; switch to `region_prompt="crop"` for that finding
   set.
 
-### Small ablation-style reports (Cell 13)
+### Small ablation-style reports (Cells 10 and 11)
 
-Cell 13 also displays compact diagnostics and saves their full rows, including
+Cell 10 saves, and Cell 11 displays, compact diagnostics and saves their full rows, including
 supporting image IDs, in `evaluation.json` and matching CSV files:
 
 * `stage_changes`: whole-image to regional outcomes, overall and per finding.
@@ -371,33 +428,26 @@ supporting image IDs, in `evaluation.json` and matching CSV files:
   causal effects or severity grades. Counts/location use the evaluator's existing
   true-positive subsets; empty denominators are unavailable.
 
-For an optional configuration comparison, edit this dictionary in **Cell 13**:
+Cell 10 compares the experiments of Cell 3 automatically: every experiment with
+a complete set of results for a dataset is scored paired against the first one
+and written to `<output_root>/comparison/<dataset>/`. `run_comparison.csv`
+includes each experiment's settings, coverage, accuracy and count metrics and
+recorded usage; `run_changes.csv` retains paired transitions and image IDs.
+Every run must cover the selected ground-truth images with matching image hashes
+and consistent saved protocol/mode; an experiment still missing images is left
+out of the paired table (its own row stays in the leaderboard). Extra unselected
+images are ignored. All runs are rescored against the same supplied ground
+truth. Paired F1 uses only checks resolved by both runs; newly
+resolved/unresolved counts and full coverage are separate. Location is scored
+per experiment in the leaderboard, not in the paired table, because experiments
+may use different location truth, and different region schemes have different
+localization difficulty.
 
-```python
-COMPARE_RUN_DIRS = {
-    "baseline": "/kaggle/working/baseline_output",
-    "variant": "/kaggle/working/variant_output",
-}
-```
-
-These are output roots containing `<dataset>/manifest.json` and
-`<dataset>/results/`. Leave `{}` for current-run diagnostics only. The first
-entry is the reference. `run_comparison.csv` includes settings, coverage,
-accuracy/count/location metrics and recorded usage; `run_changes.csv` retains
-paired transitions and image IDs. Every run must cover the selected ground-truth
-images with matching image hashes and consistent saved protocol/mode. Extra
-unselected images are ignored; missing selected images stop the comparison.
-All runs are rescored against the same supplied ground truth, including the
-current location adaptation. Paired F1 uses only checks resolved by both runs;
-newly resolved/unresolved counts and full coverage are separate. Count and
-location metrics retain each run's true-positive subset, not a common paired
-subset. Different region schemes have different localization difficulty.
-
-Use the updated project files and rerun Cell 13 with ground truth and any needed
+Use the updated project files and rerun Cell 10 with ground truth and any needed
 location adaptation already loaded; these reports make no model calls. Saved
 attempts describe the executed questions, not a simulated retries-OFF run.
 Older runs without attempt metadata cannot produce recovery rows. Generation
-changes still need separately generated runs and fresh output directories.
+changes still need their own experiment (their own name and directory).
 
 ## Caveats
 
@@ -416,7 +466,7 @@ changes still need separately generated runs and fresh output directories.
 * Every region is asked about every finding, so one region false alarm makes
   the finding present: compare `whole_image.csv` with `presence.csv` before
   reading the regional numbers as an improvement.
-* With `REGION_PROMPT="crop"` and `COUNT_LEVEL="region"`, the windows overlap
+* With `region_prompt="crop"` and `count_level="region"`, the windows overlap
   by 10% of the width and 20% of the height, so teeth on the seams can be
   counted twice; use words for region counts.
 * Apical surgery, root resorption, and furcation have very few positives in
@@ -427,11 +477,11 @@ changes still need separately generated runs and fresh output directories.
   comparing count rows of a combined run with those of a separate run.
 ## Optional location scoring
 
-In notebook Cell 3, set `EVALUATE_LOCATION = True` (default) to score locations,
+In notebook Cell 3, set `evaluate_location = True` (default) to score locations,
 or `False` to skip location scoring and location-truth adapter calls. Finding
 scores and total-count scores remain enabled; inference, counting questions,
 and saved predictions are unchanged. Regional-count metrics and the side check also follow this switch.
-Re-run Cell 3, Cell 12, and Cell 13 to evaluate existing results with this setting;
+Re-run Cell 3, Cell 9, and Cell 10 to evaluate existing results with this setting;
 no inference rerun is required.
 The report records `summary.evaluate_location`. Re-exporting a report with location
 scoring disabled removes its previous location CSVs so stale metrics are not shown.

@@ -185,10 +185,15 @@ class RecoveryTests(unittest.TestCase):
             self.assertIsNone(summary[metric], metric)
 
     def test_notebook_wires_retry_configuration(self):
+        import experiments as xp
+
         notebook = json.loads(Path(__file__).with_name("main_notebook.ipynb").read_text(encoding="utf-8"))
         code = "\n".join("".join(c["source"]) for c in notebook["cells"] if c["cell_type"] == "code")
-        self.assertIn("PARSE_RETRIES = 1", code)
-        self.assertIn("parse_retries=PARSE_RETRIES", code)
+        self.assertIn("protocol=xp.protocol(cfg)", code)  # every experiment runs with its own retry budget
+        self.assertEqual(xp.DEFAULTS["parse_retries"], 1)
+        cfg, = xp.build([{"name": "patient", "parse_retries": 3, "api_call_retries": 4}])
+        self.assertEqual(xp.protocol(cfg).parse_retries, 3)
+        self.assertEqual(cfg["analyzer"]["api_call_retries"], 4)
 
     @unittest.skipIf(DENTVLM, "DentalGPT combined protocol")
     def test_combined_missing_presence_then_count_recovery_shares_budget(self):

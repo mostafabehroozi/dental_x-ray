@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import dental_eval as ev
+import experiments as xp
 import dental_pipeline as dp
 
 
@@ -50,14 +51,16 @@ class LocationScoringTests(unittest.TestCase):
     def test_notebook_skips_adapter_without_credentials_or_local_runner(self):
         nb = json.loads(Path(__file__).with_name("main_notebook.ipynb").read_text(encoding="utf-8"))
         sources = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
-        cell = next(s for s in sources if "# CELL 12 -" in s)
-        for provider in ("llm", "fdm", "geometry"):
-            scope = {"EVALUATE_LOCATION": False, "LOCATION_TRUTH": provider,
-                     "DATASETS": [{"name": "toy"}]}
-            exec(compile(cell, "<cell12>", "exec"), scope)
+        cell = next(s for s in sources if "# CELL 9 -" in s)
+        for truth in ("llm", "geometry"):
+            scope = {"EXPERIMENTS": xp.build([{"name": "off", "evaluate_location": False,
+                                               "location_truth": truth}]),
+                     "DATASETS": [{"name": "toy"}], "MODE_USED": {}, "xp": xp}
+            exec(compile(cell, "<location cell>", "exec"), scope)
             self.assertEqual(scope["ADAPTED"], {})
-        evaluation = next(s for s in sources if "# CELL 13 -" in s)
-        self.assertIn("evaluate_location=EVALUATE_LOCATION", evaluation)
+        # Location scoring is a per-experiment knob, and every experiment is evaluated with its own.
+        evaluation = next(s for s in sources if "# CELL 10 -" in s)
+        self.assertIn('evaluate_location=cfg["evaluate_location"]', evaluation)
 
 
 if __name__ == "__main__":

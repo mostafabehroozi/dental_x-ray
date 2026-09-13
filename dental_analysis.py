@@ -37,7 +37,7 @@ def presence_changes(gt, before, after, before_field="presence"):
             for (condition, transition), ids in sorted(groups.items())]
 
 
-def _metrics(report):
+def metrics(report):
     summary = report["summary"]
     row = {k: summary[k] for k in ("images_scored", "expected_finding_checks", "scored_finding_checks",
            "excluded_unparseable_checks", "TP", "TN", "FP", "FN", "sensitivity", "specificity",
@@ -157,7 +157,7 @@ def analyze(gt, results, *, evaluate_location=True):
     for (situation, group), members in sorted(buckets.items()):
         subset = {i: {**gt[i], "annotated": conditions} for i, conditions in members.items()}
         report = ev.evaluate(subset, results, evaluate_location=evaluate_location, include_analysis=False)
-        rows.append({"situation": situation, "group": group, **_metrics(report), "image_ids": sorted(members)})
+        rows.append({"situation": situation, "group": group, **metrics(report), "image_ids": sorted(members)})
     return {"stage_changes": presence_changes(regional, results, results, "whole_image"),
             "parse_recovery": recovery_rows(gt, results, evaluate_location),
             "call_usage": call_usage(results), "case_breakdown": rows}
@@ -212,7 +212,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
                "runner_settings": manifest.get("runner", {}),
                **{k: manifest.get("protocol", {}).get(k) for k in
                   ("presence_level", "count_level", "region_scheme", "region_prompt", "question_form", "parse_retries")},
-               **_metrics(report),
+               **metrics(report),
                "paired_checks": new["scored_finding_checks"], "paired_reference_f1": old["f1"],
                "paired_run_f1": new["f1"],
                "paired_f1_delta": round(new["f1"] - old["f1"], 4) if None not in (old["f1"], new["f1"]) else None,
