@@ -70,12 +70,65 @@ side, and the notebook checks the convention against DENTEX boxes.
 | --- | --- |
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics, side-convention check, CSV/JSON export |
+| `dental_analysis.py` | offline phrasing/vote and crop comparisons, recovery, case breakdowns, paired saved-run comparisons |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image (tasks, cells, multiplicity, extra tasks, not-assessed findings), report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
-| `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
+| `main_notebook.ipynb` | Kaggle runner; generation settings in Cell 3, optional saved-run comparison in Cell 13 |
 | `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
+
+## Small evaluation comparisons (Cell 13)
+
+Cell 13 displays compact diagnostics and saves full tables with supporting image
+IDs in `<OUTPUT_DIR>/<dataset>/evaluation/evaluation.json` and matching CSV files.
+The existing finding, count and location scoring rules are preserved.
+
+| Table | DentVLM-specific comparison |
+| --- | --- |
+| `stage_changes` | First saved phrasing vs whole-image vote, and whole-image vs crop outcomes. Includes corrected errors, new errors, unchanged, unresolved and not-assessed outcomes; overall and per finding. |
+| `phrasing_votes` | Agreement, disagreement, ties, and unresolved phrasings per task. Available when multiple phrasing answers were saved. |
+| `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules. Only for rationale mode with multiple saved phrasings; crop locations do not use this vote. |
+| `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
+| `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Missing usage is unavailable, with recorded-call denominators; transport attempts are not separate saved completions. |
+| `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
+
+First-phrasing and region-vote replay use saved answers **after any parse repairs**;
+they do not simulate retries OFF or change predictions. Crown and bridge are
+combined with the existing OR rule before finding scoring. Their individual retry
+answers cannot be graded from the merged restoration label, so correctness is
+unavailable for those tasks; extra tasks without benchmark labels are likewise
+unscored. A recovered parse can still be wrong. Named-cell multiplicity is never
+treated as a tooth count; count metrics require the optional count question.
+
+To compare separately generated configurations, edit this optional dictionary in
+**Cell 13** (leave `{}` for current-run diagnostics only):
+
+```python
+COMPARE_RUN_DIRS = {
+    "baseline": "/kaggle/working/dentvlm_baseline",
+    "variant": "/kaggle/working/dentvlm_variant",
+}
+```
+
+Each output root contains `<dataset>/manifest.json` and `<dataset>/results/`.
+The first entry is the reference. `run_comparison` reports the DentVLM knobs
+(`phrasings`, `region_vote`, `location`, `count_question`, `ask_untrained`,
+`extra_tasks`, `parse_retries`), coverage, metrics and recorded usage;
+`run_changes` contains paired outcomes and image IDs. Every selected image must
+exist in each run with identical image hashes and a consistent saved protocol.
+Extra unselected images are ignored. Location comparisons require matching saved
+cell-side conventions. All runs use the same supplied ground truth and current
+location adaptation.
+
+Paired F1 uses only findings asked and resolved in both runs. Newly assessed and
+unresolved transitions remain separate, so enabling untrained tasks cannot be
+counted as repairing old errors. Coverage is scored/expected **asked** checks;
+not-assessed checks have their own column. Count and location metrics retain each
+run's true-positive subset. Case groups describe associations, not causal effects;
+empty denominators are unavailable. Reload the updated project imports and rerun
+Cell 13 with ground truth/location adaptation already loaded; no model calls are
+made. Older artifacts without task answers or retry metadata omit those analyses.
 
 ## Calls per image
 
