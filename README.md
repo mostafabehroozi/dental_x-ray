@@ -5,6 +5,60 @@ of DentVLM (a 7B dental vision-language model) on panoramic radiographs, while
 sending it only questions it was trained and evaluated on. Everything else
 (task decomposition, aggregation, scoring) happens in Python.
 
+## Experiments
+
+The notebook runs a list of configurations, not one. Cell 3 holds one dictionary
+per experiment: a name, plus the knobs that experiment changes. Everything it
+does not mention comes from the `SHARED` dictionary above it, and then from
+`experiments.DEFAULTS`:
+
+```python
+EXPERIMENTS = xp.build([
+    {"name": "base"},
+    {"name": "three-phrasings", "phrasings": 3},
+    {"name": "with-counts", "count_question": True},
+    {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
+    {"name": "dentvlm-local", "backend": "local"},
+], shared=SHARED)
+```
+
+Anything in `experiments.DEFAULTS` may vary per experiment: the backend (local
+DentVLM through llama.cpp or a hosted model), the analyzer, adapter and reporter
+models, the seven protocol knobs, the retry budgets, the location truth, the
+report language, and the local checkpoint source, context size and image-token
+cap. A dictionary knob (`analyzer`, `adapter`, `reporter`) merges key by key, so
+changing the model keeps the provider and its request options; every other knob
+is replaced. An unknown knob name is an error rather than a silent default, and
+so are a duplicate name, an invalid value, and `location_truth="fdm"` without the
+local backend.
+
+Every experiment writes into `<output_root>/<name>/<dataset>/`, with its resolved
+configuration saved as `<output_root>/<name>/experiment.json`, so two
+configurations never share a run directory and each of them resumes on its own.
+Cell 8 shows raw replies for each experiment before the run (`smoke_images`, 0
+skips it), Cell 9 runs them one at a time (an experiment that fails is reported
+and the sweep continues; local experiments restart the llama.cpp server only when
+their server settings differ), and Cell 10 translates the ground-truth boxes once
+per adapter instead of once per experiment. Cell 11 then scores every experiment
+and ranks them:
+
+* `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
+  sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
+  rate, coverage, not-assessed checks, count MAE, exact region-set rate, calls
+  per image. Each row is scored against that experiment's own location truth.
+* `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
+  on the same images against the first one - `paired_f1_delta`, checks corrected
+  and worsened, newly unresolved, recorded calls and tokens.
+
+Cells 12 to 14 look at one experiment at a time: `INSPECT_EXPERIMENT` selects it
+for the per-finding tables and saved diagnostics, for one image's raw answers,
+and for the dentist report (one report call per image, so it defaults to the
+inspected experiment).
+
+Running several experiments multiplies model calls. `"limit"` in `DATASETS` keeps
+a first sweep cheap, and every cell resumes, so a sweep can be extended, or an
+experiment added, without recomputing what is already saved.
+
 ## Why it looks like this
 
 DentVLM (Meng et al., Nature Communications 2026; arXiv 2509.23344) is
@@ -28,16 +82,16 @@ cropped-panoramic training, and no JSON or tag format. So:
   onto six dental-arch cells (upper/lower x left/anterior/right).
 * **Multiplicity** is the number of cells named (0 to 6), reported as
   "in N region(s)". The tooth-count question from the DentalGPT branch is kept
-  behind `Protocol(count_question=True)` as an explicitly out-of-distribution
+  behind `count_question` as an explicitly out-of-distribution
   experiment.
 * **Findings without a DentVLM task** (furcation involvement, apical surgery,
   root resorption, orthodontic appliances, surgical plates) are not asked and
-  are reported as "not assessed by this model". `Protocol(ask_untrained=True)`
+  are reported as "not assessed by this model". `ask_untrained`
   asks them anyway and scores them under `trained_task=False`; the paper's
   zero-shot accuracy on untrained diseases is 52-64%.
 * **Prosthetic restoration** (crowns or bridges in the benchmark) is the OR of
   the prosthetic crown and prosthetic bridge tasks, regions merged.
-* **Bounded parse recovery.** The notebook sets `PARSE_RETRIES = 1`: one extra
+* **Bounded parse recovery.** The notebook sets `parse_retries = 1`: one extra
   attempt per unparseable answer, on the same image/model with a reminder to put
   Yes/No on line 1 and retain the rationale/location. Optional counts use an
   integer-only reminder. Every failed attempt prints the full prompt and response;
@@ -49,14 +103,15 @@ cropped-panoramic training, and no JSON or tag format. So:
   remain `not_assessed` and are outside the expected checks.
   `expected_finding_checks = scored_finding_checks + excluded_unparseable_checks`.
   This means confusion-table totals can still differ when final coverage differs.
-  The recovery policy is hashed into the manifest; use a new output directory
-  after changing it. Direct Python `Protocol()` keeps retries off unless specified.
-* **Visible failure control.** `API_CALL_RETRIES` retries transient API failures without hidden SDK
-  retries. `LOCATION_PARSE_RETRIES` controls location-format retries and
-  `LOCATION_FAILURE_POLICY` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
+  The recovery policy is hashed into the manifest; give the changed setting a new
+  experiment name (its own directory) rather than reusing one. Direct Python `Protocol()` keeps retries off unless specified.
+* **Visible failure control.** `api_call_retries` retries transient API failures without hidden SDK
+  retries. `location_parse_retries` controls location-format retries and
+  `location_failure_policy` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
   print the full prompt and response; saved JSON keeps every attempt. Valid vote ties and task
   conflicts are saved as aggregation warnings. Invalid resumed artifacts stop with `ARTIFACT ERROR`.
-  Use a new `OUTPUT_DIR` after changing any hashed control.
+  A hashed control that changed under an existing experiment name stops the run instead
+  of mixing two configurations.
 
 Left and right follow the model's own convention (Supplementary Table S6): its
 "left posterior region" is FDI quadrants 1 and 4, the patient's right, which is
@@ -74,14 +129,15 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image (tasks, cells, multiplicity, extra tasks, not-assessed findings), report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
+| `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
-| `main_notebook.ipynb` | Kaggle runner; generation settings in Cell 3, optional saved-run comparison in Cell 13 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
+| `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 11 |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py` | offline tests with fake models (`python -m unittest -q`) |
 
-## Small evaluation comparisons (Cell 13)
+## Small evaluation comparisons (Cells 11 and 12)
 
-Cell 13 displays compact diagnostics and saves full tables with supporting image
-IDs in `<OUTPUT_DIR>/<dataset>/evaluation/evaluation.json` and matching CSV files.
+Cell 11 saves, and Cell 12 displays, compact diagnostics with supporting image IDs
+in `<output_root>/<experiment>/<dataset>/evaluation/evaluation.json` and matching CSV files.
 The existing finding, count and location scoring rules are preserved.
 
 | Table | DentVLM-specific comparison |
@@ -101,25 +157,18 @@ unavailable for those tasks; extra tasks without benchmark labels are likewise
 unscored. A recovered parse can still be wrong. Named-cell multiplicity is never
 treated as a tooth count; count metrics require the optional count question.
 
-To compare separately generated configurations, edit this optional dictionary in
-**Cell 13** (leave `{}` for current-run diagnostics only):
-
-```python
-COMPARE_RUN_DIRS = {
-    "baseline": "/kaggle/working/dentvlm_baseline",
-    "variant": "/kaggle/working/dentvlm_variant",
-}
-```
-
-Each output root contains `<dataset>/manifest.json` and `<dataset>/results/`.
-The first entry is the reference. `run_comparison` reports the DentVLM knobs
-(`phrasings`, `region_vote`, `location`, `count_question`, `ask_untrained`,
-`extra_tasks`, `parse_retries`), coverage, metrics and recorded usage;
-`run_changes` contains paired outcomes and image IDs. Every selected image must
-exist in each run with identical image hashes and a consistent saved protocol.
-Extra unselected images are ignored. Location comparisons require matching saved
-cell-side conventions. All runs use the same supplied ground truth and current
-location adaptation.
+Cell 11 compares the experiments of Cell 3 automatically: every experiment with a
+complete set of results for a dataset is scored paired against the first one and
+written to `<output_root>/comparison/<dataset>/`. `run_comparison` reports each
+experiment's knobs (`phrasings`, `region_vote`, `location`, `count_question`,
+`ask_untrained`, `extra_tasks`, `parse_retries`), coverage, metrics and recorded
+usage; `run_changes` contains paired outcomes and image IDs. Every selected image
+must exist in each run with identical image hashes and a consistent saved
+protocol; an experiment still missing images is left out of the paired table (its
+own row stays in the leaderboard). Extra unselected images are ignored. Location
+comparisons require matching saved cell-side conventions, so the paired table
+leaves location out and the leaderboard scores it per experiment. All runs use the
+same supplied ground truth.
 
 Paired F1 uses only findings asked and resolved in both runs. Newly assessed and
 unresolved transitions remain separate, so enabling untrained tasks cannot be
@@ -127,7 +176,7 @@ counted as repairing old errors. Coverage is scored/expected **asked** checks;
 not-assessed checks have their own column. Count and location metrics retain each
 run's true-positive subset. Case groups describe associations, not causal effects;
 empty denominators are unavailable. Reload the updated project imports and rerun
-Cell 13 with ground truth/location adaptation already loaded; no model calls are
+Cell 11 with ground truth/location adaptation already loaded; no model calls are
 made. Older artifacts without task answers or retry metadata omit those analyses.
 
 ## Calls per image
@@ -153,14 +202,14 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 
 * The model is published only as bf16 safetensors (Hugging Face
   `ZJU-AI4H/DentVLM`, gated with automatic approval, CC BY-NC 4.0). Accept the
-  license once, store a token as a Kaggle secret, and let Cell 6 convert it
+  license once, store a token as a Kaggle secret, and let Cell 6 convert it once
   with llama.cpp's converter (Q8_0 language model, f16 vision projector, about
   9.5 GB kept, 17 GB scratch). Keep the two files in a private Kaggle dataset
   or your own Hugging Face repo for later sessions.
 * `--image-max-tokens 8192` mirrors the authors' `max_pixels` of 8192 x 28 x 28;
   llama.cpp would otherwise cap Qwen2-VL images at 4096 tokens. No token floor.
   The paper's ablation found a 1024 x 1024 bound best for disease tasks;
-  `IMAGE_MAX_TOKENS = 1369` reproduces it for an A/B.
+  an experiment with `"image_max_tokens": 1369` reproduces it for an A/B.
 * `--ctx-size 16384`, the authors' maximum input length.
 * `max_tokens 512` (the authors' output cap), temperature 0, `repeat_penalty
   1.05` as in their inference script. Line 1 is present even when a rationale
@@ -168,15 +217,15 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 * No system prompt is sent; the chat template injects Qwen's default one, which
   the authors' vLLM script sets explicitly.
 * Radiographs must be JPEG, PNG, or BMP (what llama.cpp can decode).
-* `BACKEND="api"` in Cell 3 sends the same questions to a hosted vision model
+* `backend="api"` in an experiment sends the same questions to a hosted vision model
   instead, for a controlled comparison (see "Hosted models").
 
 ## Hosted models
 
 Cell 3 has one `PROVIDERS` registry containing each provider's base URL and API
 key. The keys come from environment variables or Kaggle Secrets (Add-ons >
-Secrets), and unused providers may have no key. The small `ANALYZER`,
-`ADAPTER` and `REPORTER` role dictionaries then select any provider and exact model, e.g.
+Secrets), and unused providers may have no key. The small `analyzer`,
+`adapter` and `reporter` role dictionaries of an experiment then select any provider and exact model, e.g.
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
 routing under `request_options` stay with the role. `VisionRunner.from_api`,
@@ -189,9 +238,9 @@ bad request or key fails at once.
 
 DentVLM's answers are a dozen narrow facts per image (one yes/no per task,
 regions named in rationales, a multiplicity); a dentist reads one report. Cell
-15 sends the findings of each image to a text LLM (the `REPORTER` role in Cell
-3, a spec dict like `ANALYZER` and `ADAPTER`; it never sees the image) and
-saves a classified report in the dentist's language (`REPORT_LANGUAGE`).
+14 sends the findings of each image to a text LLM (the `reporter` role of the
+experiment, a spec dict like `analyzer` and `adapter`; it never sees the image) and
+saves a classified report in the dentist's language (`report_language`).
 `report_writer.py` does it in three fixed steps, shaped by what DentVLM
 actually produces:
 
@@ -239,7 +288,7 @@ every attempt with its problems, the verified report, the Markdown) and one
 `.md` per image under `<dataset>/reports/<model>-<language>/reports/`, with a
 manifest that hashes the writer settings, the prompts and the language.
 `summarize_reports` counts how many reports verified at once, after a repair,
-or fell back. Reports are for reading and are not scored: Cell 13 stays the
+or fell back. Reports are for reading and are not scored: Cell 11 stays the
 measure of the analyzer. The language is not verified; read one report before
 trusting a batch.
 
@@ -267,7 +316,7 @@ means deciding which cells each true box occupies, and fixed image windows do
 that badly: the midline, the canine line and the occlusal plane move with
 patient positioning and the shape of the arch. DentVLM's authors built their
 own location labels anatomically (box, nearest teeth, tooth-region mapping;
-Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
+Methods 4.2), and `location_truth` picks how this project does it:
 
 * `"llm"` (recommended): `location_adapter.LLMAdapter` draws numbered boxes on
   the radiograph, burns the FDI quadrant names into the corners, and asks a
@@ -279,7 +328,7 @@ Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
   deterministic (`dental_pipeline.unit_cell`) and follows the same
   `LEFT_IS_IMAGE_LEFT` reading as the model's own words. One call per image
   (chunked above `max_boxes_per_call` boxes), strict JSON back, with bounded
-  retries and the configured location failure policy. The model is the `ADAPTER` role in Cell 3 (see "Hosted models");
+  retries and the configured location failure policy. The model is the `adapter` role of the experiment (see "Hosted models");
   for reasoning models set `token_param` to `max_completion_tokens` and leave
   `temperature` at `None`.
 * `"fdm"` (experimental): DentVLM itself. It has no question about a marked
@@ -293,12 +342,12 @@ Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
   least a quarter of its area; the windows overlap on the canine line and the
   occlusal plane). No model calls.
 
-The adapter runs once per dataset and adapter (Cell 12), independently of the
+The adapter runs once per dataset and adapter (Cell 10), independently of the
 model run, and resumes: one JSON per image under
 `<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
 cells, the windows' answer and the source that placed the box; the drawn or
 spotlighted images are kept under `.../drawn` for audit. DENTEX boxes carry FDI
-tooth numbers, which give exact cells, so on a DENTEX dataset Cell 12 also
+tooth numbers, which give exact cells, so on a DENTEX dataset Cell 10 also
 prints the adapter's and the windows' agreement with that exact truth
 (`dental_eval.truth_agreement`): the check that the adapter is worth its calls.
 `evaluation.json` records under `summary.location_truth` how many true boxes
@@ -306,7 +355,7 @@ each source placed.
 
 ## Evaluation outputs
 
-`<OUTPUT_DIR>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
+`<output_root>/<experiment>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
 `trained_task` flag), `whole_image.csv` (the same table for the whole-image
 answers alone with `location="crops"`: read the two side by side to see what
@@ -334,11 +383,11 @@ not assessed.
 * The weights are CC BY-NC 4.0: research use only.
 ## Optional location scoring
 
-In notebook Cell 3, set `EVALUATE_LOCATION = True` (default) to score locations,
+In an experiment, set `evaluate_location = True` (default) to score locations,
 or `False` to skip location scoring and location-truth adapter calls. Finding
 scores and total-count scores remain enabled; inference, counting questions,
 and saved predictions are unchanged.
-Re-run Cell 3, Cell 12, and Cell 13 to evaluate existing results with this setting;
-no inference rerun is required. Cell 14 also skips its side check when disabled.
+Re-run Cell 3, Cell 10, and Cell 11 to evaluate existing results with this setting;
+no inference rerun is required. Cell 13 also skips its side check when disabled.
 The report records `summary.evaluate_location`. Re-exporting a report with location
 scoring disabled removes its previous location CSVs so stale metrics are not shown.

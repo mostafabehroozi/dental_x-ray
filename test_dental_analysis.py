@@ -12,6 +12,7 @@ from unittest.mock import patch
 import dental_analysis as da
 import dental_eval as ev
 import dental_pipeline as dp
+import experiments as xp
 
 
 def fixture():
@@ -185,24 +186,25 @@ class AnalysisTests(unittest.TestCase):
     def test_exports_empty_cleanup_and_notebook_execution(self):
         gt, results = fixture()
         nb = json.loads(Path(__file__).with_name("main_notebook.ipynb").read_text(encoding="utf-8"))
-        source = next("".join(c["source"]) for c in nb["cells"] if "# CELL 13 -" in "".join(c["source"]))
+        source = next("".join(c["source"]) for c in nb["cells"] if "# CELL 11 -" in "".join(c["source"]))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             save_run(root / "a" / "toy", results)
             save_run(root / "b" / "toy", results)
-            start = source.index("COMPARE_RUN_DIRS = {")
-            end = source.index("\n}", start) + 2
-            source = source[:start] + "COMPARE_RUN_DIRS = " + repr({"a": str(root / "a"), "b": str(root / "b")}) + source[end:]
-            scope = {"DATASETS": [{"name": "toy"}], "GT": {"toy": gt}, "OUTPUT_DIR": root / "a",
-                     "ADAPTED": {}, "EVALUATE_LOCATION": True, "dp": dp, "ev": ev, "Path": Path}
+            configs = xp.build([{"name": "a"}, {"name": "b"}], {"output_root": tmp})
+            scope = {"EXPERIMENTS": configs, "DATASETS": [{"name": "toy"}], "GT": {"toy": gt}, "ADAPTED": {},
+                     "OUTPUT_ROOT": tmp, "xp": xp, "dp": dp, "ev": ev, "da": da, "Path": Path}
             with redirect_stdout(io.StringIO()), patch("IPython.display.display"):
-                exec(compile(source, "<cell13>", "exec"), scope)
+                exec(compile(source, "<evaluation cell>", "exec"), scope)
+            self.assertEqual(sorted(scope["REPORTS"]), [("a", "toy"), ("b", "toy")])
+            self.assertEqual(len(scope["LEADERBOARD"]), 2)
+            self.assertEqual(len(scope["COMPARISONS"]["toy"]["run_comparison"]), 2)
+            self.assertTrue((root / "leaderboard.csv").is_file())
+            self.assertTrue((root / "comparison" / "toy" / "run_comparison.csv").is_file())
             out = root / "a" / "toy" / "evaluation"
-            self.assertTrue((out / "run_comparison.csv").exists())
             self.assertTrue((out / "region_vote_comparison.csv").exists())
             ev.evaluate({}, {}, out_dir=out)
             self.assertFalse((out / "region_vote_comparison.csv").exists())
-            self.assertFalse((out / "run_comparison.csv").exists())
 
 
 if __name__ == "__main__":

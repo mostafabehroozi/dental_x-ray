@@ -42,7 +42,7 @@ def _score(gt, results, evaluate_location):
     return ev.evaluate(gt, results, evaluate_location=evaluate_location, include_analysis=False)
 
 
-def _metrics(gt, report):
+def metrics(gt, report):
     summary = report["summary"]
     row = {k: summary[k] for k in ("images_scored", "expected_finding_checks", "scored_finding_checks",
            "excluded_unparseable_checks", "TP", "TN", "FP", "FN", "sensitivity", "specificity", "ppv", "f1")}
@@ -169,7 +169,7 @@ def phrasing_analysis(gt, results, evaluate_location):
                                            "regions": regions if presence == "yes" else None,
                                            "region_count": len(regions) if presence == "yes" else None}
                 replay[image_id] = {**result, "findings": findings}
-            region_rows.append({"region_vote": mode, **_metrics(subset, _score(subset, replay, True)),
+            region_rows.append({"region_vote": mode, **metrics(subset, _score(subset, replay, True)),
                                 "image_ids": sorted(subset)})
     return changes, vote_rows, region_rows
 
@@ -206,7 +206,7 @@ def analyze(gt, results, *, evaluate_location=True):
     for (situation, group), members in sorted(buckets.items()):
         subset = {i: {**gt[i], "annotated": conditions} for i, conditions in members.items()}
         rows.append({"situation": situation, "group": group,
-                     **_metrics(subset, _score(subset, results, evaluate_location)), "image_ids": sorted(members)})
+                     **metrics(subset, _score(subset, results, evaluate_location)), "image_ids": sorted(members)})
     crops = {i: e for i, e in gt.items() if results[i]["location_level"] == "crops"}
     changes, votes, region_votes = phrasing_analysis(gt, results, evaluate_location)
     changes += presence_changes(crops, results, results, "whole_image_to_crops", before_field="whole_image")
@@ -259,7 +259,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
                **{k: manifest["protocol"].get(k) for k in ("phrasings", "region_vote", "location", "count_question",
                                                          "ask_untrained", "extra_tasks", "parse_retries")},
                "evaluate_location": evaluate_location, "location_truth": report["summary"]["location_truth"],
-               **_metrics(gt, report), "paired_checks": new["scored_finding_checks"],
+               **metrics(gt, report), "paired_checks": new["scored_finding_checks"],
                "paired_reference_f1": old["f1"], "paired_run_f1": new["f1"],
                "paired_f1_delta": round(new["f1"] - old["f1"], 4) if None not in (old["f1"], new["f1"]) else None,
                "corrected": totals.get("FN -> TP", 0) + totals.get("FP -> TN", 0),
