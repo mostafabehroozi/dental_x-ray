@@ -46,6 +46,17 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(local["question_form"], "separate")
         self.assertEqual(xp.protocol(local).question_form, "separate")
 
+    def test_counting_switch(self):
+        on, off = xp.build([{"name": "base"}, {"name": "presence-only", "counting": False}], SHARED)
+        self.assertTrue(xp.protocol(on).counting)
+        self.assertEqual((off["counting"], off["count_level"], off["question_form"]), (False, "region", "combined"))
+        protocol = xp.protocol(off)  # the idle knobs are kept as given; the Protocol makes them inert
+        self.assertEqual((protocol.counting, protocol.counts_per_region, protocol.combined, protocol.uses_regions),
+                         (False, False, False, True))
+        with self.assertRaisesRegex(ValueError, "counting must be True or False"):
+            xp.build([{"name": "bad", "counting": "off"}], SHARED)
+        self.assertEqual([r["counting"] for r in xp.table([on, off])], ["True", "False"])
+
     def test_invalid_values_fail_at_build_time(self):
         for bad, message in (({"backend": "gpu"}, "backend must be one of"),
                              ({"location_truth": "fdm"}, "needs backend 'local'"),

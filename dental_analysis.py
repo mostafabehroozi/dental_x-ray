@@ -54,6 +54,7 @@ def metrics(report):
                 sum(r[metric] * r[weight] for r in usable), sum(r[weight] for r in usable))
     row["counts_unparseable"] = sum(r["count_unparseable"] for r in report["counts"])
     row["regions_excluded"] = sum(r["excluded_location_checks"] for r in report["regions"])
+    row["region_presence_f1"] = (summary.get("region_presence") or {}).get("f1")  # None without region answers or location
     return row
 
 
@@ -195,6 +196,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
         if reference is None:
             reference, reference_name = results, name
         report = ev.evaluate(gt, results, dataset=dataset, evaluate_location=evaluate_location, include_analysis=False)
+        saved = ev.result_protocol(manifest)  # older manifests get the defaults of the knobs added since
         transitions = presence_changes(gt, reference, results)
         changes.extend({"run": name, "reference": reference_name, **r} for r in transitions)
         totals = {r["transition"]: r["checks"] for r in transitions if r["condition"] == "ALL"}
@@ -210,8 +212,8 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
                "location_truth": report["summary"]["location_truth"],
                "model": manifest.get("runner", {}).get("model"), "mode": manifest.get("mode"),
                "runner_settings": manifest.get("runner", {}),
-               **{k: manifest.get("protocol", {}).get(k) for k in
-                  ("presence_level", "count_level", "region_scheme", "region_prompt", "question_form", "parse_retries")},
+               **{k: saved.get(k) for k in ("presence_level", "counting", "count_level", "region_scheme", "region_prompt",
+                                            "question_form", "parse_retries")},
                **metrics(report),
                "paired_checks": new["scored_finding_checks"], "paired_reference_f1": old["f1"],
                "paired_run_f1": new["f1"],

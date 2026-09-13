@@ -151,6 +151,21 @@ class StructuredInputTests(unittest.TestCase):
         self.assertEqual((by["carious_lesion"]["count"], by["carious_lesion"]["region_counts"]), ("not_asked", {}))
         self.assertEqual(s["summary"]["regional_only"], [])
 
+    def test_counting_off_protocol(self):
+        result = dp.analyze_image(ScriptedRunner(SCRIPT), self.image, protocol=dp.Protocol(counting=False))
+        s = rw.structured_findings(result)
+        by = {f["condition"]: f for f in s["findings"]}
+        # Nothing is countable in a run without count questions; the presence and region fields are untouched.
+        self.assertTrue(all(not f["countable"] and f["count"] == "not_countable" and f["count_source"] == "none"
+                            and f["region_counts"] == {} for f in s["findings"]))
+        self.assertEqual((by["dental_filling"]["status"], by["dental_filling"]["located_in"]), ("present", ["UR"]))
+        self.assertEqual((by["endodontic_treatment"]["status"], by["endodontic_treatment"]["located_in"]), ("present", ["UL"]))
+        self.assertEqual((by["impacted_tooth"]["located_in"], by["impacted_tooth"]["count"]), (["LL", "LR"], "not_countable"))
+        self.assertEqual(s["analysis"]["protocol"]["counting"], False)
+        self.assertIn("no count question: presence only", s["analysis"]["method"])
+        self.assertNotIn("count of affected teeth", s["analysis"]["method"])
+        self.assertEqual(rw.verify_report(good_report(s), s), [])
+
     def test_prompt_is_filled_in(self):
         s = rw.structured_findings(self.result, analyzer="DentalGPT-7B")
         prompt = rw.user_prompt(s, "Persian")
@@ -177,6 +192,9 @@ class MethodTextTests(unittest.TestCase):
         self.assertIn("with a separate whole-image count for a finding the whole image answered False but a region answered True",
                       rw.method_text({**base, "count_level": "overall", "question_form": "combined"}, regions))
         self.assertIn("one whole-image count of affected teeth", rw.method_text({**base, "count_level": "overall"}, regions))
+        off = rw.method_text({**base, "counting": False, "question_form": "combined"}, regions)
+        self.assertIn("each of the 4 regions (named in the question); no count question: presence only", off)
+        self.assertNotIn("count of affected teeth", off)
 
 
 class VerificationTests(unittest.TestCase):

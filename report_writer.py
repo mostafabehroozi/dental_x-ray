@@ -2,7 +2,8 @@
 
 The analyzer answers dozens of narrow questions per image (one True/False question per
 finding on the whole image and, region by region, the same question for every finding; a
-tooth count wherever a region answered True). A dentist wants one report. This module
+tooth count wherever a region answered True, unless counting is off). A dentist wants one
+report. This module
 
 * condenses a saved result into one dense, fixed-shape JSON (structured_findings): all 14
   findings, every region, every count, each with an explicit status ("present", "absent",
@@ -79,7 +80,7 @@ LEGEND = {
     },
     "count": ("the number of affected teeth (of implants, of residual roots), or 'incomplete' (one region's count could not "
               "be read), 'unparseable', 'not_asked' (the finding was absent, so nothing was counted), 'not_countable' "
-              "(a finding the analyzer never counts)"),
+              "(a finding the analyzer never counts, or an analysis run without count questions)"),
     "region_counts": "the number counted in that region, or 'not_asked' (the region answered False) or 'unparseable'",
     "detection": "whether the whole-image question and the regional questions agree; a regional-only detection is a weaker signal",
 }
@@ -121,7 +122,9 @@ def method_text(protocol: dict, regions: tuple[str, ...]) -> str:
     how = "named in the question" if protocol["region_prompt"] == "words" else "sent as a crop"
     if protocol["presence_level"] == "region":
         parts.append(f"the same question for every finding in each of the {len(regions)} regions ({how})")
-    if protocol["count_level"] == "region" and regions:
+    if not protocol.get("counting", True):
+        parts.append("no count question: presence only")
+    elif protocol["count_level"] == "region" and regions:
         if protocol["presence_level"] == "region":
             parts.append("for the nine countable findings the regional question also asks for the count of affected teeth"
                          if combined else "a count of affected teeth in every region that answered True")
@@ -142,7 +145,7 @@ def _finding(condition: str, finding: dict, protocol: dict, regions: tuple[str, 
     whole_image = _status(finding.get("whole_image", finding["presence"]))
     region_presence = finding.get("regions") if regions else None
     region_counts = finding.get("region_counts") if regions else None
-    countable = condition in dp.COUNTABLE
+    countable = condition in dp.COUNTABLE and protocol.get("counting", True)  # nothing is countable with counting off
     regional = protocol["presence_level"] == "region" and bool(regions)
 
     # Region answers: from the presence questions, else from the counts (a count above zero is a hit).

@@ -8,6 +8,7 @@ one run directory and the evaluation cell scores them side by side on the same i
     EXPERIMENTS = xp.build([
         {"name": "base"},
         {"name": "separate-questions", "question_form": "separate"},
+        {"name": "presence-only", "counting": False},
         {"name": "arch-regions", "region_scheme": "arch"},
         {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
         {"name": "dentalgpt-local", "backend": "local"},
@@ -51,6 +52,7 @@ DEFAULTS = {
     # Protocol: the question shapes (README, "Two levels").
     "mode": "auto",                    # "auto" = probe decides (local); or force "plain" / "tagged"
     "presence_level": "region",        # "overall" | "region"
+    "counting": True,                  # False: no count question at all, presence only (count_level and question_form idle)
     "count_level": "region",           # "overall" | "region"
     "region_scheme": "quadrant",       # "quadrant" | "arch"
     "region_prompt": "words",          # "words" | "crop"
@@ -84,7 +86,8 @@ DEFAULTS = {
     "image_min_tokens": None,
 }
 
-PROTOCOL_KEYS = ("presence_level", "count_level", "region_scheme", "region_prompt", "question_form", "parse_retries")
+PROTOCOL_KEYS = ("presence_level", "count_level", "region_scheme", "region_prompt", "question_form", "parse_retries",
+                 "counting")
 SERVER_KEYS = ("model_filename", "mmproj_filename", "n_gpu_layers", "ctx_size", "image_max_tokens", "image_min_tokens")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -306,7 +309,7 @@ def table(configs: list[dict]) -> list[dict]:
     """One row per experiment holding only the knobs the experiments disagree on."""
     varying = [k for k in DEFAULTS if len({_digest(public(c)[k]) for c in configs}) > 1]
     if not varying:
-        varying = ["backend", "analyzer", "presence_level", "count_level", "region_scheme", "question_form"]
+        varying = ["backend", "analyzer", "presence_level", "counting", "count_level", "region_scheme", "question_form"]
     return [{"name": c["name"], **{k: _cell(public(c)[k]) for k in varying}} for c in configs]
 
 

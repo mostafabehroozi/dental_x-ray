@@ -65,6 +65,8 @@ class AnalysisTests(unittest.TestCase):
         original = ev.evaluate(gt, results, include_analysis=False)
         for key, value in original.items():
             self.assertEqual(report[key], value)
+        # The fixture answers UR for the filling: presence per region scores 2 TP, 1 FP, 1 FN there.
+        self.assertEqual((da.metrics(report)["region_presence_f1"], report["summary"]["region_presence"]["FN"]), (0.6667, 1))
         changes = {r["transition"]: r for r in report["stage_changes"] if r["condition"] == "ALL"}
         self.assertEqual(set(changes), {"FN -> TP", "TN -> FP", "FP -> TN", "TP -> FN",
                                        "unresolved -> TP", "TP -> unresolved"})
@@ -163,6 +165,7 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(row["coverage"], .8333)
             self.assertEqual(row["paired_f1_delta"], 0)
             self.assertIsNone(row["prompt_tokens"])
+            self.assertEqual((row["counting"], row["region_presence_f1"]), (True, None))  # older manifest, no location
             selected = da.compare_runs({"0": gt["0"]}, {"baseline": a, "variant": b}, evaluate_location=False)
             self.assertEqual(selected["run_comparison"][1]["corrected"], 1)
             ev.write_report(report, Path(tmp) / "export")

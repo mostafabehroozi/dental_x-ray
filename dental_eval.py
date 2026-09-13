@@ -3,10 +3,13 @@
 Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
 Metrics stay simple: image-level TP/FP/TN/FN per finding (and the same table
 for the whole-image answers when presence was resolved per region, to show what
-the regional pass recovered and what it cost), count agreement on true
+the regional pass recovered and what it cost), presence per region (every region
+answer of every image against the regions the true boxes occupy, so a finding
+class is scored once per region rather than counted), count agreement on true
 positives (whole-image counts, and per region when counts were taken per
-region), region-level TP/FP/TN/FN for localized findings, and two per-image
-numbers a dentist cares about (complete-case rate, false alarms).
+region; left out when counting was off), region-level TP/FP/TN/FN for localized
+findings, and two per-image numbers a dentist cares about (complete-case rate,
+false alarms).
 
 Unparseable answers are neutral: excluded from confusion tables and per-image
 recall, with coverage reported separately. Complete-case rate excludes images
@@ -235,18 +238,19 @@ def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
 def result_protocol(result: dict) -> dict:
     """The protocol a result was produced with; results from before the two levels are translated."""
     protocol = result.get("protocol")
-    if protocol:
-        return {**protocol, "question_form": protocol.get("question_form", "separate")}  # form knob added later
+    if protocol:  # the form and counting knobs were added later; older results took counts in the separate form
+        return {**protocol, "question_form": protocol.get("question_form", "separate"),
+                "counting": protocol.get("counting", True)}
     level = result.get("location_level", "none")
     return {"presence_level": "overall" if level == "none" else "region", "count_level": "overall",
             "region_scheme": "quadrant" if level == "none" else level, "region_prompt": "crop",
-            "question_form": "separate"}
+            "question_form": "separate", "counting": True}
 
 
 def result_scheme(result: dict) -> str:
     """Region scheme of a saved result ("quadrant", "arch") or "none" when no region was asked."""
     protocol = result_protocol(result)
-    if "region" in (protocol["presence_level"], protocol["count_level"]):
+    if protocol["presence_level"] == "region" or (protocol["counting"] and protocol["count_level"] == "region"):
         return protocol["region_scheme"]
     return "none"
 
@@ -296,11 +300,12 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, whole_image, counts, region_counts, regions, per_image = [], [], [], [], [], []
+    presence, whole_image, counts, region_counts, region_presence, regions, per_image = [], [], [], [], [], [], []
     protocol = result_protocol(results[ids[0]]) if ids else None
+    counting = protocol["counting"] if protocol else True
     level = result_scheme(results[ids[0]]) if ids else "none"
     region_names = tuple(CROPS[level]) if evaluate_location and level != "none" else ()
-    per_region_counts = evaluate_location and bool(protocol) and protocol["count_level"] == "region" and level != "none"
+    per_region_counts = counting and bool(region_names) and protocol["count_level"] == "region"
     # The whole-image answers are a separate result only when presence was resolved per region.
     whole_image_kept = (bool(protocol) and protocol["presence_level"] == "region"
                         and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]])
@@ -319,6 +324,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         jaccard_sum = 0.0
         rc = {name: {"n": 0, "exact": 0, "within1": 0, "abs": 0, "signed": 0, "strict_n": 0, "strict_abs": 0,
                      "unparseable": 0, "truth_positive": 0} for name in region_names}
+        rp = {name: {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0, "positives": 0} for name in region_names}
+        rp_excluded = 0
         for image_id in annotated:
             boxes = [b for b in gt[image_id]["boxes"] if b["condition"] == condition]
             truth = len(boxes) > 0
@@ -326,11 +333,25 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             finding = results[image_id]["findings"][condition]
             if whole_image_kept:
                 _tally(whole, truth, finding["whole_image"])
+            if region_names:
+                # Presence per region: every region answer of every image, whatever the whole image said, against
+                # the regions the true boxes occupy (none when the finding is absent). One cell per region, so
+                # several boxes in one region are one presence, and an unparseable region is one excluded cell.
+                pred_map, _ = predicted_regions(finding)
+                placed = [b for b in boxes if not b.get("location_excluded")]
+                if pred_map is not None and boxes and not placed:
+                    rp_excluded += 1
+                elif pred_map is not None:
+                    truth_regions = gt_regions(placed, level)
+                    for name, hit in pred_map.items():
+                        if name in rp:
+                            rp[name]["positives"] += name in truth_regions
+                            _tally(rp[name], name in truth_regions, None if hit is None else "A" if hit else "B")
             if not _tally(table, truth, finding["presence"]):
                 continue
             positive = finding["presence"] == "A"
 
-            if condition in COUNTABLE and truth:
+            if counting and condition in COUNTABLE and truth:
                 strict_pred = 0 if not positive else finding["count"]
                 if strict_pred is None:
                     unparsed_count += 1
@@ -398,7 +419,19 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         presence.append({**row, **table, **_prf(table["TP"], table["FP"], table["TN"], table["FN"])})
         if whole_image_kept:
             whole_image.append({**row, **whole, **_prf(whole["TP"], whole["FP"], whole["TN"], whole["FN"])})
-        if condition in COUNTABLE:
+        for name in region_names:
+            cell = rp[name]
+            scored = cell["TP"] + cell["FP"] + cell["TN"] + cell["FN"]
+            if not scored and not cell["unparseable"] and not rp_excluded:
+                continue  # no region answer for this finding (a presence-only finding under region counts)
+            region_presence.append({
+                "dataset": dataset, "condition": condition, "region": name, "level": level,
+                "images": scored + cell["unparseable"], "positives": cell["positives"],
+                **{k: cell[k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
+                **_prf(cell["TP"], cell["FP"], cell["TN"], cell["FN"]),
+                "location_truth_excluded": rp_excluded,
+            })
+        if counting and condition in COUNTABLE:
             counts.append({
                 "dataset": dataset, "condition": condition, "n_scored": n_count,
                 "exact_rate": _ratio(exact, n_count), "within_1_rate": _ratio(within1, n_count),
@@ -480,10 +513,15 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     if whole_image:
         micro_whole = {k: sum(r[k] for r in whole_image) for k in ("TP", "FP", "TN", "FN")}
         summary["whole_image"] = {**micro_whole, **_prf(*(micro_whole[k] for k in ("TP", "FP", "TN", "FN")))}
+    if region_presence:
+        micro_regions = {k: sum(r[k] for r in region_presence) for k in ("TP", "FP", "TN", "FN")}
+        summary["region_presence"] = {**micro_regions, **_prf(*(micro_regions[k] for k in ("TP", "FP", "TN", "FN"))),
+                                      "unparseable": sum(r["unparseable"] for r in region_presence)}
     if evaluate_location and level == "quadrant":
         summary["side_agreement"] = side_agreement(gt, results)
     report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
-              "region_counts": region_counts, "regions": regions, "per_image": per_image, "missing_results": missing}
+              "region_counts": region_counts, "region_presence": region_presence, "regions": regions,
+              "per_image": per_image, "missing_results": missing}
     if include_analysis:
         from dental_analysis import analyze
         report.update(analyze({i: gt[i] for i in ids}, results, evaluate_location=evaluate_location))
@@ -544,7 +582,7 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "whole_image", "counts", "region_counts", "regions", "per_image",
+    for name in ("presence", "whole_image", "counts", "region_counts", "region_presence", "regions", "per_image",
                  "stage_changes", "parse_recovery", "call_usage", "case_breakdown",
                  "run_comparison", "run_changes"):
         rows = report.get(name) or []

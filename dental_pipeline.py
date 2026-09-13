@@ -21,8 +21,11 @@ whole image only, or every region for every finding, with the whole-image
 answers kept as a separate result) and where counts are taken (one whole-image
 count, or one count per region). The whole-image answers never decide which
 regional questions are asked, so a finding missed with the model's attention
-spread over the whole image can be recovered in a region. Nothing else (JSON
-contracts or forced zeros) is used. Optional parse retries append a format reminder.
+spread over the whole image can be recovered in a region. Counting can also be
+switched off altogether (Protocol.counting False): the model then only decides
+presence, on the whole image and in every region, and no count question is
+asked. Nothing else (JSON contracts or forced zeros) is used. Optional parse
+retries append a format reminder.
 
 A hosted vision-language model (Protocol.question_form "combined") is asked presence
 and count in one question for the nine countable findings: the Figure 7 sentence and
@@ -666,6 +669,11 @@ REGION_PROMPTS = ("words", "crop")
 class Protocol:
     """What the wrapper may vary. Defaults are the recommended run.
 
+    counting        True: counts are taken where count_level says. False: no count question of
+                    any kind; the model only decides presence, on the whole image and, with
+                    presence_level "region", in every region, so a finding's result is its
+                    presence and its region set. count_level and question_form then have no
+                    effect: every question is the bare Figure 7 question, on both backends.
     presence_level  "overall": presence from the whole-image question only.
                     "region":  the same question for every finding in every region, region by
                                region, independent of the whole-image answers (kept as a separate
@@ -697,9 +705,12 @@ class Protocol:
     region_prompt: str = "words"
     question_form: str = "separate"
     parse_retries: int = 0  # extra attempts per failed question; notebook defaults to 1
+    counting: bool = True
 
     def __post_init__(self) -> None:
         llm_api.validate_parse_retries(self.parse_retries)
+        if type(self.counting) is not bool:
+            raise ValueError(f"counting must be True or False, got {self.counting!r}")
         for value, allowed, name in ((self.presence_level, PRESENCE_LEVELS, "presence_level"),
                                      (self.count_level, COUNT_LEVELS, "count_level"),
                                      (self.region_scheme, REGION_SCHEMES, "region_scheme"),
@@ -709,8 +720,18 @@ class Protocol:
                 raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
 
     @property
+    def counts_per_region(self) -> bool:
+        """Counts are taken in every region (never with counting off)."""
+        return self.counting and self.count_level == "region"
+
+    @property
+    def combined(self) -> bool:
+        """The presence-and-count question is in use (never with counting off)."""
+        return self.counting and self.question_form == "combined"
+
+    @property
     def uses_regions(self) -> bool:
-        return "region" in (self.presence_level, self.count_level)
+        return self.presence_level == "region" or self.counts_per_region
 
     @property
     def regions(self) -> tuple[str, ...]:
@@ -737,15 +758,16 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
     region-major, so with crops the crop's image prefix stays cached; with words every call shares
     the whole image. With question_form "combined", a slot that would take a presence question and
     then a count question takes one presence-and-count question instead (countable findings only);
-    the call record keeps the raw pair, so a count rejected as contradictory stays visible."""
+    the call record keeps the raw pair, so a count rejected as contradictory stays visible. With
+    counting off no count question is asked at all: only the presence answers are filled in."""
     path = Path(image_path)
     calls: list[dict] = []
     findings = {c: {"presence": None, "whole_image": None, "count": None, "regions": None, "region_counts": None}
                 for c in CONDITIONS}
     scheme, regions = protocol.region_scheme, protocol.regions
     by_crop = protocol.region_prompt == "crop"
-    region_counts = protocol.count_level == "region"
-    combined = protocol.question_form == "combined"
+    region_counts = protocol.counts_per_region
+    combined = protocol.combined
 
     def ask(stage: str, condition: str, region: str | None, image, question: str):
         counting = stage in {"count", "region_count"}
@@ -864,7 +886,7 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
                                 count_question(condition, mode, named(region), scheme))
                 findings[condition]["region_counts"][region] = count
 
-    for condition in COUNTABLE:
+    for condition in COUNTABLE if protocol.counting else ():
         finding = findings[condition]
         if region_counts:
             counts = finding["region_counts"]
@@ -895,15 +917,15 @@ def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}; run the probe or set MODE to one of them")
     words = protocol.uses_regions and protocol.region_prompt == "words"
-    combined = protocol.question_form == "combined"
+    combined = protocol.combined
     config = {
         "mode": mode, "protocol": asdict(protocol), "labels": LABELS,
         "presence_question": PRESENCE_QUESTION,
         "region_presence_question": REGION_PRESENCE_QUESTION if words and protocol.presence_level == "region" else None,
         "region_phrases": ({r: region_phrase(r, protocol.region_scheme, patient_side=True if combined else None)
                             for r in protocol.regions} if words else None),
-        "count_questions": COUNT_QUESTIONS,
-        "count_templates": {c: t for c, (t, _) in COUNT_TEMPLATES.items()} if protocol.count_level == "region" else None,
+        "count_questions": COUNT_QUESTIONS if protocol.counting else None,
+        "count_templates": {c: t for c, (t, _) in COUNT_TEMPLATES.items()} if protocol.counts_per_region else None,
         "combined": ({"question": COMBINED_QUESTION, "context": COMBINED_CONTEXT, "definitions": DEFINITIONS,
                       "whole_scope": WHOLE_SCOPE, "crop_scope": CROP_SCOPE,
                       "scope_notes": {r: SCOPE_NOTES[r] for r in protocol.regions} if words else None}

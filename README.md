@@ -17,6 +17,7 @@ EXPERIMENTS = xp.build([
     {"name": "base"},
     {"name": "separate-questions", "question_form": "separate"},
     {"name": "whole-image-only", "presence_level": "overall", "count_level": "overall"},
+    {"name": "presence-only", "counting": False},
     {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
     {"name": "dentalgpt-local", "backend": "local"},
 ], shared=SHARED)
@@ -24,7 +25,7 @@ EXPERIMENTS = xp.build([
 
 Anything in `experiments.DEFAULTS` may vary per experiment: the backend (local
 DentalGPT through llama.cpp or a hosted model), the analyzer, adapter and
-reporter models, the five protocol knobs, the retry budgets, the location truth,
+reporter models, the six protocol knobs, the retry budgets, the location truth,
 the report language, and the local checkpoint, context size and image-token cap.
 A dictionary knob (`analyzer`, `adapter`, `reporter`) merges key by key, so
 changing the model keeps the provider and its request options; every other knob
@@ -43,8 +44,9 @@ scores every experiment and ranks them:
 
 * `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
   sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
-  rate, coverage, count MAE, exact region-set rate, calls per image. Each row is
-  scored against that experiment's own location truth.
+  rate, coverage, count MAE, exact region-set rate, presence-per-region F1,
+  calls per image. Each row is scored against that experiment's own location
+  truth.
 * `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
   on the same images against the first one - `paired_f1_delta`, checks corrected
   and worsened, newly unresolved, recorded calls and tokens.
@@ -112,10 +114,11 @@ experiment keeps it.
 
 ## Two levels
 
-`dental_pipeline.Protocol`, built from the five question knobs of an experiment, has:
+`dental_pipeline.Protocol`, built from the six question knobs of an experiment, has:
 
 | Knob | Values | Meaning |
 | --- | --- | --- |
+| `counting` | `True`, `False` | `False`: no count question of any kind. The model only decides presence, on the whole image and, with `presence_level="region"`, in every region, so a finding's result is its presence and its region set; `count_level` and `question_form` then have no effect and every question is the bare Figure 7 question on both backends (the manifest records no count wording). The evaluation keeps the presence tables, adds presence per region (`region_presence.csv`, see "Evaluation outputs") and leaves the count tables out, so a class with several boxes in one image or one region is scored once, as present. |
 | `presence_level` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: the same question for every finding in every region, region by region, independent of the whole-image answers (kept under `whole_image`). A finding is present when any region answers A and absent only when every region answers B; the region set is the regions that answer A. |
 | `count_level` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `presence_level="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
 | `region_scheme` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
@@ -143,7 +146,9 @@ region-finding pairs that answered A for a countable finding.
 The regional calls never depend on what the whole image answered, so an
 all-negative image needs 14, 70, 50 or 70 calls. With `region_prompt="words"`
 every call reuses the cached image prefix; with crops the loop is region-major,
-so each crop's prefix is built once.
+so each crop's prefix is built once. With `counting=False` there is no count
+call at all: 14 calls with `presence_level="overall"`, 14 + R x 14 with
+`"region"`, whatever the image holds and whichever backend answers.
 
 With `question_form="combined"` the count calls disappear. Rf = findings a
 region answered A for while the whole image did not (only `region / overall`
@@ -214,7 +219,7 @@ directory.
 | File | Role |
 | --- | --- |
 | `dental_pipeline.py` | prompts and region wording, answer extraction, crops, model runner, probe, `Protocol`, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. per-region counts and the side check, CSV/JSON export |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. presence per region, per-region counts and the side check, CSV/JSON export |
 | `dental_analysis.py` | offline regional changes, parse recovery, case breakdowns, and paired saved-run comparisons |
 | `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
@@ -383,12 +388,24 @@ what the regional pass recovered and what it cost in specificity),
 `counts.csv` (exact, within-1, MAE on true positives, and a strict MAE that
 scores misses as zero), `region_counts.csv` (the same per finding and region
 when `count_level="region"`; a region that answered B to presence counts as 0
-in the strict MAE), `regions.csv` (per-region TP, FP, TN, FN, exact-set match,
-Jaccard, unlocalized rate, `from_counts` for regions derived from counts, and
-`pred_all_regions_rate` next to `truth_all_regions_rate`), `per_image.csv`,
-and `evaluation.json` with a summary: the protocol, micro and macro F1,
-complete-case rate, mean false alarms per image, the whole-image micro numbers
-under `whole_image`, and, for the quadrant scheme, `side_agreement`.
+in the strict MAE), `region_presence.csv` (presence per finding and region:
+every region answer of every image, whatever the whole image said, against the
+regions the true boxes occupy, as TP, FP, TN, FN, unparseable, sensitivity,
+specificity, PPV and F1; one cell per region, so several boxes in a region are
+one presence and an unparseable region answer is one excluded cell; an image
+whose true boxes could not be placed is left out and counted under
+`location_truth_excluded`), `regions.csv` (per-region TP, FP, TN, FN, exact-set
+match, Jaccard, unlocalized rate, `from_counts` for regions derived from
+counts, and `pred_all_regions_rate` next to `truth_all_regions_rate`),
+`per_image.csv`, and `evaluation.json` with a summary: the protocol, micro and
+macro F1, complete-case rate, mean false alarms per image, the whole-image
+micro numbers under `whole_image`, the presence-per-region micro numbers under
+`region_presence` (the leaderboard's `region_f1`), and, for the quadrant
+scheme, `side_agreement`. Both count tables are absent from a `counting=False`
+run. `regions.csv` and `region_presence.csv` answer different questions: the
+first scores where a detected finding was placed (true positives only), the
+second whether each region was called correctly at all, absent findings
+included. Both need the location truth, so they follow `evaluate_location`.
 
 Two diagnostics decide whether word-based regions are being read:
 
@@ -480,7 +497,7 @@ changes still need their own experiment (their own name and directory).
 In notebook Cell 3, set `evaluate_location = True` (default) to score locations,
 or `False` to skip location scoring and location-truth adapter calls. Finding
 scores and total-count scores remain enabled; inference, counting questions,
-and saved predictions are unchanged. Regional-count metrics and the side check also follow this switch.
+and saved predictions are unchanged. Regional-count metrics, presence per region and the side check also follow this switch.
 Re-run Cell 3, Cell 9, and Cell 10 to evaluate existing results with this setting;
 no inference rerun is required.
 The report records `summary.evaluate_location`. Re-exporting a report with location
