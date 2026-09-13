@@ -291,7 +291,8 @@ def _tally(table: dict, truth: bool, answer: str | None) -> bool:
 
 
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
-             out_dir: str | Path | None = None, *, evaluate_location: bool = True) -> dict:
+             out_dir: str | Path | None = None, *, evaluate_location: bool = True,
+             include_analysis: bool = True) -> dict:
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
@@ -483,6 +484,9 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         summary["side_agreement"] = side_agreement(gt, results)
     report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
               "region_counts": region_counts, "regions": regions, "per_image": per_image, "missing_results": missing}
+    if include_analysis:
+        from dental_analysis import analyze
+        report.update(analyze({i: gt[i] for i in ids}, results, evaluate_location=evaluate_location))
     if out_dir:
         write_report(report, out_dir)
     return report
@@ -540,13 +544,15 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "whole_image", "counts", "region_counts", "regions", "per_image"):
+    for name in ("presence", "whole_image", "counts", "region_counts", "regions", "per_image",
+                 "stage_changes", "parse_recovery", "call_usage", "case_breakdown",
+                 "run_comparison", "run_changes"):
         rows = report.get(name) or []
         if not rows:
-            if name in ("regions", "region_counts"):
-                (out / f"{name}.csv").unlink(missing_ok=True)
+            (out / f"{name}.csv").unlink(missing_ok=True)
             continue
         with (out / f"{name}.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows({k: json.dumps(v) if isinstance(v, (dict, list)) else v
+                              for k, v in row.items()} for row in rows)

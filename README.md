@@ -161,11 +161,12 @@ directory.
 | --- | --- |
 | `dental_pipeline.py` | prompts and region wording, answer extraction, crops, model runner, probe, `Protocol`, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. per-region counts and the side check, CSV/JSON export |
+| `dental_analysis.py` | offline regional changes, parse recovery, case breakdowns, and paired saved-run comparisons |
 | `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
-| `main_notebook.ipynb` | Kaggle runner; edit Cell 3 only |
+| `main_notebook.ipynb` | Kaggle runner; configure generation in Cell 3, optional saved-run comparison in Cell 13 |
 | `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Runtime settings that matter
@@ -344,6 +345,59 @@ Two diagnostics decide whether word-based regions are being read:
   answered A in every region whenever the whole image was positive, i.e. it
   ignored the region clause; switch to `REGION_PROMPT="crop"` for that finding
   set.
+
+### Small ablation-style reports (Cell 13)
+
+Cell 13 also displays compact diagnostics and saves their full rows, including
+supporting image IDs, in `evaluation.json` and matching CSV files:
+
+* `stage_changes`: whole-image to regional outcomes, overall and per finding.
+  FN -> TP means a recovered miss; TN -> FP means a new false alarm. Reverse,
+  unchanged, and unresolved transitions are retained. Missing legacy whole-image
+  fields are skipped, not treated as negative predictions.
+* `parse_recovery`: first-pass, recovered, and unresolved **fields** of recorded
+  questions, by stage. Presence and count are separate, so an unusable count
+  does not hide a valid presence decision. Recovered answers are checked against
+  truth; parsing successfully does not imply correctness. Regional correctness
+  is unavailable when location scoring is off or a true box was excluded.
+* `call_usage`: recorded analyzer completions, tokens and latency, split into
+  first attempts and parse retries. Combined fields do not duplicate call costs.
+  Missing metadata is unavailable, with recorded-call denominators beside usage;
+  transport retry attempts are not stored as individual completions.
+* `case_breakdown`: one/multiple boxes for a finding, absent findings with/without
+  other annotated findings, 0/1-2/3+ finding types, and (when enabled) one/multiple
+  true regions, boundary-crossing boxes, and location-truth sources. Mixed and
+  excluded truth sources remain visible. These are descriptive groups, not
+  causal effects or severity grades. Counts/location use the evaluator's existing
+  true-positive subsets; empty denominators are unavailable.
+
+For an optional configuration comparison, edit this dictionary in **Cell 13**:
+
+```python
+COMPARE_RUN_DIRS = {
+    "baseline": "/kaggle/working/baseline_output",
+    "variant": "/kaggle/working/variant_output",
+}
+```
+
+These are output roots containing `<dataset>/manifest.json` and
+`<dataset>/results/`. Leave `{}` for current-run diagnostics only. The first
+entry is the reference. `run_comparison.csv` includes settings, coverage,
+accuracy/count/location metrics and recorded usage; `run_changes.csv` retains
+paired transitions and image IDs. Every run must cover the selected ground-truth
+images with matching image hashes and consistent saved protocol/mode. Extra
+unselected images are ignored; missing selected images stop the comparison.
+All runs are rescored against the same supplied ground truth, including the
+current location adaptation. Paired F1 uses only checks resolved by both runs;
+newly resolved/unresolved counts and full coverage are separate. Count and
+location metrics retain each run's true-positive subset, not a common paired
+subset. Different region schemes have different localization difficulty.
+
+Use the updated project files and rerun Cell 13 with ground truth and any needed
+location adaptation already loaded; these reports make no model calls. Saved
+attempts describe the executed questions, not a simulated retries-OFF run.
+Older runs without attempt metadata cannot produce recovery rows. Generation
+changes still need separately generated runs and fresh output directories.
 
 ## Caveats
 
