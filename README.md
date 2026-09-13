@@ -44,8 +44,9 @@ and ranks them:
 
 * `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
   sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
-  rate, coverage, not-assessed checks, count MAE, exact region-set rate, calls
-  per image. Each row is scored against that experiment's own location truth.
+  rate, coverage, not-assessed checks, count MAE, exact region-set rate,
+  presence-per-cell F1, calls per image. Each row is scored against that
+  experiment's own location truth.
 * `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
   on the same images against the first one - `paired_f1_delta`, checks corrected
   and worsened, newly unresolved, recorded calls and tokens.
@@ -83,7 +84,11 @@ cropped-panoramic training, and no JSON or tag format. So:
 * **Multiplicity** is the number of cells named (0 to 6), reported as
   "in N region(s)". The tooth-count question from the DentalGPT branch is kept
   behind `count_question` as an explicitly out-of-distribution
-  experiment.
+  experiment. That knob is the counting switch, and it is off by default: the
+  model is asked presence only, and the evaluation scores each finding as
+  present or absent per image and per cell (`region_presence.csv`), so a class
+  that occurs several times in an image or a cell is scored once. Only
+  `count_question=True` adds a count and the count tables.
 * **Findings without a DentVLM task** (furcation involvement, apical surgery,
   root resorption, orthodontic appliances, surgical plates) are not asked and
   are reported as "not assessed by this model". `ask_untrained`
@@ -124,7 +129,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 | File | Role |
 | --- | --- |
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics, side-convention check, CSV/JSON export |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell, side-convention check, CSV/JSON export |
 | `dental_analysis.py` | offline phrasing/vote and crop comparisons, recovery, case breakdowns, paired saved-run comparisons |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
@@ -359,12 +364,24 @@ each source placed.
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
 `trained_task` flag), `whole_image.csv` (the same table for the whole-image
 answers alone with `location="crops"`: read the two side by side to see what
-the cells recovered and what it cost in specificity), `regions.csv` (per-cell
-TP, FP, TN, FN, exact-set match,
-Jaccard, unlocalized rate), `counts.csv` (only when the count question was
-asked), `per_image.csv`, and `evaluation.json` with a summary: micro and macro
-F1, complete-case rate, mean false alarms per image, and the list of findings
-not assessed.
+the cells recovered and what it cost in specificity), `region_presence.csv`
+(presence per finding and cell: every cell of every asked image, whatever the
+whole image answered, against the cells the true boxes occupy, as TP, FP, TN,
+FN, unparseable, sensitivity, specificity, PPV and F1; one cell per image, so
+several boxes in a cell are one presence; with `location="rationale"` a named
+cell is the prediction and an unnamed cell counts as not predicted, with
+`"crops"` each cell's own answer counts and an unparseable one is an excluded
+cell; an image whose true boxes could not be placed is left out and counted
+under `location_truth_excluded`), `regions.csv` (per-cell TP, FP, TN, FN,
+exact-set match, Jaccard, unlocalized rate, over the localized true positives
+only), `counts.csv` (only when the count question was asked), `per_image.csv`,
+and `evaluation.json` with a summary: micro and macro F1, complete-case rate,
+mean false alarms per image, the presence-per-cell micro numbers under
+`region_presence` (the leaderboard's `region_f1`), and the list of findings not
+assessed. `regions.csv` and `region_presence.csv` answer different questions:
+the first scores where a detected finding was placed, the second whether each
+cell was called correctly at all, absent findings included. Both need the
+location truth, so they follow `evaluate_location`.
 
 ## Caveats
 
@@ -386,7 +403,7 @@ not assessed.
 In an experiment, set `evaluate_location = True` (default) to score locations,
 or `False` to skip location scoring and location-truth adapter calls. Finding
 scores and total-count scores remain enabled; inference, counting questions,
-and saved predictions are unchanged.
+and saved predictions are unchanged. Presence per cell follows this switch.
 Re-run Cell 3, Cell 10, and Cell 11 to evaluate existing results with this setting;
 no inference rerun is required. Cell 13 also skips its side check when disabled.
 The report records `summary.evaluate_location`. Re-exporting a report with location

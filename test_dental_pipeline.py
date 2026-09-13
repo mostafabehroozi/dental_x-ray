@@ -214,6 +214,19 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(regions["dental_filling"]["exact_set_match_rate"], 1.0)
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
         self.assertNotIn("carious_lesion", {r["condition"] for r in report["regions"] if r["n_localized_cases"]})
+        # Presence per cell: every cell of every asked image; a named cell is present, an unnamed one absent, and
+        # two filling boxes in one cell are one presence. Unasked findings and the unresolved implant image are out.
+        rp = {(r["condition"], r["region"]): r for r in report["region_presence"]}
+        self.assertEqual(len(rp), 9 * 6)
+        self.assertEqual((rp[("dental_filling", "upper-left")]["TP"], rp[("dental_filling", "upper-left")]["positives"],
+                          rp[("dental_filling", "upper-left")]["TN"]), (1, 1, 1))
+        self.assertEqual((rp[("impacted_tooth", "lower-right")]["TP"], rp[("impacted_tooth", "lower-left")]["FP"]), (1, 1))
+        self.assertEqual((rp[("prosthetic_restoration", "upper-anterior")]["FP"], rp[("carious_lesion", "upper-left")]["TN"]), (1, 2))
+        self.assertEqual((rp[("dental_implant", "upper-left")]["images"], rp[("dental_implant", "upper-left")]["unparseable"]), (1, 0))
+        self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
+                         {"TP": 2, "FP": 2, "TN": 98, "FN": 0, "unparseable": 0})
+        self.assertTrue((out / "evaluation" / "region_presence.csv").is_file())
+        self.assertEqual(ev.evaluate(gt, results, dataset="toy", evaluate_location=False)["region_presence"], [])
         summary = report["summary"]
         self.assertEqual(summary["images_scored"], 2)
         self.assertEqual(summary["complete_case_rate"], 1.0)
@@ -255,6 +268,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         script[("crop", "fillings", "upper-left")] = "Yes\nFillings are visible."
         script[("crop", "impacted_tooth", "lower-right")] = "Yes"
         script[("crop", "root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, recovered in a cell
+        script[("crop", "residual_root", "upper-anterior")] = "Yes and no."  # one unparseable cell
         runner = FakeRunner(script, cell_of)
         out = dp.run_dataset(runner, self.images, self.root / "run_crops", protocol=dp.Protocol(location="crops"))
         results = dp.load_results(out)
@@ -267,6 +281,9 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["whole_image"]), ("no", "yes"))
         self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]), ("no", None))
         self.assertEqual(results["img1"]["tasks"]["implant"]["presence"], "no")  # unparseable on the whole image only
+        self.assertIsNone(results["img1"]["findings"]["root_fragment"]["presence"])  # no yes, one unparseable cell
+        self.assertEqual((dp.cell_answers(results["img1"])["fillings"]["upper-left"],
+                          dp.cell_answers(results["img1"])["residual_root"]["upper-anterior"]), ("yes", None))
         # 13 whole-image calls + 6 cells x 13 tasks, for every image.
         self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (91, 91))
         self.assertTrue((out / "crops" / "img1_upper-left.png").is_file())
@@ -280,6 +297,43 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual((presence["dental_implant"]["unparseable"], whole["dental_implant"]["unparseable"]), (0, 1))
         self.assertEqual(report["summary"]["whole_image"]["FP"], 2)  # caries and the bridge
         self.assertTrue((out / "evaluation" / "whole_image.csv").is_file())
+        # Presence per cell reads each cell's own answer: the implant's six No cells count although the whole
+        # image was unparseable, and only the one unparseable residual-root cell is excluded.
+        rp = {(r["condition"], r["region"]): r for r in report["region_presence"]}
+        self.assertEqual((rp[("dental_filling", "upper-left")]["TP"], rp[("endodontic_treatment", "upper-right")]["FP"]), (1, 1))
+        self.assertEqual((rp[("dental_implant", "upper-left")]["TN"], rp[("dental_implant", "upper-left")]["images"]), (2, 2))
+        self.assertEqual((rp[("root_fragment", "upper-anterior")]["unparseable"], rp[("root_fragment", "upper-left")]["TN"]), (1, 2))
+        self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
+                         {"TP": 2, "FP": 1, "TN": 104, "FN": 0, "unparseable": 1})
+
+
+class PredictedCellsTests(unittest.TestCase):
+    def test_rationale_and_fallback(self):
+        finding = {"asked": True, "tasks": ["fillings"], "presence": "yes", "regions": ["upper-left"]}
+        result = {"location_level": "rationale", "findings": {"dental_filling": finding}, "calls": []}
+        self.assertEqual(ev.predicted_cells(result, "dental_filling"), {c: c == "upper-left" for c in dp.CELLS})
+        result["findings"]["dental_filling"] = {**finding, "presence": "no", "regions": None}
+        self.assertEqual(set(ev.predicted_cells(result, "dental_filling").values()), {False})
+        result["findings"]["dental_filling"] = {**finding, "presence": None, "regions": None}
+        self.assertIsNone(ev.predicted_cells(result, "dental_filling"))
+        result["findings"]["dental_filling"] = {**finding, "asked": False, "tasks": []}
+        self.assertIsNone(ev.predicted_cells(result, "dental_filling"))
+        self.assertIsNone(ev.predicted_cells({**result, "location_level": "none", "findings": {"dental_filling": finding}},
+                                             "dental_filling"))
+
+    def test_crops_merge_the_tasks_cell_by_cell(self):
+        def call(task, cell, text):
+            return {"stage": "crop", "task": task, "cell": cell, "text": text, "parse_recovery": {"value": dp.extract_answer(text)}}
+
+        calls = [call("prosthetic_crown", c, "Yes" if c == "upper-anterior" else "No") for c in dp.CELLS]
+        calls += [call("prosthetic_bridge", c, "Yes and no." if c == "lower-left" else "No") for c in dp.CELLS]
+        finding = {"asked": True, "tasks": ["prosthetic_crown", "prosthetic_bridge"], "presence": "yes", "regions": ["upper-anterior"]}
+        result = {"location_level": "crops", "findings": {"prosthetic_restoration": finding}, "calls": calls}
+        expected = {c: True if c == "upper-anterior" else None if c == "lower-left" else False for c in dp.CELLS}
+        self.assertEqual(ev.predicted_cells(result, "prosthetic_restoration"), expected)
+        # A result saved without its calls falls back to the finding's cell set.
+        self.assertEqual(ev.predicted_cells({**result, "calls": []}, "prosthetic_restoration"),
+                         {c: c == "upper-anterior" for c in dp.CELLS})
 
 
 class GeometryAndDentexTests(unittest.TestCase):

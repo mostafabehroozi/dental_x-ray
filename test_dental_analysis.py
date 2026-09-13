@@ -65,6 +65,10 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual((gt, results), before)
         self.assertEqual(report["summary"]["expected_finding_checks"], 9)
         self.assertEqual(len(report["summary"]["not_assessed"]), 5)
+        # Presence per cell: the filling's upper-left and the bridge's upper-right are hits, the filling's
+        # lower-right (named by one phrasing, union vote) a false cell.
+        self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "FN")}, {"TP": 2, "FP": 1, "FN": 0})
+        self.assertEqual(da.metrics(gt, report)["region_presence_f1"], 0.8)
 
     def test_phrasing_recovery_and_union_majority_use_saved_answers(self):
         gt, results = fixture()

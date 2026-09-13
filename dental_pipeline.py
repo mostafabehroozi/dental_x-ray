@@ -11,7 +11,9 @@ Communications 2026; arXiv 2509.23344) was trained and evaluated on:
   of the upper dentition", ...). Location is read from that rationale exactly
   as the authors' scorer does; nothing about location is ever asked in words.
 * Multiplicity is the number of distinct regions the model names (0-6). A
-  tooth-count question exists only as an explicitly out-of-distribution option.
+  tooth-count question exists only as an explicitly out-of-distribution option
+  (Protocol.count_question, off by default): without it the model only decides
+  presence, and a finding is scored per image and per cell as present or absent.
 * The crop comparison asks every task on each of the six cell crops, whatever
   the whole image answered (kept as a separate result), so a finding missed on
   the whole image can be recovered in a cell.
@@ -530,6 +532,17 @@ def _any_yes(answers) -> str | None:
     if "yes" in answers:
         return "yes"
     return "no" if all(a == "no" for a in answers) else None
+
+
+def cell_answers(result: dict) -> dict[str, dict[str, str | None]]:
+    """{task: {cell: yes/no/None}} from the saved crop calls (location "crops"): each cell's final answer."""
+    answers: dict[str, dict] = {}
+    for call in result.get("calls") or []:
+        if call.get("stage") == "crop" and call.get("cell"):
+            recovery = call.get("parse_recovery")
+            answer = recovery["value"] if recovery is not None else extract_answer(call["text"])
+            answers.setdefault(call["task"], {})[call["cell"]] = answer
+    return answers
 
 
 def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:

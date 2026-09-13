@@ -30,7 +30,8 @@ class LocationScoringTests(unittest.TestCase):
             out = Path(tmp)
             enabled = ev.evaluate(gt, results, out_dir=out)
             self.assertTrue(enabled["regions"])
-            self.assertTrue((out / "regions.csv").exists())
+            self.assertTrue(enabled["region_presence"] and enabled["summary"]["region_presence"]["TP"] == 1)
+            self.assertTrue((out / "regions.csv").exists() and (out / "region_presence.csv").exists())
             with patch.object(ev, "gt_regions", side_effect=AssertionError("Location scoring ran")), \
                  patch.object(ev, "location_truth_summary", side_effect=AssertionError("Truth lookup ran")):
                 disabled = ev.evaluate(gt, results, out_dir=out, evaluate_location=False)
@@ -39,6 +40,9 @@ class LocationScoringTests(unittest.TestCase):
             self.assertEqual(disabled["regions"], [])
             self.assertNotIn("side_agreement", disabled["summary"])
             self.assertFalse((out / "regions.csv").exists())
+            self.assertEqual(disabled["region_presence"], [])  # presence per cell needs the location truth
+            self.assertNotIn("region_presence", disabled["summary"])
+            self.assertFalse((out / "region_presence.csv").exists())
             for key in ("presence", "whole_image", "counts", "per_image"):
                 self.assertEqual(enabled[key], disabled[key])
             self.assertEqual(results, original)

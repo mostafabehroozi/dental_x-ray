@@ -251,13 +251,14 @@ class RecoveryTests(unittest.TestCase):
 
     @unittest.skipUnless(DENTVLM, "DentVLM crop protocol")
     def test_crop_exhaustion_is_neutral_in_report_as_well(self):
-        import report_writer
         n_tasks = len(protocol().tasks())
         result, _, _, _ = self.run_image(
             ["No"] * n_tasks + [("Yes\nunfinished", "length")] * 2, location="crops")
         self.assertIsNone(result["findings"]["dental_implant"]["presence"])
-        cells = report_writer._cell_answers(result)
+        cells = dp.cell_answers(result)
         self.assertIsNone(cells["implant"][dp.CELLS[0]])
+        self.assertIsNone(ev.predicted_cells(result, "dental_implant")[dp.CELLS[0]])
+        self.assertFalse(ev.predicted_cells(result, "dental_implant")[dp.CELLS[1]])
         self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)
 
     @unittest.skipUnless(DENTVLM, "DentVLM optional count protocol")

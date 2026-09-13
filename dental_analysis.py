@@ -58,6 +58,7 @@ def metrics(gt, report):
             row[table + "_" + metric] = ev._ratio(
                 sum(r[metric] * r[weight] for r in usable), sum(r[weight] for r in usable))
     row["regions_excluded"] = sum(r["excluded_location_checks"] for r in report["regions"])
+    row["region_presence_f1"] = (summary.get("region_presence") or {}).get("f1")  # None without cells or location
     return row
 
 

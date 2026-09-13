@@ -3,10 +3,12 @@
 Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
 Metrics stay simple: image-level TP/FP/TN/FN per finding (and the same table
 for the whole-image answers alone in the crop comparison, to show what the
-cells recovered and what it cost), cell-level TP/FP/TN/FN for the six
-dental-arch regions DentVLM names, count agreement when the optional count
-question was asked, and two per-image numbers a dentist cares about
-(complete-case rate, false alarms).
+cells recovered and what it cost), presence per cell (every cell of every
+image, present or absent, against the cells the true boxes occupy, so a finding
+class is scored once per cell rather than counted), cell-level TP/FP/TN/FN for
+the localized true positives, count agreement when the optional count question
+was asked, and two per-image numbers a dentist cares about (complete-case rate,
+false alarms).
 
 Findings the model was not asked about are listed as not assessed and skipped.
 Unparseable answers are excluded from the per-finding confusion tables and
@@ -25,8 +27,8 @@ import csv
 import json
 from pathlib import Path
 
-from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, COUNTABLE, LEFT_IS_IMAGE_LEFT, TRAINED, fdi_unit,
-                             unit_cell, units_to_cells)
+from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, COUNTABLE, LEFT_IS_IMAGE_LEFT, TRAINED, cell_answers,
+                             fdi_unit, unit_cell, units_to_cells)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -227,6 +229,36 @@ def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Reading saved results
+# ----------------------------------------------------------------------------
+def predicted_cells(result: dict, condition: str) -> dict[str, bool | None] | None:
+    """{cell: True | False | None (unparseable)} for one finding, or None when no location was asked, the
+    finding was not asked, or (rationale) its whole-image answer was unparseable.
+
+    Rationale: the cells the model named are the prediction and every other cell counts as not predicted,
+    the same reading as regions.csv (a cell the rationale did not name is not evidence of absence there).
+    Crops: each cell's own answer, merged over the finding's tasks (any yes, all no, else unparseable);
+    a result saved without its calls or task list falls back to the finding's cell set.
+    """
+    finding = result["findings"][condition]
+    level = result.get("location_level", "none")
+    if not finding["asked"] or level == "none":
+        return None
+    if level == "crops":
+        answers, tasks = cell_answers(result), finding.get("tasks") or []
+        if tasks and all(task in answers for task in tasks):
+            cells = {}
+            for cell in CELLS:
+                votes = [answers[task].get(cell) for task in tasks]
+                cells[cell] = True if "yes" in votes else False if all(v == "no" for v in votes) else None
+            return cells
+    if finding["presence"] is None:
+        return None
+    named = set(finding["regions"] or [])
+    return {cell: cell in named for cell in CELLS}
+
+
+# ----------------------------------------------------------------------------
 # Metrics
 # ----------------------------------------------------------------------------
 def _ratio(a: float, b: float):
@@ -259,7 +291,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, whole_image, counts, regions, per_image, not_assessed = [], [], [], [], [], []
+    presence, whole_image, counts, region_presence, regions, per_image, not_assessed = [], [], [], [], [], [], []
     level = next((results[i]["location_level"] for i in ids), "none")
     count_asked = any(results[i].get("protocol", {}).get("count_question") for i in ids)
     # The whole-image answers are a separate result only in the crop comparison.
@@ -280,6 +312,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = 0
         region_unparseable = location_truth_excluded = 0
         jaccard_sum = 0.0
+        rp = {name: {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0, "positives": 0} for name in CELLS}
+        rp_excluded = 0
         for image_id in asked:
             boxes = [b for b in gt[image_id]["boxes"] if b["condition"] == condition]
             truth = len(boxes) > 0
@@ -287,6 +321,19 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             finding = results[image_id]["findings"][condition]
             if whole_image_kept:
                 _tally(whole, truth, finding["whole_image"])
+            if evaluate_location and level != "none":
+                # Presence per cell: every cell of every image, whatever the whole image said, against the cells
+                # the true boxes occupy (none when the finding is absent). One cell per image, so several boxes in
+                # one cell are one presence, and an unparseable cell answer is one excluded cell.
+                pred_map = predicted_cells(results[image_id], condition)
+                placed = [b for b in boxes if not b.get("location_excluded")]
+                if pred_map is not None and boxes and not placed:
+                    rp_excluded += 1
+                elif pred_map is not None:
+                    truth_regions = gt_regions(placed)
+                    for name, hit in pred_map.items():
+                        rp[name]["positives"] += name in truth_regions
+                        _tally(rp[name], name in truth_regions, None if hit is None else "yes" if hit else "no")
             if not _tally(table, truth, finding["presence"]):
                 continue
             positive = finding["presence"] == "yes"
@@ -335,6 +382,19 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         presence.append({**row, **table, **_prf(table["TP"], table["FP"], table["TN"], table["FN"])})
         if whole_image_kept:
             whole_image.append({**row, **whole, **_prf(whole["TP"], whole["FP"], whole["TN"], whole["FN"])})
+        if evaluate_location and level != "none":
+            for name in CELLS:
+                cell = rp[name]
+                scored = cell["TP"] + cell["FP"] + cell["TN"] + cell["FN"]
+                if not scored and not cell["unparseable"] and not rp_excluded:
+                    continue  # every image of this finding was unresolved before any cell could be read
+                region_presence.append({
+                    "dataset": dataset, "condition": condition, "region": name, "level": level,
+                    "images": scored + cell["unparseable"], "positives": cell["positives"],
+                    **{k: cell[k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
+                    **_prf(cell["TP"], cell["FP"], cell["TN"], cell["FN"]),
+                    "location_truth_excluded": rp_excluded,
+                })
         if count_asked and condition in COUNTABLE:
             counts.append({
                 "dataset": dataset, "condition": condition, "n_scored": n_count,
@@ -402,8 +462,13 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     if whole_image:
         micro_whole = {k: sum(r[k] for r in whole_image) for k in ("TP", "FP", "TN", "FN")}
         summary["whole_image"] = {**micro_whole, **_prf(*(micro_whole[k] for k in ("TP", "FP", "TN", "FN")))}
+    if region_presence:
+        micro_cells = {k: sum(r[k] for r in region_presence) for k in ("TP", "FP", "TN", "FN")}
+        summary["region_presence"] = {**micro_cells, **_prf(*(micro_cells[k] for k in ("TP", "FP", "TN", "FN"))),
+                                      "unparseable": sum(r["unparseable"] for r in region_presence)}
     report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
-              "regions": regions, "per_image": per_image, "missing_results": missing}
+              "region_presence": region_presence, "regions": regions, "per_image": per_image,
+              "missing_results": missing}
     if include_analysis:
         from dental_analysis import analyze
         report.update(analyze({i: gt[i] for i in ids}, results, evaluate_location=evaluate_location))
@@ -459,7 +524,7 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "whole_image", "counts", "regions", "per_image", "stage_changes",
+    for name in ("presence", "whole_image", "counts", "region_presence", "regions", "per_image", "stage_changes",
                  "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage",
                  "case_breakdown", "run_comparison", "run_changes"):
         rows = report.get(name) or []

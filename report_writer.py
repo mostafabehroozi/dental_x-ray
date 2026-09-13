@@ -164,17 +164,6 @@ def method_text(result: dict) -> str:
     return "; ".join(parts)
 
 
-def _cell_answers(result: dict) -> dict[str, dict[str, str | None]]:
-    """{task: {cell: yes/no/None}} from the saved crop calls (location_level 'crops' only)."""
-    answers: dict[str, dict] = {}
-    for call in result.get("calls") or []:
-        if call.get("stage") == "crop" and call.get("cell"):
-            recovery = call.get("parse_recovery")
-            answer = recovery["value"] if recovery is not None else dp.extract_answer(call["text"])
-            answers.setdefault(call["task"], {})[call["cell"]] = answer
-    return answers
-
-
 def _task_entry(key: str, task: dict, flag: bool, model_text: str | None) -> dict:
     answers = task.get("answers") or []
     entry = {
@@ -282,7 +271,7 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
     """One dense JSON for the report model: every finding, task, cell and count with an explicit status."""
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
-    cell_answers = _cell_answers(result) if level == "crops" else {}
+    cell_answers = dp.cell_answers(result) if level == "crops" else {}  # the evaluator reads the same answers
     findings = [_entry(i, result, cell_answers, flag, include_rationale) for i in IDENTIFIERS]
     status = {f["finding"]: f["status"] for f in findings}
     order = PATHOLOGY + TREATMENT
