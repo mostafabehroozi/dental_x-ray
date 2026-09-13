@@ -403,10 +403,12 @@ class VisionRunner:
         cache_prompt: bool = True,
         request_options: dict | None = None,
         token_param: str = "max_tokens",
+        api_call_retries: int = 2,
         client=None,
     ) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        llm_api.validate_api_retries(api_call_retries)
         self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.model = model
         self.max_tokens = max_tokens
@@ -415,11 +417,12 @@ class VisionRunner:
         self.local = local
         self.cache_prompt = cache_prompt
         self.request_options = dict(request_options or {})
+        self.api_call_retries = api_call_retries
         self.calls = 0
 
     @classmethod
     def from_api(cls, spec: dict, max_tokens: int = 4096, temperature: float | None = 0.0,
-                 timeout: float = 600.0, client=None) -> "VisionRunner":
+                 timeout: float = 600.0, api_call_retries: int = 2, client=None) -> "VisionRunner":
         """Runner for a hosted model. spec = {"provider", "model", ...} as documented in llm_api.
 
         A "temperature" or "token_param" in the spec wins over the arguments, so the spec of a
@@ -429,13 +432,15 @@ class VisionRunner:
         return cls(base_url=base_url, api_key=api_key, model=spec["model"], max_tokens=max_tokens,
                    temperature=spec.get("temperature", temperature), timeout=timeout, local=False,
                    cache_prompt=False, request_options=spec.get("request_options"),
-                   token_param=spec.get("token_param", "max_tokens"), client=client)
+                   token_param=spec.get("token_param", "max_tokens"),
+                   api_call_retries=spec.get("api_call_retries", api_call_retries), client=client)
 
     def settings(self) -> dict:
         return {
             "model": self.model, "max_tokens": self.max_tokens, "token_param": self.token_param,
             "temperature": self.temperature, "local": self.local, "cache_prompt": self.cache_prompt,
             "request_options": self.request_options,
+            "api_call_retries": self.api_call_retries,
         }
 
     def ask(self, image: str | Path | bytes, question: str) -> dict:
@@ -455,18 +460,11 @@ class VisionRunner:
             request["extra_body"] = {"cache_prompt": self.cache_prompt, "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
         started = time.perf_counter()
-        response = self.client.chat.completions.create(**request)
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
+        normalized = llm_api.call_with_retries(
+            lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)), self.api_call_retries,
+            f"analyzer model={self.model}")
         self.calls += 1
-        result = {
-            "text": (choice.message.content or "").strip(),
-            "finish_reason": choice.finish_reason,
-            "truncated": choice.finish_reason == "length",
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "latency_seconds": round(time.perf_counter() - started, 3),
-        }
+        result = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
         print(f"call {self.calls} | {result['latency_seconds']}s | prompt_tokens={result['prompt_tokens']} "
               f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
         return result
@@ -485,8 +483,10 @@ class Protocol:
     count_question: bool = False  # out-of-distribution tooth-count question for positive countables
     ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
     extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
+    parse_retries: int = 0        # extra attempts per failed question; notebook defaults to 1
 
     def __post_init__(self) -> None:
+        llm_api.validate_parse_retries(self.parse_retries)
         if not 1 <= self.phrasings <= MAX_PHRASINGS:
             raise ValueError(f"phrasings must be between 1 and {MAX_PHRASINGS}")
         if self.region_vote not in REGION_VOTES:
@@ -557,15 +557,38 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
     path = Path(image_path)
     calls: list[dict] = []
     tasks: dict[str, dict] = {}
+    aggregation_warnings: list[dict] = []
+
+    def ask(stage, task, cell, image, question):
+        counting = stage == "count"
+        extract = extract_count if counting else extract_answer
+        hint = ("Return only the whole-number count in digits." if counting else
+                "Start your reply with exactly Yes or No on the first line, choosing one. "
+                "Then give your brief rationale and location as requested.")
+
+        def parse(reply):
+            # A cut-off rationale can contain incomplete locations even if line 1 is readable.
+            value = None if reply.get("truncated") else extract(reply["text"])
+            return value, None if value is not None else "missing_count" if counting else "missing_or_ambiguous_decision"
+
+        return llm_api.ask_parsed(
+            runner, image, question, parse=parse, retries=protocol.parse_retries,
+            context=f"image={path.name} | task={task} | stage={stage} | cell={cell or 'whole'}",
+            record=lambda q, r: _record(calls, stage, task, cell, q, r),
+            fallback=lambda _: question + "\n\n" + hint)
 
     for task in protocol.tasks():
         answers = []
         for question in questions_for(task)[:protocol.phrasings]:
-            reply = runner.ask(path, question)
-            _record(calls, "presence", task, None, question, reply)
-            answers.append({"answer": extract_answer(reply["text"]), "regions": extract_regions(reply["text"]),
+            answer, reply = ask("presence", task, None, path, question)
+            answers.append({"answer": answer, "regions": extract_regions(reply["text"]) if answer is not None else [],
                             "truncated": reply["truncated"]})
         tasks[task] = {"name": task_name(task), "answers": answers, **vote(answers, protocol.region_vote)}
+        parsed_answers = [a["answer"] for a in answers if a["answer"] is not None]
+        if parsed_answers and tasks[task]["presence"] is None:
+            warning = {"kind": "phrasing_tie", "task": task, "answers": parsed_answers, "policy": "neutral"}
+            aggregation_warnings.append(warning)
+            llm_api.monitor("AGGREGATION WARNING", f"task={task}", reason="phrasing tie", policy="neutral")
         tasks[task]["whole_image"] = tasks[task]["presence"]
 
     if protocol.location == "crops":
@@ -577,9 +600,8 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
         for cell, png in crops.items():  # cell-major order keeps the image prefix cached
             for task in tasks:
                 question = questions_for(task)[0]
-                reply = runner.ask(png, question)
-                _record(calls, "crop", task, cell, question, reply)
-                cell_answers[task][cell] = extract_answer(reply["text"])
+                answer, _ = ask("crop", task, cell, png, question)
+                cell_answers[task][cell] = answer
         for task, answers in cell_answers.items():
             presence = tasks[task]["presence"] = _any_yes(answers.values())
             tasks[task]["regions"] = [c for c in CELLS if answers[c] == "yes"] if presence == "yes" else None
@@ -588,13 +610,19 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
             tasks[task]["regions"] = None
 
     findings = {c: _finding(c, tasks, protocol) for c in CONDITIONS}
+    for condition, finding in findings.items():
+        decisions = [tasks[k]["presence"] for k in finding["tasks"] if tasks[k]["presence"] is not None]
+        if "yes" in decisions and "no" in decisions:
+            warning = {"kind": "task_conflict", "condition": condition, "answers": decisions,
+                       "policy": "existing any-yes aggregation"}
+            aggregation_warnings.append(warning)
+            llm_api.monitor("AGGREGATION WARNING", f"condition={condition}", reason="task conflict",
+                            policy="any-yes")
     if protocol.count_question:
         for condition in COUNTABLE:
             if findings[condition]["presence"] == "yes":
                 question = COUNT_QUESTIONS[condition]
-                reply = runner.ask(path, question)
-                _record(calls, "count", condition, None, question, reply)
-                findings[condition]["count"] = extract_count(reply["text"])
+                findings[condition]["count"], _ = ask("count", condition, None, path, question)
 
     return {
         "image": str(path.resolve()),
@@ -606,6 +634,8 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
         "findings": findings,
         "calls": calls,
         "call_count": len(calls),
+        "parse_recovery": llm_api.parse_recovery_summary(calls),
+        "aggregation_warnings": aggregation_warnings,
     }
 
 
@@ -620,6 +650,7 @@ def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | Non
         # geometry, so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
         "cell_windows": CELL_WINDOWS if protocol.location == "crops" else None,
         "runner": runner_settings, "provenance": provenance or {},
+        "parse_recovery_version": 1,
     }
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
@@ -644,6 +675,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
     for index, (image_id, path) in enumerate(todo, start=1):
         target = results_dir / f"{image_id}.json"
         if resume and target.is_file():
+            _load_result_file(target, image_id)
             continue
         print(f"[{index}/{len(todo)}] {image_id}")
         result = analyze_image(runner, path, protocol=protocol, crop_dir=out / "crops")
@@ -654,11 +686,31 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
     return out
 
 
+def _load_result_file(path: Path, expected_id: str | None = None) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        llm_api.monitor("ARTIFACT ERROR", str(path), reason=str(exc))
+        raise ValueError(f"invalid result artifact {path}: {exc}") from exc
+    image_id = payload.get("image_id") if isinstance(payload, dict) else None
+    if not isinstance(image_id, str) or not image_id:
+        raise llm_api.artifact_error(path, "missing non-empty image_id")
+    if image_id != path.stem or (expected_id is not None and image_id != expected_id):
+        raise llm_api.artifact_error(path, f"image_id {image_id!r} does not match filename/expected id")
+    findings = payload.get("findings")
+    if not isinstance(findings, dict) or any(c not in findings for c in CONDITIONS):
+        raise llm_api.artifact_error(path, "incomplete findings schema")
+    return payload
+
+
 def load_results(out_dir: str | Path) -> dict[str, dict]:
     results = {}
     for path in sorted(Path(out_dir, "results").glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        results[payload.get("image_id", path.stem)] = payload
+        payload = _load_result_file(path)
+        image_id = payload["image_id"]
+        if image_id in results:
+            raise llm_api.artifact_error(path, f"duplicate result image_id {image_id!r}")
+        results[image_id] = payload
     return results
 
 

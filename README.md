@@ -37,10 +37,26 @@ cropped-panoramic training, and no JSON or tag format. So:
   zero-shot accuracy on untrained diseases is 52-64%.
 * **Prosthetic restoration** (crowns or bridges in the benchmark) is the OR of
   the prosthetic crown and prosthetic bridge tasks, regions merged.
-* **No JSON, no region wording, no paraphrase retries, no forced zeros.** One
-  greedy call per question. Unparseable answers are recorded as such and
-  excluded from the per-finding TP/FP/TN/FN tables, never converted into a
-  negative there. The per-image complete-case rate and recall are strict.
+* **Bounded parse recovery.** The notebook sets `PARSE_RETRIES = 1`: one extra
+  attempt per unparseable answer, on the same image/model with a reminder to put
+  Yes/No on line 1 and retain the rationale/location. Optional counts use an
+  integer-only reminder. Every failed attempt prints the full prompt and response;
+  all attempts and the recovery summary are saved. Truncated replies are unresolved.
+  Retries repair individual phrasings, not votes: valid but conflicting phrasings
+  still follow the existing vote rule. Exhausted results remain `None`, never
+  forced negatives. TP/FP/TN/FN and per-image recall exclude unresolved findings;
+  complete-case rate excludes images with unresolved findings. Unasked classes
+  remain `not_assessed` and are outside the expected checks.
+  `expected_finding_checks = scored_finding_checks + excluded_unparseable_checks`.
+  This means confusion-table totals can still differ when final coverage differs.
+  The recovery policy is hashed into the manifest; use a new output directory
+  after changing it. Direct Python `Protocol()` keeps retries off unless specified.
+* **Visible failure control.** `API_CALL_RETRIES` retries transient API failures without hidden SDK
+  retries. `LOCATION_PARSE_RETRIES` controls location-format retries and
+  `LOCATION_FAILURE_POLICY` selects `geometry`, `exclude`, or `error`. Failure-only console blocks
+  print the full prompt and response; saved JSON keeps every attempt. Valid vote ties and task
+  conflicts are saved as aggregation warnings. Invalid resumed artifacts stop with `ARTIFACT ERROR`.
+  Use a new `OUTPUT_DIR` after changing any hashed control.
 
 Left and right follow the model's own convention (Supplementary Table S6): its
 "left posterior region" is FDI quadrants 1 and 4, the patient's right, which is
@@ -209,9 +225,8 @@ Methods 4.2), and `LOCATION_TRUTH` in Cell 3 picks how this project does it:
   finest division the six cells are made of, so the mapping onto cells is
   deterministic (`dental_pipeline.unit_cell`) and follows the same
   `LEFT_IS_IMAGE_LEFT` reading as the model's own words. One call per image
-  (chunked above `max_boxes_per_call` boxes), strict JSON back, one retry when
-  the reply is incomplete, and a box the model cannot place falls back to the
-  windows. The model is the `ADAPTER` role in Cell 3 (see "Hosted models");
+  (chunked above `max_boxes_per_call` boxes), strict JSON back, with bounded
+  retries and the configured location failure policy. The model is the `ADAPTER` role in Cell 3 (see "Hosted models");
   for reasoning models set `token_param` to `max_completion_tokens` and leave
   `temperature` at `None`.
 * `"fdm"` (experimental): DentVLM itself. It has no question about a marked

@@ -169,7 +169,9 @@ def _cell_answers(result: dict) -> dict[str, dict[str, str | None]]:
     answers: dict[str, dict] = {}
     for call in result.get("calls") or []:
         if call.get("stage") == "crop" and call.get("cell"):
-            answers.setdefault(call["task"], {})[call["cell"]] = dp.extract_answer(call["text"])
+            recovery = call.get("parse_recovery")
+            answer = recovery["value"] if recovery is not None else dp.extract_answer(call["text"])
+            answers.setdefault(call["task"], {})[call["cell"]] = answer
     return answers
 
 
@@ -211,6 +213,8 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
     texts = {}
     if include_rationale:
         for call in result.get("calls") or []:
+            if call.get("parse_recovery", {}).get("error"):
+                continue
             if call.get("stage") == "presence" and call.get("task") in keys and call["task"] not in texts:
                 texts[call["task"]] = (call.get("text") or "")[:600]
     tasks = [_task_entry(k, tasks_out[k], flag, texts.get(k) if include_rationale else None) for k in keys if k in tasks_out]
@@ -525,21 +529,23 @@ class ReportWriter:
 
     kind = "report"
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "request_options", "language", "repairs",
-               "include_rationale")
+               "include_rationale", "api_call_retries")
 
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = 0.0, language: str = "English",
                  repairs: int = 1, include_rationale: bool = False, timeout: float = 600.0,
-                 request_options: dict | None = None, client=None) -> None:
+                 request_options: dict | None = None, api_call_retries: int = 2, client=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         if not isinstance(language, str) or not language.strip():
             raise ValueError("language must be a non-empty string, e.g. 'English' or 'Persian'")
+        llm_api.validate_api_retries(api_call_retries)
         self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.base_url, self.model = base_url, model
         self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
         self.language, self.repairs, self.include_rationale = language.strip(), max(0, int(repairs)), bool(include_rationale)
         self.request_options = dict(request_options or {})
+        self.api_call_retries = api_call_retries
         self.calls = 0
 
     @classmethod
@@ -566,6 +572,7 @@ class ReportWriter:
         return {"kind": self.kind, "model": self.model, "base_url": self.base_url, "token_param": self.token_param,
                 "max_output_tokens": self.max_output_tokens, "temperature": self.temperature, "language": self.language,
                 "repairs": self.repairs, "include_rationale": self.include_rationale,
+                "api_call_retries": self.api_call_retries,
                 "request_options": self.request_options, "schema": SCHEMA,
                 "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT, "output_schema": OUTPUT_SCHEMA,
                 "repair_prompt": REPAIR_PROMPT}
@@ -580,18 +587,11 @@ class ReportWriter:
                    **llm_api.generation_fields(self.token_param, self.max_output_tokens, self.temperature)}
         request.update(self.request_options)
         started = time.perf_counter()
-        response = self.client.chat.completions.create(**request)
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
+        normalized = llm_api.call_with_retries(
+            lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)),
+            self.api_call_retries, f"report model={self.model}")
         self.calls += 1
-        content = choice.message.content or ""
-        reply = {
-            "text": content if isinstance(content, str) else str(content),
-            "finish_reason": choice.finish_reason, "truncated": choice.finish_reason == "length",
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "latency_seconds": round(time.perf_counter() - started, 3),
-        }
+        reply = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
         print(f"report call {self.calls} | {reply['latency_seconds']}s | prompt_tokens={reply['prompt_tokens']} "
               f"| completion_tokens={reply['completion_tokens']} | finish={reply['finish_reason']}")
         return reply
@@ -611,9 +611,16 @@ class ReportWriter:
             attempts.append({**reply, "problems": problems})
             if not problems:
                 break
+            llm_api.monitor("REPORT VERIFY WARNING", f"image={structured['image']['id']}",
+                            attempt=f"{_attempt + 1}/{self.repairs + 1}", problems=len(problems))
+            llm_api.failure_details(json.dumps(messages, ensure_ascii=False, indent=2), reply["text"], problems)
+            if _attempt < self.repairs:
+                llm_api.monitor("REPORT RETRY", f"image={structured['image']['id']}", action="verification repair")
             messages += [{"role": "assistant", "content": reply["text"]},
                          {"role": "user", "content": REPAIR_PROMPT.replace("{problems}", "\n".join(f"- {p}" for p in problems))}]
         verified = not problems
+        if not verified:
+            llm_api.monitor("REPORT FALLBACK", f"image={structured['image']['id']}", policy="deterministic summary")
         return {
             "image_id": structured["image"]["id"], "image": result["image"], "schema": SCHEMA,
             "language": self.language, "writer": self.public(), "analyzer": structured["analysis"]["analyzer"],
@@ -647,6 +654,7 @@ def report_dataset(writer: ReportWriter, results: dict[str, dict], out_dir: str 
     for index, (image_id, result) in enumerate(todo, start=1):
         target = reports_dir / f"{image_id}.json"
         if resume and target.is_file():
+            _load_report_file(target, image_id)
             continue
         print(f"[{index}/{len(todo)}] {image_id}")
         payload = writer.write(result, analyzer)
@@ -658,11 +666,27 @@ def report_dataset(writer: ReportWriter, results: dict[str, dict], out_dir: str 
     return load_reports(out)
 
 
+def _load_report_file(path: Path, expected_id: str | None = None) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        llm_api.monitor("ARTIFACT ERROR", str(path), reason=str(exc))
+        raise ValueError(f"invalid report artifact {path}: {exc}") from exc
+    image_id = payload.get("image_id") if isinstance(payload, dict) else None
+    if not isinstance(image_id, str) or image_id != path.stem or (expected_id and image_id != expected_id):
+        raise llm_api.artifact_error(path, "report image_id does not match filename/expected id")
+    if not isinstance(payload.get("verified"), bool) or not isinstance(payload.get("attempts"), list):
+        raise llm_api.artifact_error(path, "report missing verified/attempts schema")
+    return payload
+
+
 def load_reports(out_dir: str | Path) -> dict[str, dict]:
     reports = {}
     for path in sorted(Path(out_dir, "reports").glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        reports[payload.get("image_id", path.stem)] = payload
+        payload = _load_report_file(path)
+        if payload["image_id"] in reports:
+            raise llm_api.artifact_error(path, f"duplicate report image_id {payload['image_id']!r}")
+        reports[payload["image_id"]] = payload
     return reports
 
 
