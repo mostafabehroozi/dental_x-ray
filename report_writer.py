@@ -34,6 +34,7 @@ from pathlib import Path
 
 import dental_pipeline as dp
 import llm_api
+import run_monitor as mon
 
 SCHEMA = "dentvlm-findings/1"
 
@@ -523,7 +524,8 @@ class ReportWriter:
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = 0.0, language: str = "English",
                  repairs: int = 1, include_rationale: bool = False, timeout: float = 600.0,
-                 request_options: dict | None = None, api_call_retries: int = 2, client=None) -> None:
+                 request_options: dict | None = None, api_call_retries: int = 2,
+                 call_log: str | None = None, client=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         if not isinstance(language, str) or not language.strip():
@@ -535,7 +537,7 @@ class ReportWriter:
         self.language, self.repairs, self.include_rationale = language.strip(), max(0, int(repairs)), bool(include_rationale)
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
-        self.calls = 0
+        self.call_log = mon.CallLog("report", call_log)
 
     @classmethod
     def from_api(cls, spec: dict, language: str | None = None, timeout: float = 600.0, client=None) -> "ReportWriter":
@@ -546,6 +548,10 @@ class ReportWriter:
         if language is not None:
             options["language"] = language
         return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
+
+    @property
+    def calls(self) -> int:
+        return self.call_log.calls
 
     @property
     def name(self) -> str:
@@ -579,11 +585,7 @@ class ReportWriter:
         normalized = llm_api.call_with_retries(
             lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)),
             self.api_call_retries, f"report model={self.model}")
-        self.calls += 1
-        reply = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
-        print(f"report call {self.calls} | {reply['latency_seconds']}s | prompt_tokens={reply['prompt_tokens']} "
-              f"| completion_tokens={reply['completion_tokens']} | finish={reply['finish_reason']}")
-        return reply
+        return self.call_log.live({**normalized, "latency_seconds": round(time.perf_counter() - started, 3)})
 
     def write(self, result: dict, analyzer: str | None = None) -> dict:
         """One image result -> {"structured", "report", "verified", "problems", "markdown", "attempts", ...}."""
@@ -624,8 +626,14 @@ class ReportWriter:
 # Dataset loop with resume, loading, summary
 # ----------------------------------------------------------------------------
 def report_dataset(writer: ReportWriter, results: dict[str, dict], out_dir: str | Path, analyzer: str | None = None,
-                   resume: bool = True, limit: int | None = None) -> dict[str, dict]:
-    """Write a report for every result, one JSON and one .md per image under out_dir/reports; resumable."""
+                   resume: bool = True, limit: int | None = None, ledger: "mon.Ledger | None" = None,
+                   stop_after: int = 3) -> dict[str, dict]:
+    """Write a report for every result, one JSON and one .md per image under out_dir/reports; resumable.
+
+    An image whose report call fails is recorded with its complete traceback and the
+    loop continues, so one refused or unreachable request does not cost the rest of
+    the reports; `stop_after` consecutive failures stop the loop.
+    """
     out = Path(out_dir)
     reports_dir = out / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -640,18 +648,37 @@ def report_dataset(writer: ReportWriter, results: dict[str, dict], out_dir: str 
         manifest_path.write_text(json.dumps(config, indent=2, default=list), encoding="utf-8")
 
     todo = sorted(results.items())[:limit] if limit else sorted(results.items())
-    for index, (image_id, result) in enumerate(todo, start=1):
+    failures = mon.Ledger(f"reports {out.name}")
+    progress = mon.Progress(len(todo), label=f"reports {writer.run_name}", unit="report")
+    for image_id, result in todo:
         target = reports_dir / f"{image_id}.json"
         if resume and target.is_file():
-            _load_report_file(target, image_id)
+            _load_report_file(target, image_id)  # a corrupt or foreign artifact stops the loop
+            progress.skip(image_id)
             continue
-        print(f"[{index}/{len(todo)}] {image_id}")
-        payload = writer.write(result, analyzer)
-        payload["image_id"] = image_id
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)
-        (reports_dir / f"{image_id}.md").write_text(payload["markdown"], encoding="utf-8")
+        with mon.guard(f"{out.name}/{image_id}", failures) as step:
+            payload = writer.write(result, analyzer)
+            payload["image_id"] = image_id
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(target)
+            (reports_dir / f"{image_id}.md").write_text(payload["markdown"], encoding="utf-8")
+        if not step.ok:
+            if progress.failure(image_id) >= stop_after:
+                progress.stop(f"{stop_after} reports in a row failed; fix the cause and rerun to resume")
+                break
+            continue
+        detail = f"verified={payload['verified']} attempts={len(payload['attempts'])}"
+        if not payload["verified"]:
+            detail += f" | fell back, problems: {mon.clip('; '.join(payload['problems']), 120)}"
+        progress.item(image_id, detail, repairs=len(payload["attempts"]) - 1 or None,
+                      fallback=0 if payload["verified"] else 1)
+    log = getattr(writer, "call_log", None)
+    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    if failures:
+        failures.report(path=out / "failures.json")
+        if ledger is not None:
+            ledger.entries.extend(failures.entries)
     return load_reports(out)
 
 

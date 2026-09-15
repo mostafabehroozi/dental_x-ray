@@ -13,6 +13,7 @@ import dental_analysis as da
 import dental_eval as ev
 import dental_pipeline as dp
 import experiments as xp
+import run_monitor as mon
 
 
 def fixture():
@@ -221,11 +222,15 @@ class AnalysisTests(unittest.TestCase):
             root = Path(tmp)
             save_run(root / "a" / "toy", results)
             save_run(root / "b" / "toy", results)
-            configs = xp.build([{"name": "a"}, {"name": "b"}], {"output_root": tmp})
+            # "c" has no saved run: the cell must note it and still rank the two that ran.
+            configs = xp.build([{"name": "a"}, {"name": "b"}, {"name": "c"}], {"output_root": tmp})
+            ledger = mon.Ledger("test")
             scope = {"EXPERIMENTS": configs, "DATASETS": [{"name": "toy"}], "GT": {"toy": gt}, "ADAPTED": {},
-                     "OUTPUT_ROOT": tmp, "xp": xp, "dp": dp, "ev": ev, "da": da, "Path": Path}
+                     "OUTPUT_ROOT": tmp, "xp": xp, "dp": dp, "ev": ev, "da": da, "Path": Path,
+                     "mon": mon, "LEDGER": ledger}
             with redirect_stdout(io.StringIO()), patch("IPython.display.display"):
                 exec(compile(source, "<evaluation cell>", "exec"), scope)
+            self.assertEqual([e["scope"] for e in ledger.entries], ["score c/toy"])
             self.assertEqual(sorted(scope["REPORTS"]), [("a", "toy"), ("b", "toy")])
             self.assertEqual(len(scope["LEADERBOARD"]), 2)
             self.assertEqual(len(scope["COMPARISONS"]["toy"]["run_comparison"]), 2)
