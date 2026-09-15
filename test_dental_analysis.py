@@ -110,6 +110,13 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual((absent["FP"], absent["TN"]), (1, 1))
         self.assertIsNone(absent["sensitivity"])
         self.assertEqual(absent["expected_finding_checks"], 2)  # not all 14 unannotated conditions
+        by_condition = ev.evaluate(gt, results, dataset="toy", evaluate_location=False)["case_condition_breakdown"]
+        multiple_condition = next(r for r in by_condition
+                                  if r["situation"] == "instances_of_finding" and r["group"] == "2+"
+                                  and r["condition"] == CONDITION)
+        self.assertEqual((multiple_condition["dataset"], multiple_condition["TP"],
+                          multiple_condition["FN"]), ("toy", 1, 0))
+        self.assertEqual(multiple_condition["count_mae"], 1)
 
     def test_empty_legacy_and_missing_usage_are_not_fabricated(self):
         self.assertEqual(ev.evaluate({}, {})["case_breakdown"], [])
@@ -144,9 +151,35 @@ class AnalysisTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertIsInstance(json.loads(rows[0]["image_ids"]), list)
             self.assertTrue((root / "case_breakdown.csv").is_file())
+            self.assertTrue((root / "case_condition_breakdown.csv").is_file())
             ev.evaluate({}, {}, out_dir=root)
             self.assertFalse((root / "case_breakdown.csv").exists())
+            self.assertFalse((root / "case_condition_breakdown.csv").exists())
             self.assertFalse((root / "stage_changes.csv").exists())
+
+    def test_compact_views_join_experiments_situations_and_findings(self):
+        gt, results = fixture()
+        report = ev.evaluate(gt, results, dataset="toy", evaluate_location=False)
+        views = da.compact_views({("regional", "toy"): report})
+        overall = views["experiment_overview"][0]
+        self.assertEqual((overall["experiment"], overall["TP"], overall["TN"],
+                          overall["FP"], overall["FN"]), ("regional", 2, 1, 1, 1))
+        self.assertEqual(overall["expected_checks"], 6)
+        self.assertIsNone(overall["location_TP"])
+        self.assertEqual((overall["count_within_1_rate"], overall["count_strict_mae"]), (1.0, 0.3333))
+        self.assertEqual(len(views["finding_comparison"]), 1)
+        self.assertTrue(all(r["experiment"] == "regional" for r in views["situation_comparison"]))
+        detailed = views["situation_finding_comparison"]
+        self.assertTrue(any(r["situation"] == "instances_of_finding" and r["condition"] == CONDITION
+                            for r in detailed))
+        with tempfile.TemporaryDirectory() as tmp:
+            ev.write_report(views, tmp)
+            for name in views:
+                self.assertTrue((Path(tmp) / f"{name}.csv").is_file())
+        located = da.compact_views({("regional", "toy"): ev.evaluate(gt, results, dataset="toy")})
+        located_overall = located["experiment_overview"][0]
+        self.assertIsNotNone(located_overall["location_TP"])
+        self.assertEqual(located_overall["TP"], 2)  # location cells never overwrite finding cells
 
     def test_comparison_pairs_coverage_and_ignores_unselected_images(self):
         gt, current = fixture()
@@ -206,8 +239,10 @@ class AnalysisTests(unittest.TestCase):
                 exec(compile(source, "<evaluation cell>", "exec"), scope)
             self.assertEqual(sorted(scope["REPORTS"]), [("a", "toy"), ("b", "toy")])
             self.assertEqual(len(scope["LEADERBOARD"]), 2)
+            self.assertEqual(len(scope["VIEWS"]["experiment_overview"]), 2)
             self.assertEqual(len(scope["COMPARISONS"]["toy"]["run_comparison"]), 2)
             self.assertTrue((root / "leaderboard.csv").is_file())
+            self.assertTrue((root / "overview" / "situation_finding_comparison.csv").is_file())
             self.assertTrue((root / "comparison" / "toy" / "run_changes.csv").is_file())
             self.assertTrue((root / "a" / "toy" / "evaluation" / "presence.csv").is_file())
 

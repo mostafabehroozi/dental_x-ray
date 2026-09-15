@@ -524,7 +524,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
               "per_image": per_image, "missing_results": missing}
     if include_analysis:
         from dental_analysis import analyze
-        report.update(analyze({i: gt[i] for i in ids}, results, evaluate_location=evaluate_location))
+        report.update(analyze({i: gt[i] for i in ids}, results, dataset=dataset,
+                              evaluate_location=evaluate_location))
     if out_dir:
         write_report(report, out_dir)
     return report
@@ -583,8 +584,9 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
     for name in ("presence", "whole_image", "counts", "region_counts", "region_presence", "regions", "per_image",
-                 "stage_changes", "parse_recovery", "call_usage", "case_breakdown",
-                 "run_comparison", "run_changes"):
+                 "stage_changes", "parse_recovery", "call_usage", "case_breakdown", "case_condition_breakdown",
+                 "run_comparison", "run_changes", "experiment_overview", "finding_comparison",
+                 "situation_comparison", "situation_finding_comparison"):
         rows = report.get(name) or []
         if not rows:
             (out / f"{name}.csv").unlink(missing_ok=True)

@@ -42,14 +42,17 @@ server only when their server settings differ). Cell 9 translates the
 ground-truth boxes once per adapter instead of once per experiment. Cell 10 then
 scores every experiment and ranks them:
 
-* `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
-  sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
-  rate, coverage, count MAE, exact region-set rate, presence-per-region F1,
-  calls per image. Each row is scored against that experiment's own location
-  truth.
+* `<output_root>/leaderboard.csv`: one row per experiment and dataset - support,
+  TP/TN/FP/FN, coverage, sensitivity, specificity, PPV, micro/macro F1, false
+  alarms, count accuracy, location accuracy and calls per image. Each row is
+  scored against that experiment's own location truth.
+* `<output_root>/overview/`: joined tables across every experiment: the overall
+  leaderboard, one row per experiment and finding, one row per experiment and
+  diagnostic situation, and the full experiment x situation x finding drill-down.
 * `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
-  on the same images against the first one - `paired_f1_delta`, checks corrected
-  and worsened, newly unresolved, recorded calls and tokens.
+  on the same images against the first one - raw confusion counts, coverage,
+  `paired_f1_delta`, checks corrected and worsened, newly resolved/unresolved,
+  recorded calls and tokens.
 
 Cells 11 to 13 look at one experiment at a time: `INSPECT_EXPERIMENT` selects it
 for the per-finding tables, for one image's raw answers, and for the dentist
@@ -406,6 +409,10 @@ run. `regions.csv` and `region_presence.csv` answer different questions: the
 first scores where a detected finding was placed (true positives only), the
 second whether each region was called correctly at all, absent findings
 included. Both need the location truth, so they follow `evaluate_location`.
+`case_condition_breakdown.csv` joins each diagnostic situation with each
+applicable finding, including support, TP/TN/FP/FN, unparseable answers,
+presence metrics, count metrics and location metrics. It is the detailed source
+for the cross-experiment situation/finding view described below.
 
 Two diagnostics decide whether word-based regions are being read:
 
@@ -444,6 +451,23 @@ supporting image IDs, in `evaluation.json` and matching CSV files:
   excluded truth sources remain visible. These are descriptive groups, not
   causal effects or severity grades. Counts/location use the evaluator's existing
   true-positive subsets; empty denominators are unavailable.
+* `case_condition_breakdown`: the same situations split by finding. This keeps
+  the aggregate situation table compact while retaining the full drill-down in
+  CSV/JSON and in Cell 11 for the selected experiment.
+
+Cell 10 also writes `<output_root>/overview/` with four joined tables:
+
+* `experiment_overview.csv`: one compact row per experiment and dataset.
+* `finding_comparison.csv`: every experiment x finding row.
+* `situation_comparison.csv`: every experiment x diagnostic situation row.
+* `situation_finding_comparison.csv`: every experiment x situation x finding row.
+
+The notebook presents detection, counting, and location as separate compact
+blocks so disabled or inapplicable metrics do not create a mostly empty table.
+The full exports remain available for filtering and audit. With
+`evaluate_location=False`, location rows and location-based situations are
+intentionally unavailable; regional inference, whole-image-to-region changes,
+finding scores and total counts remain available.
 
 Cell 10 compares the experiments of Cell 3 automatically: every experiment with
 a complete set of results for a dataset is scored paired against the first one
