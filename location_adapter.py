@@ -41,6 +41,7 @@ from pathlib import Path
 import dental_eval as ev
 import dental_pipeline as dp
 import llm_api
+import run_monitor as mon
 
 UNITS = dp.UNITS
 QUADRANTS = tuple(dp.CROPS["quadrant"])
@@ -247,7 +248,7 @@ class LLMAdapter:
                  max_output_tokens: int = 4096, temperature: float | None = None, max_boxes_per_call: int = 12,
                  max_side: int = 2048, corner_labels: bool = True, timeout: float = 600.0,
                  request_options: dict | None = None, parse_retries: int = 1, api_call_retries: int = 2,
-                 failure_policy: str = "geometry", client=None) -> None:
+                 failure_policy: str = "geometry", call_log: str | None = None, client=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         llm_api.validate_parse_retries(parse_retries)
@@ -260,7 +261,7 @@ class LLMAdapter:
         self.max_boxes_per_call, self.max_side, self.corner_labels = max_boxes_per_call, max_side, corner_labels
         self.request_options = dict(request_options or {})
         self.parse_retries, self.api_call_retries, self.failure_policy = parse_retries, api_call_retries, failure_policy
-        self.calls = 0
+        self.call_log = mon.CallLog("location", call_log)
 
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "max_boxes_per_call", "max_side",
                "corner_labels", "request_options", "parse_retries", "api_call_retries", "failure_policy")
@@ -272,6 +273,10 @@ class LLMAdapter:
         base_url, api_key = llm_api.resolve(spec)
         options = {k: spec[k] for k in cls.OPTIONS if k in spec}
         return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
+
+    @property
+    def calls(self) -> int:
+        return self.call_log.calls
 
     @property
     def name(self) -> str:
@@ -303,10 +308,7 @@ class LLMAdapter:
         normalized = llm_api.call_with_retries(
             lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)),
             self.api_call_retries, f"location model={self.model}")
-        self.calls += 1
-        reply = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
-        print(f"location call {self.calls} | {reply['latency_seconds']}s | finish={reply['finish_reason']}")
-        return reply
+        return self.call_log.live({**normalized, "latency_seconds": round(time.perf_counter() - started, 3)})
 
     def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
               drawn_dir: str | Path | None = None) -> list[dict]:
@@ -468,8 +470,14 @@ class FdmAdapter:
 # ----------------------------------------------------------------------------
 # Dataset loop with resume, loading, summary
 # ----------------------------------------------------------------------------
-def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: bool = True) -> dict[str, dict]:
-    """Adapt every image's boxes, one JSON per image under out_dir/boxes, drawn images under out_dir/drawn."""
+def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: bool = True,
+                  ledger: "mon.Ledger | None" = None, stop_after: int = 3) -> dict[str, dict]:
+    """Adapt every image's boxes, one JSON per image under out_dir/boxes, drawn images under out_dir/drawn.
+
+    An image whose adaptation fails is recorded with its complete traceback and the
+    loop continues (its boxes then fall back to the fixed windows at evaluation time,
+    the same as an unparseable reply); `stop_after` consecutive failures stop the loop.
+    """
     out = Path(out_dir)
     boxes_dir, drawn_dir = out / "boxes", out / "drawn"
     boxes_dir.mkdir(parents=True, exist_ok=True)
@@ -484,29 +492,48 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
         manifest_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     todo = sorted(gt.items())
-    for index, (image_id, entry) in enumerate(todo, start=1):
+    failures = mon.Ledger(f"location {out.name}")
+    progress = mon.Progress(len(todo), label=f"location truth {out.name}", unit="image")
+    for image_id, entry in todo:
         target = boxes_dir / f"{image_id}.json"
         if resume and target.is_file():
-            _load_adapted_file(target, image_id)
+            _load_adapted_file(target, image_id)  # a corrupt or foreign artifact stops the loop
+            progress.skip(image_id)
             continue
         boxes = entry["boxes"]
-        if boxes:
-            print(f"[{index}/{len(todo)}] {image_id}: {len(boxes)} boxes")
-        rows = adapter.adapt(entry["path"], boxes, image_id, drawn_dir) if boxes else []
-        if len(rows) != len(boxes):
-            raise ValueError(f"adapter returned {len(rows)} rows for {len(boxes)} boxes in {image_id}")
         records = []
-        for box, row in zip(boxes, rows):
-            geometry = dp.quadrants_to_regions(ev.geometric_regions(box, "quadrant"))
-            record = {"condition": box["condition"], "box": [box["xc"], box["yc"], box["w"], box["h"]],
-                      "geometry": geometry, **row}
-            if record["regions"] is None:
-                record["regions"], record["source"] = geometry, "geometry"
-            records.append(record)
-        payload = {"image_id": image_id, "image": entry["path"], "adapter": adapter.name, "boxes": records}
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)
+        with mon.guard(f"{out.name}/{image_id}", failures) as step:
+            rows = adapter.adapt(entry["path"], boxes, image_id, drawn_dir) if boxes else []
+            if len(rows) != len(boxes):
+                raise ValueError(f"adapter returned {len(rows)} rows for {len(boxes)} boxes in {image_id}")
+            for box, row in zip(boxes, rows):
+                geometry = dp.quadrants_to_regions(ev.geometric_regions(box, "quadrant"))
+                record = {"condition": box["condition"], "box": [box["xc"], box["yc"], box["w"], box["h"]],
+                          "geometry": geometry, **row}
+                if record["regions"] is None:
+                    record["regions"], record["source"] = geometry, "geometry"
+                records.append(record)
+            payload = {"image_id": image_id, "image": entry["path"], "adapter": adapter.name, "boxes": records}
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(target)
+        if not step.ok:
+            if progress.failure(image_id) >= stop_after:
+                progress.stop(f"{stop_after} images in a row failed; fix the cause and rerun to resume")
+                break
+            continue
+        sources: dict[str, int] = {}
+        for record in records:
+            sources[record["source"]] = sources.get(record["source"], 0) + 1
+        detail = f"boxes={len(records)}" + (" | " + " ".join(f"{k}={v}" for k, v in sorted(sources.items()))
+                                            if sources else "")
+        progress.item(image_id, detail, fallbacks=sum(bool(r.get("fallback_reason")) for r in records) or None)
+    log = getattr(adapter, "call_log", None)
+    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    if failures:
+        failures.report(path=out / "failures.json")
+        if ledger is not None:
+            ledger.entries.extend(failures.entries)
     return load_adapted(out)
 
 

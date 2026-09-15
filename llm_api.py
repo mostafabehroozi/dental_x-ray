@@ -16,6 +16,13 @@ from __future__ import annotations
 import os
 import time
 
+import run_monitor as mon
+
+# The console side of a run lives in run_monitor; these names stay here because every
+# caller already reaches for them through llm_api.
+monitor = mon.monitor
+failure_details = mon.failure_details
+
 PROVIDERS: dict[str, dict] = {}
 TOKEN_PARAMS = ("max_tokens", "max_completion_tokens")
 
@@ -112,23 +119,6 @@ def validate_api_retries(retries: int) -> None:
         raise ValueError("api_call_retries must be a non-negative integer")
 
 
-def monitor(event: str, message: str = "", **fields) -> None:
-    """Compact, consistent console event; normal calls keep their existing one-line progress."""
-    parts = [f"[{event}]"]
-    if message:
-        parts.append(message)
-    parts.extend(f"{key}={value}" for key, value in fields.items() if value is not None)
-    print(" | ".join(parts), flush=True)
-
-
-def failure_details(prompt: str, response: str, problems=None) -> None:
-    """Print full failure evidence only when recovery is needed."""
-    if problems:
-        print("Problems: " + "; ".join(str(p) for p in problems), flush=True)
-    print("PROMPT (full):\n" + prompt, flush=True)
-    print("RESPONSE (full):\n" + response, flush=True)
-
-
 def artifact_error(path, reason: str) -> ValueError:
     monitor("ARTIFACT ERROR", str(path), reason=reason)
     return ValueError(f"invalid artifact {path}: {reason}")
@@ -145,11 +135,17 @@ def call_with_retries(call, retries: int, context: str):
             permanent = status in {400, 401, 403, 404, 405, 422} or str(exc).startswith(
                 ("refusal:", "content_filter", "non_text_content:"))
             if permanent or attempt == retries:
-                monitor("API FAILED", context, attempt=attempt + 1, reason=type(exc).__name__, status=status)
+                mon.tally("api_failed")
+                monitor("API FAILED", context, attempt=f"{attempt + 1}/{retries + 1}",
+                        reason=type(exc).__name__, status=status,
+                        kind="permanent" if permanent else "retries exhausted")
+                mon.error_details(exc)  # the provider's own message is the only thing that explains it
                 raise
             delay = min(2 ** attempt, 8)
+            mon.tally("api_retry")
             monitor("API RETRY", context, attempt=f"{attempt + 1}/{retries + 1}",
-                    reason=type(exc).__name__, status=status, wait=f"{delay}s")
+                    reason=type(exc).__name__, status=status, wait=f"{delay}s",
+                    detail=mon.clip(exc, 120) or None)
             time.sleep(delay)
 
 
@@ -207,12 +203,15 @@ def ask_parsed(runner, image, question, *, parse, record, retries, context, fall
         record(question, reply)
         if not error:
             if attempt:
-                print(f"PARSE RECOVERED | {context} | attempt={attempt + 1}", flush=True)
+                mon.tally("parse_recovered")
+                monitor("PARSE RECOVERED", context, attempt=f"{attempt + 1}/{retries + 1}")
             return value, reply
+        mon.tally("parse_warning")
         monitor("PARSE WARNING", context, attempt=f"{attempt + 1}/{retries + 1}",
                 reason=error, finish=reply.get("finish_reason"))
         failure_details(question, reply.get("text", ""))
         if exhausted:
+            mon.tally("parse_exhausted")
             monitor("PARSE EXHAUSTED", context, policy="neutral/excluded")
             return value, reply
         monitor("PARSE RETRY", context, action="format reminder")

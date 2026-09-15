@@ -48,6 +48,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import llm_api
+import run_monitor as mon
 from response_cache import ResponseCache
 
 # Stable ontology in YOLO class order of the UMFIH 14-class dataset.
@@ -552,6 +553,7 @@ class VisionRunner:
         token_param: str = "max_tokens",
         api_call_retries: int = 2,
         response_cache: ResponseCache | None = None,
+        call_log: str | None = None,
         client=None,
     ) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
@@ -567,9 +569,9 @@ class VisionRunner:
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
         self.response_cache = response_cache
-        self.calls = 0
-        self.requests = 0
-        self.cache_hits = 0
+        # Counters for every question asked, and the policy for printing single calls: one line per
+        # image is denser than one per question, so a call prints only when it is worth reading.
+        self.call_log = mon.CallLog("analyzer", call_log)
 
     @classmethod
     def from_api(cls, spec: dict, max_tokens: int = 4096, temperature: float | None = 0.0,
@@ -585,6 +587,18 @@ class VisionRunner:
                    cache_prompt=False, request_options=spec.get("request_options"),
                    token_param=spec.get("token_param", "max_tokens"),
                    api_call_retries=spec.get("api_call_retries", api_call_retries), client=client)
+
+    @property
+    def calls(self) -> int:
+        return self.call_log.calls
+
+    @property
+    def requests(self) -> int:
+        return self.call_log.requests
+
+    @property
+    def cache_hits(self) -> int:
+        return self.call_log.cache_hits
 
     def settings(self) -> dict:
         return {
@@ -610,27 +624,19 @@ class VisionRunner:
             request["extra_body"] = {"reasoning_format": "none", "cache_prompt": self.cache_prompt,
                                      "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
-        self.requests += 1
         cache_key = self.response_cache.key(request) if self.response_cache is not None else None
         cached = self.response_cache.get(cache_key) if self.response_cache is not None else None
         if cached is not None:
-            self.cache_hits += 1
-            result = {**cached, "cache_hit": True, "cache_key": cache_key}
-            print(f"request {self.requests} | CACHE HIT | prompt_tokens={result['prompt_tokens']} "
-                  f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
-            return result
+            return self.call_log.cached({**cached, "cache_hit": True, "cache_key": cache_key})
         started = time.perf_counter()
         normalized = llm_api.call_with_retries(
             lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)), self.api_call_retries,
             f"analyzer model={self.model}")
-        self.calls += 1
         result = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3),
                   "cache_hit": False, "cache_key": cache_key}
         if self.response_cache is not None:
             self.response_cache.put(cache_key, result)
-        print(f"call {self.calls} | {result['latency_seconds']}s | prompt_tokens={result['prompt_tokens']} "
-              f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
-        return result
+        return self.call_log.live(result)
 
 
 # ----------------------------------------------------------------------------
@@ -958,9 +964,34 @@ def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance:
     return config
 
 
+def result_line(result: dict) -> str:
+    """Dense one-line state of one image: what was found (with counts), and what stayed unresolved."""
+    findings = result["findings"]
+    present = [c for c in CONDITIONS if findings[c]["presence"] == "A"]
+    absent = sum(findings[c]["presence"] == "B" for c in CONDITIONS)
+    unclear = [c for c in CONDITIONS if findings[c]["presence"] is None]
+    parts = [f"present={len(present)} absent={absent} unclear={len(unclear)}"]
+    if present:
+        named = [c + ("" if findings[c]["count"] is None else f" x{findings[c]['count']}") for c in present[:3]]
+        parts.append(", ".join(named) + (f", +{len(present) - 3}" if len(present) > 3 else ""))
+    if unclear:
+        parts.append("unresolved: " + ", ".join(unclear[:3]) + (f", +{len(unclear) - 3}" if len(unclear) > 3 else ""))
+    return " | ".join(parts)
+
+
 def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode: str = "plain",
-                protocol: Protocol = Protocol(), resume: bool = True, provenance: dict | None = None) -> Path:
-    """Analyze every image, one JSON per image, skipping finished ones on resume."""
+                protocol: Protocol = Protocol(), resume: bool = True, provenance: dict | None = None,
+                ledger: "mon.Ledger | None" = None, stop_after: int = 3) -> Path:
+    """Analyze every image, one JSON per image, skipping finished ones on resume.
+
+    An image that fails (a rejected request, an unreadable file, a model that never
+    answers) is recorded with its complete traceback and the run moves to the next
+    image, so one bad image never costs the rest of the dataset; the failures are
+    saved as failures.json next to the results. `stop_after` consecutive failures
+    stop the run instead, because that is a dead server or a rejected key rather
+    than a bad image. A saved result that does not match its own run directory is
+    still fatal: that is a mixed-up output directory, not a bad image.
+    """
     out = Path(out_dir)
     results_dir = out / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -974,17 +1005,35 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
         manifest_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     todo = [(image_id, Path(p)) for image_id, p in images.items()]
-    for index, (image_id, path) in enumerate(todo, start=1):
+    failures = mon.Ledger(f"{out.parent.name}/{out.name}")
+    progress = mon.Progress(len(todo), label=f"{out.parent.name}/{out.name}", unit="image")
+    for image_id, path in todo:
         target = results_dir / f"{image_id}.json"
         if resume and target.is_file():
-            _load_result_file(target, image_id)
+            _load_result_file(target, image_id)  # a corrupt or foreign artifact stops the run
+            progress.skip(image_id)
             continue
-        print(f"[{index}/{len(todo)}] {image_id}")
-        result = analyze_image(runner, path, mode=mode, protocol=protocol, crop_dir=out / "crops")
-        result["image_id"] = image_id
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)
+        with mon.guard(f"{out.name}/{image_id}", failures) as step:
+            result = analyze_image(runner, path, mode=mode, protocol=protocol, crop_dir=out / "crops")
+            result["image_id"] = image_id
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(target)
+        if not step.ok:
+            if progress.failure(image_id) >= stop_after:
+                progress.stop(f"{stop_after} images in a row failed; fix the cause and rerun to resume")
+                break
+            continue
+        recovery = result["parse_recovery"]
+        progress.item(image_id, result_line(result), calls=result["inference_call_count"],
+                      cache=result["cache_hit_count"] or None, retries=recovery["retry_calls"] or None,
+                      unparsed=recovery["unresolved_checks"] or None)
+    log = getattr(runner, "call_log", None)
+    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    if failures:
+        failures.report(path=out / "failures.json")
+        if ledger is not None:  # the sweep's own ledger keeps every stage's failures together
+            ledger.entries.extend(failures.entries)
     return out
 
 

@@ -116,6 +116,23 @@ name. So:
   print the full prompt and response; saved JSON keeps every attempt. Invalid resumed artifacts stop
   with `ARTIFACT ERROR`. A hashed control that changed under an existing experiment name
   stops the run instead of mixing two configurations.
+* **Nothing fails silently, and no failure takes the sweep with it** (`run_monitor.py`). Every stage
+  runs its items behind a guard: a failed image, dataset, experiment, adapted image, scored run or
+  report prints its error and full traceback, is recorded in the session ledger with its scope, and
+  the loop continues with the next item; the run directory keeps a `failures.json`, and each cell
+  ends with a `[HEALTH]` line grouping what failed by reason. Three failures in a row stop that
+  dataset instead, because that is a dead server or a rejected key rather than a bad image. Only
+  identity errors (a saved artifact that belongs to another run, a changed hashed control) still stop
+  at once, and `Ctrl-C` is never swallowed. The failed items are simply absent from the results, so a
+  rerun resumes them and the evaluation reports them as `missing_results`.
+* **Dense monitoring while it runs.** One line per image carries what was found (with counts), what
+  stayed unresolved, the call and cache counts and an ETA; one `[DONE]` line per dataset carries the
+  totals, the token counts and every retry the stage paid for. Single model calls are counted rather
+  than listed, and printed only when worth reading (slow, truncated, empty) — `CALL_LOG` in Cell 3
+  switches that to `"each"` for debugging one image, or `"off"`. Failures are the exception to
+  density and always print completely. Before any model call, Cell 7 prints what each benchmark holds
+  and flags what is unusable in it: images with no label file, label files with no image, annotated
+  images missing from disk.
 
 The only public weights are the GGUF conversion of `DentalGPT-7B-1026`. That
 checkpoint may predate the reinforcement-learning stage, and the exact sentence
@@ -238,9 +255,10 @@ directory.
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment, the probe decision |
-| `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
+| `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction, visible API and parse retries |
+| `run_monitor.py` | the console and failure side of a run: dense per-item progress with ETA, call counters with a print policy, the failure ledger and the guard that keeps a loop alive |
 | `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 10 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py`, `test_response_cache.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py`, `test_response_cache.py`, `test_run_monitor.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Runtime settings that matter
 

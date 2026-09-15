@@ -26,6 +26,7 @@ import csv
 import json
 from pathlib import Path
 
+import run_monitor as mon
 from dental_pipeline import (CONDITIONS, COUNTABLE, CROPS, QUADRANT_WORDS_ARE_PATIENT_SIDE, UNIT_QUADRANT,
                              quadrants_to_regions, units_to_regions)
 
@@ -53,12 +54,18 @@ DENTEX_DISEASES = {
 # box = {"condition", "xc", "yc", "w", "h", "fdi" (optional (quadrant, tooth))}
 # ----------------------------------------------------------------------------
 def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]:
+    """UMFIH 14-class layout. An image with no label file is scored as all-negative, and a label
+    file with no image is never scored at all, so both are counted and reported: silently, they
+    look exactly like a correct dataset."""
     images_root, labels_root = Path(images_dir), Path(labels_dir)
     dataset = {}
+    unlabeled = []
     for path in sorted(p for p in images_root.rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS):
         boxes = []
         label_path = labels_root / path.relative_to(images_root).with_suffix(".txt")
-        if label_path.is_file():
+        if not label_path.is_file():
+            unlabeled.append(path.stem)
+        else:
             for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), 1):
                 parts = line.split()
                 if not parts:
@@ -75,6 +82,12 @@ def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]
         dataset[path.stem] = {"path": str(path), "boxes": boxes, "annotated": set(CONDITIONS)}
     if not dataset:
         raise ValueError(f"no images under {images_root}")
+    orphans = sorted(p.stem for p in labels_root.rglob("*.txt") if p.stem not in dataset)
+    for reason, names in (("images with no label file (scored as all-negative)", unlabeled),
+                          ("label files with no image (never scored)", orphans)):
+        if names:
+            mon.monitor("PROBLEM", str(images_root), reason=reason, count=len(names),
+                        examples=mon.clip(", ".join(names[:5]), 80))
     return dataset
 
 
@@ -93,11 +106,15 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
             "annotated": {"carious_lesion", "periapical_lesion", "impacted_tooth"},
         }
     for ann in payload["annotations"]:
+        if ann.get("image_id") not in images:
+            raise ValueError(f"{annotations_json}: annotation {ann.get('id')} names image_id "
+                             f"{ann.get('image_id')!r}, which the file does not list under 'images'")
         img = images[ann["image_id"]]
         disease = disease_names.get(ann.get("category_id_3"))
         condition = DENTEX_DISEASES.get(disease)
         if condition is None:
-            raise ValueError(f"unknown DENTEX disease label {disease!r}")
+            raise ValueError(f"{annotations_json}: unknown DENTEX disease label {disease!r} "
+                             f"(annotation {ann.get('id')}); extend DENTEX_DISEASES")
         x, y, w, h = ann["bbox"]
         width, height = img["width"], img["height"]
         box = {"condition": condition, "xc": (x + w / 2) / width, "yc": (y + h / 2) / height,
@@ -107,7 +124,40 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
         if ann.get("category_id_1") in quadrants and ann.get("category_id_2") in teeth:
             box["fdi"] = (quadrants[ann["category_id_1"]], teeth[ann["category_id_2"]])
         dataset[Path(img["file_name"]).stem]["boxes"].append(box)
+    missing = sorted(i for i, e in dataset.items() if not Path(e["path"]).is_file())
+    if missing:
+        mon.monitor("PROBLEM", str(annotations_json), reason="annotated images not found on disk",
+                    count=len(missing), examples=mon.clip(", ".join(missing[:5]), 80))
     return dataset
+
+
+def truth_report(gt: dict[str, dict], name: str = "dataset") -> dict:
+    """One dense line of what a loaded benchmark holds, and a problem line for anything unusable.
+
+    Printed before any model call, because a dataset that is half missing is cheaper to find
+    here than after an hour of questions.
+    """
+    boxes = [b for entry in gt.values() for b in entry["boxes"]]
+    per_condition: dict[str, int] = {}
+    for box in boxes:
+        per_condition[box["condition"]] = per_condition.get(box["condition"], 0) + 1
+    missing = sorted(i for i, entry in gt.items() if not Path(entry["path"]).is_file())
+    summary = {"images": len(gt), "with_findings": sum(1 for e in gt.values() if e["boxes"]),
+               "boxes": len(boxes), "boxes_with_fdi": sum(1 for b in boxes if b.get("fdi")),
+               "findings_annotated": len(set().union(*(e["annotated"] for e in gt.values())) if gt else set()),
+               "missing_image_files": len(missing), "per_condition": per_condition}
+    mon.monitor("TRUTH", name, images=summary["images"], with_findings=summary["with_findings"],
+                boxes=summary["boxes"], fdi=summary["boxes_with_fdi"] or None,
+                findings=summary["findings_annotated"])
+    ranked = sorted(per_condition.items(), key=lambda kv: -kv[1])
+    if ranked:
+        shown = " ".join(f"{c}={n}" for c, n in ranked[:6])
+        print(f"  boxes per finding: {shown}" + (f" (+{len(ranked) - 6} more findings)" if len(ranked) > 6 else ""),
+              flush=True)
+    if missing:
+        mon.monitor("PROBLEM", name, reason="image files missing; those images will fail",
+                    count=len(missing), examples=mon.clip(", ".join(missing[:5]), 80))
+    return summary
 
 
 # ----------------------------------------------------------------------------
@@ -539,6 +589,16 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                               evaluate_location=evaluate_location))
     if out_dir:
         write_report(report, out_dir)
+    summary = report["summary"]
+    mon.monitor("SCORED", dataset, images=len(ids), missing_results=len(missing) or None,
+                checks=summary["scored_finding_checks"],
+                unparseable=summary["excluded_unparseable_checks"] or None,
+                f1=summary["f1"], sens=summary["sensitivity"], spec=summary["specificity"])
+    if not summary["finding_check_invariant_ok"]:
+        # Every expected check must end up scored or explicitly excluded; anything else is a bug here.
+        mon.monitor("EVAL INVARIANT BROKEN", dataset, expected=summary["expected_finding_checks"],
+                    scored=summary["scored_finding_checks"],
+                    excluded=summary["excluded_unparseable_checks"])
     return report
 
 
