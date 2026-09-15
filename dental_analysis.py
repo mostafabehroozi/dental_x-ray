@@ -49,7 +49,7 @@ def metrics(gt, report):
     row["annotated_checks"] = sum(len(e["annotated"]) for e in gt.values())
     row["not_assessed_checks"] = row["annotated_checks"] - row["expected_finding_checks"]
     row["coverage"] = ev._ratio(row["scored_finding_checks"], row["expected_finding_checks"])
-    for table, weight, metrics in (("counts", "n_scored", ("mae", "exact_rate")),
+    for table, weight, metrics in (("counts", "n_scored", ("mae", "exact_rate", "within_1_rate")),
                                    ("regions", "n_localized_cases", ("exact_set_match_rate", "mean_jaccard"))):
         rows = report[table]
         row[table + "_scored"] = sum(r[weight] for r in rows)
@@ -57,9 +57,85 @@ def metrics(gt, report):
             usable = [r for r in rows if r[metric] is not None]
             row[table + "_" + metric] = ev._ratio(
                 sum(r[metric] * r[weight] for r in usable), sum(r[weight] for r in usable))
+    strict = [r for r in report["counts"] if r["strict_mae"] is not None]
+    row["counts_strict_scored"] = sum(r["strict_n"] for r in strict)
+    row["counts_strict_mae"] = ev._ratio(sum(r["strict_mae"] * r["strict_n"] for r in strict),
+                                         row["counts_strict_scored"])
+    row["counts_unparseable"] = sum(r["count_unparseable"] for r in report["counts"])
     row["regions_excluded"] = sum(r["excluded_location_checks"] for r in report["regions"])
+    location = ({k: sum(r[k] for r in report["regions"]) for k in ("TP", "TN", "FP", "FN")}
+                if report["regions"] else {k: None for k in ("TP", "TN", "FP", "FN")})
+    row.update({"regions_" + k: value for k, value in location.items()})
+    row["regions_f1"] = (ev._prf(location["TP"], location["FP"], location["TN"], location["FN"])["f1"]
+                         if report["regions"] else None)
     row["region_presence_f1"] = (summary.get("region_presence") or {}).get("f1")  # None without cells or location
+    row["side_agreement_rate"] = (summary.get("side_agreement") or {}).get("agreement_rate")
     return row
+
+
+def finding_rows(gt, report):
+    """Every annotated finding, keeping not-assessed distinct from unresolved."""
+    summary = report["summary"]
+    dataset = summary["dataset"]
+    presence = {r["condition"]: r for r in report.get("presence", [])}
+    whole = {r["condition"]: r for r in report.get("whole_image", [])}
+    counts = {r["condition"]: r for r in report.get("counts", [])}
+    regions = {r["condition"]: r for r in report.get("regions", [])}
+    region_presence = defaultdict(list)
+    for row in report.get("region_presence", []):
+        region_presence[row["condition"]].append(row)
+
+    rows = []
+    for condition in dp.CONDITIONS:
+        annotated = [entry for entry in gt.values() if condition in entry["annotated"]]
+        if not annotated:
+            continue
+        base = presence.get(condition)
+        annotated_positives = sum(any(b["condition"] == condition for b in entry["boxes"])
+                                  for entry in annotated)
+        if base is None:
+            base = {"dataset": dataset, "condition": condition, "trained_task": condition in dp.TRAINED,
+                    "images": 0, "positives": 0,
+                    **{k: None for k in ("TP", "TN", "FP", "FN")}, "unparseable": 0,
+                    **{k: None for k in ("sensitivity", "specificity", "ppv", "f1")}}
+        scored = sum(base[k] or 0 for k in ("TP", "TN", "FP", "FN"))
+        before, count, location = whole.get(condition, {}), counts.get(condition, {}), regions.get(condition, {})
+        regional = region_presence.get(condition, [])
+        regional_cells = {k: sum(r.get(k, 0) for r in regional) for k in ("TP", "TN", "FP", "FN")}
+        regional_scores = (ev._prf(regional_cells["TP"], regional_cells["FP"],
+                                   regional_cells["TN"], regional_cells["FN"])
+                           if regional else {})
+        not_assessed_checks = len(annotated) - base["images"]
+        assessment_status = ("not_assessed" if not base["images"] else
+                             "partly_assessed" if not_assessed_checks else "assessed")
+        rows.append({
+            **base,
+            "assessment_status": assessment_status,
+            "annotated_images": len(annotated),
+            "annotated_positives": annotated_positives,
+            "not_assessed_checks": not_assessed_checks,
+            "scored_checks": scored,
+            "coverage": ev._ratio(scored, base["images"]),
+            "whole_image_f1": before.get("f1"),
+            "count_n_scored": count.get("n_scored"),
+            "count_exact_rate": count.get("exact_rate"),
+            "count_within_1_rate": count.get("within_1_rate"),
+            "count_mae": count.get("mae"),
+            "count_strict_mae": count.get("strict_mae"),
+            "count_unparseable": count.get("count_unparseable"),
+            "region_presence_TP": regional_cells["TP"] if regional else None,
+            "region_presence_TN": regional_cells["TN"] if regional else None,
+            "region_presence_FP": regional_cells["FP"] if regional else None,
+            "region_presence_FN": regional_cells["FN"] if regional else None,
+            "region_presence_f1": regional_scores.get("f1"),
+            "localized_cases": location.get("n_localized_cases"),
+            "location_TP": location.get("TP"), "location_TN": location.get("TN"),
+            "location_FP": location.get("FP"), "location_FN": location.get("FN"),
+            "location_f1": location.get("f1"),
+            "region_exact_rate": location.get("exact_set_match_rate"),
+            "region_jaccard": location.get("mean_jaccard"),
+        })
+    return rows
 
 
 def call_usage(results):
@@ -175,7 +251,7 @@ def phrasing_analysis(gt, results, evaluate_location):
     return changes, vote_rows, region_rows
 
 
-def analyze(gt, results, *, evaluate_location=True):
+def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
     results = {i: results[i] for i in gt}
     buckets = defaultdict(lambda: defaultdict(set))
     for image_id, entry in gt.items():
@@ -203,17 +279,24 @@ def analyze(gt, results, *, evaluate_location=True):
                             labels.append(("crosses_cell_boundary", "yes" if any(ev.straddling(b) for b in boxes) else "no"))
             for label in labels:
                 buckets[label][image_id].add(condition)
-    rows = []
+    rows, condition_rows = [], []
     for (situation, group), members in sorted(buckets.items()):
         subset = {i: {**gt[i], "annotated": conditions} for i, conditions in members.items()}
-        rows.append({"situation": situation, "group": group,
-                     **metrics(subset, _score(subset, results, evaluate_location)), "image_ids": sorted(members)})
+        report = ev.evaluate(subset, results, dataset=dataset, evaluate_location=evaluate_location,
+                             include_analysis=False)
+        rows.append({"dataset": dataset, "situation": situation, "group": group,
+                     **metrics(subset, report), "image_ids": sorted(members)})
+        for row in finding_rows(subset, report):
+            condition_rows.append({"situation": situation, "group": group, **row,
+                                   "image_ids": sorted(i for i, conditions in members.items()
+                                                       if row["condition"] in conditions)})
     crops = {i: e for i, e in gt.items() if results[i]["location_level"] == "crops"}
     changes, votes, region_votes = phrasing_analysis(gt, results, evaluate_location)
     changes += presence_changes(crops, results, results, "whole_image_to_crops", before_field="whole_image")
     return {"stage_changes": changes, "phrasing_votes": votes, "region_vote_comparison": region_votes,
             "parse_recovery": recovery_rows(gt, results, evaluate_location),
-            "call_usage": call_usage(results), "case_breakdown": rows}
+            "call_usage": call_usage(results), "case_breakdown": rows,
+            "case_condition_breakdown": condition_rows}
 
 
 def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
@@ -279,3 +362,52 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
             row[field] = round(sum(r[field] or 0 for r in usage), 4) if recorded else None
         rows.append(row)
     return {"run_comparison": rows, "run_changes": changes}
+
+
+def compact_views(ground_truth, reports):
+    """Join DentVLM reports without losing task support, votes, crops, or not-assessed states."""
+    overview, findings, situations, situation_findings = [], [], [], []
+    stages, phrasings, vote_replays, recoveries, usage = [], [], [], [], []
+    for (experiment, dataset), report in sorted(reports.items()):
+        gt = ground_truth[dataset]
+        summary, extra = report["summary"], metrics(gt, report)
+        protocol = summary.get("protocol") or {}
+        overview.append({
+            "dataset": dataset, "experiment": experiment,
+            **{k: protocol.get(k) for k in ("phrasings", "region_vote", "location", "count_question",
+                                             "ask_untrained", "extra_tasks", "parse_retries")},
+            "evaluate_location": summary.get("evaluate_location"),
+            "images": summary["images_scored"], "annotated_checks": extra["annotated_checks"],
+            "not_assessed_checks": extra["not_assessed_checks"],
+            "expected_checks": summary["expected_finding_checks"],
+            "scored_checks": summary["scored_finding_checks"], "coverage": extra["coverage"],
+            **{k: summary[k] for k in ("TP", "TN", "FP", "FN", "excluded_unparseable_checks",
+                                        "unparseable_rate", "sensitivity", "specificity", "ppv", "f1", "macro_f1",
+                                        "complete_case_rate", "mean_false_alarms_per_image", "mean_calls_per_image")},
+            "count_n_scored": extra["counts_scored"], "count_exact_rate": extra["counts_exact_rate"],
+            "count_within_1_rate": extra["counts_within_1_rate"], "count_mae": extra["counts_mae"],
+            "count_strict_n": extra["counts_strict_scored"], "count_strict_mae": extra["counts_strict_mae"],
+            "count_unparseable": extra["counts_unparseable"],
+            "localized_cases": extra["regions_scored"],
+            **{"location_" + k: extra["regions_" + k] for k in ("TP", "TN", "FP", "FN")},
+            "location_f1": extra["regions_f1"], "region_exact_rate": extra["regions_exact_set_match_rate"],
+            "region_jaccard": extra["regions_mean_jaccard"],
+            **{"region_presence_" + k: (summary.get("region_presence") or {}).get(k)
+               for k in ("TP", "TN", "FP", "FN")},
+            "region_presence_f1": extra["region_presence_f1"],
+            "side_agreement_rate": extra["side_agreement_rate"], "location_excluded": extra["regions_excluded"],
+        })
+        findings.extend({"experiment": experiment, **row} for row in finding_rows(gt, report))
+        situations.extend({"experiment": experiment, **row} for row in report.get("case_breakdown", []))
+        situation_findings.extend({"experiment": experiment, **row}
+                                  for row in report.get("case_condition_breakdown", []))
+        for source, target in (("stage_changes", stages), ("phrasing_votes", phrasings),
+                               ("region_vote_comparison", vote_replays), ("parse_recovery", recoveries),
+                               ("call_usage", usage)):
+            target.extend({"dataset": dataset, "experiment": experiment, **row}
+                          for row in report.get(source, []))
+    return {"experiment_overview": overview, "finding_comparison": findings,
+            "situation_comparison": situations, "situation_finding_comparison": situation_findings,
+            "stage_comparison": stages, "phrasing_comparison": phrasings,
+            "vote_replay_comparison": vote_replays, "parse_recovery_comparison": recoveries,
+            "call_usage_comparison": usage}

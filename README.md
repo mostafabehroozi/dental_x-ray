@@ -42,11 +42,15 @@ their server settings differ), and Cell 10 translates the ground-truth boxes onc
 per adapter instead of once per experiment. Cell 11 then scores every experiment
 and ranks them:
 
-* `<output_root>/leaderboard.csv`: one row per experiment and dataset - F1,
-  sensitivity, specificity, PPV, macro F1, false alarms per image, unparseable
-  rate, coverage, not-assessed checks, count MAE, exact region-set rate,
-  presence-per-cell F1, calls per image. Each row is scored against that
+* `<output_root>/leaderboard.csv`: one row per experiment and dataset with the
+  protocol knobs, raw TP/TN/FP/FN, scored/expected/annotated denominators,
+  coverage, detection rates, count diagnostics, six-cell location diagnostics,
+  side agreement, and calls per image. Each row is scored against that
   experiment's own location truth.
+* `<output_root>/overview/`: joined experiment, finding, situation,
+  situation-by-finding, stage, phrasing, union/majority replay, parse-recovery,
+  and call-usage tables. Cell 11 shows compact decision columns; these CSVs keep
+  the full diagnostic rows and supporting image IDs.
 * `<output_root>/comparison/<dataset>/`: the same experiments compared **paired**
   on the same images against the first one - `paired_f1_delta`, checks corrected
   and worsened, newly unresolved, recorded calls and tokens.
@@ -153,6 +157,14 @@ The existing finding, count and location scoring rules are preserved.
 | `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
 | `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Missing usage is unavailable, with recorded-call denominators; transport attempts are not separate saved completions. |
 | `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
+| `case_condition_breakdown` | The same situations split by finding, including assessment status, raw confusion counts, coverage, optional count metrics, and six-cell location metrics. |
+
+Cell 11 also writes the joined versions to `<output_root>/overview/` as
+`experiment_overview`, `finding_comparison`, `situation_comparison`,
+`situation_finding_comparison`, `stage_comparison`, `phrasing_comparison`,
+`vote_replay_comparison`, `parse_recovery_comparison`, and
+`call_usage_comparison`. Findings without an active DentVLM task appear as
+`not_assessed`; their TP/TN/FP/FN cells are blank rather than misleading zeros.
 
 First-phrasing and region-vote replay use saved answers **after any parse repairs**;
 they do not simulate retries OFF or change predictions. Crown and bridge are
@@ -375,10 +387,11 @@ cell; an image whose true boxes could not be placed is left out and counted
 under `location_truth_excluded`), `regions.csv` (per-cell TP, FP, TN, FN,
 exact-set match, Jaccard, unlocalized rate, over the localized true positives
 only), `counts.csv` (only when the count question was asked), `per_image.csv`,
-and `evaluation.json` with a summary: micro and macro F1, complete-case rate,
-mean false alarms per image, the presence-per-cell micro numbers under
-`region_presence` (the leaderboard's `region_f1`), and the list of findings not
-assessed. `regions.csv` and `region_presence.csv` answer different questions:
+and `evaluation.json` with a summary: the saved protocol, micro and macro F1,
+complete-case rate, mean false alarms per image, the presence-per-cell micro
+numbers under `region_presence`, left/right side agreement when location is
+enabled, and the list of findings not assessed. `regions.csv` and
+`region_presence.csv` answer different questions:
 the first scores where a detected finding was placed, the second whether each
 cell was called correctly at all, absent findings included. Both need the
 location truth, so they follow `evaluate_location`.

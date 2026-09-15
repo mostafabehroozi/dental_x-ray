@@ -65,6 +65,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual((gt, results), before)
         self.assertEqual(report["summary"]["expected_finding_checks"], 9)
         self.assertEqual(len(report["summary"]["not_assessed"]), 5)
+        self.assertEqual(report["summary"]["protocol"]["phrasings"], 3)
+        self.assertIn("side_agreement", report["summary"])
         # Presence per cell: the filling's upper-left and the bridge's upper-right are hits, the filling's
         # lower-right (named by one phrasing, union vote) a false cell.
         self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "FN")}, {"TP": 2, "FP": 1, "FN": 0})
@@ -137,12 +139,36 @@ class AnalysisTests(unittest.TestCase):
 
     def test_task_support_and_case_denominators(self):
         gt, results = fixture()
-        rows = {(r["situation"], r["group"]): r for r in ev.evaluate(gt, results)["case_breakdown"]}
+        report = ev.evaluate(gt, results, dataset="toy")
+        rows = {(r["situation"], r["group"]): r for r in report["case_breakdown"]}
         self.assertEqual(rows["task_support", "untrained"]["not_assessed_checks"], 5)
         self.assertIsNone(rows["task_support", "untrained"]["coverage"])
         self.assertEqual(rows["instances_of_finding", "1"]["TP"], 2)
         self.assertIsNone(rows["instances_of_finding", "1"]["specificity"])
         self.assertEqual(rows["predicted_named_cells", "2+"]["counts_scored"], 0)
+        detail = [r for r in report["case_condition_breakdown"]
+                  if r["situation"] == "task_support" and r["group"] == "untrained"]
+        self.assertEqual(len(detail), 5)
+        self.assertTrue(all(r["assessment_status"] == "not_assessed" for r in detail))
+        self.assertTrue(all(r["dataset"] == "toy" for r in detail))
+
+    def test_compact_views_keep_confusion_support_and_native_subexperiments(self):
+        gt, results = fixture()
+        report = ev.evaluate(gt, results, dataset="toy")
+        views = da.compact_views({"toy": gt}, {("base", "toy"): report})
+        overall = views["experiment_overview"][0]
+        self.assertEqual({k: overall[k] for k in ("TP", "TN", "FP", "FN")},
+                         {"TP": 2, "TN": 7, "FP": 0, "FN": 0})
+        self.assertEqual(overall["not_assessed_checks"], 5)
+        self.assertEqual(overall["phrasings"], 3)
+        self.assertEqual(overall["localized_cases"], 2)
+        findings = views["finding_comparison"]
+        self.assertEqual(len(findings), len(dp.CONDITIONS))
+        self.assertEqual(sum(r["assessment_status"] == "not_assessed" for r in findings), 5)
+        self.assertTrue(views["situation_finding_comparison"])
+        self.assertTrue(views["stage_comparison"])
+        self.assertTrue(views["phrasing_comparison"])
+        self.assertEqual({r["region_vote"] for r in views["vote_replay_comparison"]}, {"union", "majority"})
 
     def test_comparison_distinguishes_newly_asked_from_newly_resolved(self):
         gt, base = fixture()
@@ -204,6 +230,9 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(len(scope["LEADERBOARD"]), 2)
             self.assertEqual(len(scope["COMPARISONS"]["toy"]["run_comparison"]), 2)
             self.assertTrue((root / "leaderboard.csv").is_file())
+            self.assertTrue((root / "overview" / "experiment_overview.csv").is_file())
+            self.assertTrue((root / "overview" / "finding_comparison.csv").is_file())
+            self.assertTrue((root / "overview" / "situation_finding_comparison.csv").is_file())
             self.assertTrue((root / "comparison" / "toy" / "run_comparison.csv").is_file())
             out = root / "a" / "toy" / "evaluation"
             self.assertTrue((out / "region_vote_comparison.csv").exists())

@@ -292,6 +292,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
     presence, whole_image, counts, region_presence, regions, per_image, not_assessed = [], [], [], [], [], [], []
+    protocol = results[ids[0]].get("protocol") if ids else None
     level = next((results[i]["location_level"] for i in ids), "none")
     count_asked = any(results[i].get("protocol", {}).get("count_question") for i in ids)
     # The whole-image answers are a separate result only in the crop comparison.
@@ -438,6 +439,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     scored_images = [r for r in per_image if r["scored_findings"]]
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
+        "protocol": protocol,
         "location_level": level, "not_assessed": not_assessed,
         "evaluate_location": evaluate_location,
         "location_truth": location_truth_summary({i: gt[i] for i in ids}) if evaluate_location else None,
@@ -466,12 +468,15 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         micro_cells = {k: sum(r[k] for r in region_presence) for k in ("TP", "FP", "TN", "FN")}
         summary["region_presence"] = {**micro_cells, **_prf(*(micro_cells[k] for k in ("TP", "FP", "TN", "FN"))),
                                       "unparseable": sum(r["unparseable"] for r in region_presence)}
+    if evaluate_location and level != "none":
+        summary["side_agreement"] = side_agreement({i: gt[i] for i in ids}, results)
     report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
               "region_presence": region_presence, "regions": regions, "per_image": per_image,
               "missing_results": missing}
     if include_analysis:
         from dental_analysis import analyze
-        report.update(analyze({i: gt[i] for i in ids}, results, evaluate_location=evaluate_location))
+        report.update(analyze({i: gt[i] for i in ids}, results, dataset=dataset,
+                              evaluate_location=evaluate_location))
     if out_dir:
         write_report(report, out_dir)
     return report
@@ -526,7 +531,10 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
     for name in ("presence", "whole_image", "counts", "region_presence", "regions", "per_image", "stage_changes",
                  "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage",
-                 "case_breakdown", "run_comparison", "run_changes"):
+                 "case_breakdown", "case_condition_breakdown", "run_comparison", "run_changes",
+                 "experiment_overview", "finding_comparison", "situation_comparison",
+                 "situation_finding_comparison", "stage_comparison", "phrasing_comparison",
+                 "vote_replay_comparison", "parse_recovery_comparison", "call_usage_comparison"):
         rows = report.get(name) or []
         if not rows:
             (out / f"{name}.csv").unlink(missing_ok=True)
