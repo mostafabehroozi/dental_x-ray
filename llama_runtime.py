@@ -172,7 +172,9 @@ def build_llama_cpp(
     # 3. Return an already valid binary unless rebuilding
     # ---------------------------------------------------------
 
-    if server.is_file() and not clean_build:
+    stamp = build_dir / ".commit"
+    built = stamp.read_text().strip() if stamp.is_file() else None
+    if server.is_file() and not clean_build and built == commit:
         print("Using existing llama-server:", server)
         return server.resolve()
 
@@ -260,6 +262,7 @@ def build_llama_cpp(
 
     if not os.access(server, os.X_OK):
         server.chmod(server.stat().st_mode | 0o111)
+    stamp.write_text(commit)
 
     print("\nllama-server successfully built:")
     print(server)
@@ -279,8 +282,10 @@ class LlamaCppServer:
         port: int = 8080,
         alias: str = "dentalgpt",
         n_gpu_layers: int = 999,
-        ctx_size: int = 8192,
+        ctx_size: int = 16384,
         parallel: int = 1,
+        image_max_tokens: int | None = 6144,
+        image_min_tokens: int | None = None,
         startup_timeout: float = 180.0,
         log_path: str | Path = "/kaggle/working/llama_dentalgpt_server.log",
     ):
@@ -293,6 +298,12 @@ class LlamaCppServer:
         self.n_gpu_layers = n_gpu_layers
         self.ctx_size = ctx_size
         self.parallel = parallel
+        # llama.cpp caps Qwen2.5-VL images at 4096 tokens (about 3.2 MP) unless told
+        # otherwise; a full-size panoramic needs ~4400-5900 tokens to keep the
+        # resolution the model was trained with. ctx must hold image + prompt + answer.
+        # No token floor: crops of small panoramics stay at native size, as in training.
+        self.image_max_tokens = image_max_tokens
+        self.image_min_tokens = image_min_tokens
         self.startup_timeout = startup_timeout
         self.log_path = Path(log_path)
         self.process: subprocess.Popen | None = None
@@ -343,6 +354,10 @@ class LlamaCppServer:
             "--reasoning-format",
             "none",
         ]
+        if self.image_max_tokens:
+            command += ["--image-max-tokens", str(self.image_max_tokens)]
+        if self.image_min_tokens:
+            command += ["--image-min-tokens", str(self.image_min_tokens)]
 
         print("Starting llama.cpp DentalGPT server...")
         print(" ".join(command))
