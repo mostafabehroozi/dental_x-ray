@@ -30,6 +30,7 @@ import dental_pipeline as dp
 import llm_api
 import location_adapter as la
 import report_writer as rw
+from response_cache import ResponseCache
 
 BACKENDS = ("api", "local")
 LOCATION_TRUTHS = ("llm", "fdm", "geometry")
@@ -46,6 +47,7 @@ DEFAULTS = {
     "max_tokens": 4096,
     "temperature": 0.0,                # None leaves the field out (reasoning models)
     "cache_prompt": True,              # local only: reuse the image KV prefix across one image's questions
+    "reuse_local_responses": True,     # exact shared cache under output_root; safe across matching experiments
     "request_timeout_seconds": 600.0,
     "api_call_retries": 2,             # visible retries for transient API/transport failures
 
@@ -139,6 +141,8 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
             raise ValueError(f"{name}: {knob} must be a positive integer, got {cfg[knob]!r}")
     if cfg["report_images"] is not None and (type(cfg["report_images"]) is not int or cfg["report_images"] <= 0):
         raise ValueError(f"{name}: report_images must be None or a positive integer")
+    if type(cfg["reuse_local_responses"]) is not bool:
+        raise ValueError(f"{name}: reuse_local_responses must be True or False")
     if cfg["location_failure_policy"] not in ("geometry", "exclude", "error"):
         raise ValueError(f"{name}: location_failure_policy must be 'geometry', 'exclude' or 'error'")
     if cfg["backend"] == "api":
@@ -244,6 +248,28 @@ def truth_dir(cfg: dict, dataset: str, mode: str | None = None) -> Path:
 # ----------------------------------------------------------------------------
 # The three model roles of one experiment
 # ----------------------------------------------------------------------------
+def _file_identity(path: str | Path) -> dict:
+    """Cheap restart-safe identity for a local runtime artifact."""
+    path = Path(path).resolve()
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def local_response_cache(cfg: dict, server) -> ResponseCache | None:
+    """One shared exact-response cache for compatible local experiments."""
+    if not cfg["reuse_local_responses"]:
+        return None
+    namespace = {
+        "backend": "local",
+        "hf_repo_id": cfg["hf_repo_id"],
+        "model": _file_identity(server.model_path),
+        "mmproj": _file_identity(server.mmproj_path),
+        "llama_server": _file_identity(server.binary),
+        "server": {key: cfg[key] for key in SERVER_KEYS},
+    }
+    return ResponseCache(Path(cfg["output_root"]) / "_response_cache", namespace)
+
+
 def runner(cfg: dict, server=None) -> dp.VisionRunner:
     """The analyzer: this experiment's hosted model, or the running local llama.cpp server."""
     if not is_local(cfg):
@@ -253,7 +279,8 @@ def runner(cfg: dict, server=None) -> dp.VisionRunner:
         raise ValueError(f"{cfg['name']}: backend 'local' needs a started llama.cpp server")
     return dp.VisionRunner(base_url=f"{server.base_url}/v1", model=server.alias, max_tokens=cfg["max_tokens"],
                            temperature=cfg["temperature"], timeout=cfg["request_timeout_seconds"], local=True,
-                           cache_prompt=cfg["cache_prompt"], api_call_retries=cfg["api_call_retries"])
+                           cache_prompt=cfg["cache_prompt"], api_call_retries=cfg["api_call_retries"],
+                           response_cache=local_response_cache(cfg, server))
 
 
 def location_adapter(cfg: dict, runner=None, mode: str = "plain"):

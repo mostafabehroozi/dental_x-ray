@@ -58,9 +58,18 @@ Cells 11 to 13 look at one experiment at a time: `INSPECT_EXPERIMENT` selects it
 for the per-finding tables, for one image's raw answers, and for the dentist
 report (one report call per image, so it defaults to the inspected experiment).
 
-Running several experiments multiplies model calls. `"limit"` in `DATASETS`
-keeps a first sweep cheap, and every cell resumes, so a sweep can be extended,
-or an experiment added, without recomputing what is already saved.
+Running several experiments increases the number of logical questions. `"limit"`
+in `DATASETS` controls the selected images, and every cell resumes, so a sweep
+can be extended or an experiment added without recomputing saved results.
+
+Local experiments also share an exact response cache under
+`<output_root>/_response_cache`. A reply is reused only when the model files,
+llama.cpp binary and server settings, complete request, prompt, generation
+settings, and image or crop bytes match. Each experiment still writes a normal
+result with the raw reply and marks the call with `cache_hit`; changed prompts,
+crops, modes, token budgets, checkpoints, or runtime settings miss the cache.
+Set `reuse_local_responses=False` only when independently repeating identical
+deterministic calls is itself part of the experiment.
 
 ## Why it looks like this
 
@@ -224,13 +233,14 @@ directory.
 | `dental_pipeline.py` | prompts and region wording, answer extraction, crops, model runner, probe, `Protocol`, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. presence per region, per-region counts and the side check, CSV/JSON export |
 | `dental_analysis.py` | offline regional changes, parse recovery, case breakdowns, and paired saved-run comparisons |
+| `response_cache.py` | immutable, content-addressed reuse of exact local model responses across compatible experiments |
 | `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment, the probe decision |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
 | `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 10 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py`, `test_response_cache.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Runtime settings that matter
 
@@ -443,6 +453,8 @@ supporting image IDs, in `evaluation.json` and matching CSV files:
   is unavailable when location scoring is off or a true box was excluded.
 * `call_usage`: recorded analyzer completions, tokens and latency, split into
   first attempts and parse retries. Combined fields do not duplicate call costs.
+  `calls` counts logical questions, while `inference_calls`, `cache_hits`, and
+  their token/latency totals expose how much model work was actually performed.
   Missing metadata is unavailable, with recorded-call denominators beside usage;
   transport retry attempts are not stored as individual completions.
 * `case_breakdown`: one/multiple boxes for a finding, absent findings with/without

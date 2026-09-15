@@ -123,10 +123,14 @@ def call_usage(results):
     rows = []
     for (stage, attempt), calls in sorted(groups.items()):
         row = {"stage": stage, "attempt": attempt, "calls": len(calls)}
+        row["inference_calls"] = sum(not call.get("cache_hit", False) for call in calls)
+        row["cache_hits"] = sum(call.get("cache_hit", False) for call in calls)
         for field in ("prompt_tokens", "completion_tokens", "latency_seconds"):
             values = [c[field] for c in calls if c.get(field) is not None]
             row[field + "_recorded_calls"] = len(values)
             row[field] = round(sum(values), 4) if values else None
+            inference_values = [c[field] for c in calls if not c.get("cache_hit", False) and c.get(field) is not None]
+            row["inference_" + field] = round(sum(inference_values), 4) if inference_values else None
         rows.append(row)
     return rows
 
@@ -287,12 +291,20 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
         call_counts = [r["call_count"] for r in results.values() if r.get("call_count") is not None]
         row["call_counts_recorded_images"] = len(call_counts)
         row["mean_calls_per_image"] = ev._ratio(sum(call_counts), len(call_counts))
+        inference_counts = [r.get("inference_call_count", r.get("call_count")) for r in results.values()
+                            if r.get("inference_call_count", r.get("call_count")) is not None]
+        cache_hits = [r.get("cache_hit_count", 0) for r in results.values()]
+        row["mean_inference_calls_per_image"] = ev._ratio(sum(inference_counts), len(inference_counts))
+        row["cache_hits"] = sum(cache_hits)
+        row["cache_hit_rate"] = ev._ratio(sum(cache_hits), sum(call_counts))
         calls = [c for r in results.values() for c in r.get("calls", [])]
         row["recorded_calls"] = len(calls)
         for field in ("prompt_tokens", "completion_tokens", "latency_seconds"):
             values = [c[field] for c in calls if c.get(field) is not None]
             row[field + "_recorded_calls"] = len(values)
             row[field] = round(sum(values), 4) if values else None
+            inference_values = [c[field] for c in calls if not c.get("cache_hit", False) and c.get(field) is not None]
+            row["inference_" + field] = round(sum(inference_values), 4) if inference_values else None
         rows.append(row)
     return {"run_comparison": rows, "run_changes": changes}
 
@@ -319,7 +331,9 @@ def compact_views(reports):
             "coverage": extra["coverage"],
             **{k: summary[k] for k in ("TP", "TN", "FP", "FN", "excluded_unparseable_checks",
                                         "unparseable_rate", "sensitivity", "specificity", "ppv", "f1", "macro_f1",
-                                        "complete_case_rate", "mean_false_alarms_per_image", "mean_calls_per_image")},
+                                        "complete_case_rate", "mean_false_alarms_per_image", "mean_calls_per_image",
+                                        "logical_calls", "inference_calls", "cache_hits",
+                                        "mean_inference_calls_per_image", "mean_cache_hits_per_image", "cache_hit_rate")},
             "count_n_scored": extra["counts_scored"],
             "count_exact_rate": extra["counts_exact_rate"],
             "count_within_1_rate": extra["counts_within_1_rate"],
