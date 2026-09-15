@@ -253,20 +253,23 @@ class RunLoopFailureTests(unittest.TestCase):
         self.assertEqual({Path(s).stem for s in runner.asked}, {"img1", "img2", "img3"})
 
     def test_per_image_line_names_what_was_found(self):
+        """One positive answer, and the image's line has to name the finding it belongs to."""
+        first = dp.CONDITIONS[0]
+        positive = (dp.questions_for(dp.condition_tasks(first, False)[0])[0] if DENTVLM
+                    else dp.presence_question(first, "plain"))
+
         class OneFinding(FlakyRunner):
             def ask(self, image, question):
-                first = dp.CONDITIONS[0]
-                label = dp.LABELS[first] if not DENTVLM else first
-                positive = label.lower() in question.lower() or first.replace("_", " ") in question.lower()
-                return reply(("Yes" if DENTVLM else "A") if positive else ("No" if DENTVLM else "B"))
+                hit = question.strip().startswith(positive.strip())
+                return reply(("Yes" if DENTVLM else "A") if hit else ("No" if DENTVLM else "B"))
 
-        images = _images(self.root, ["img1"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            dp.run_dataset(OneFinding(), images, self.root / "run" / "umfih", protocol=protocol())
+            dp.run_dataset(OneFinding(), _images(self.root, ["img1"]), self.root / "run" / "umfih",
+                           protocol=protocol())
         printed = out.getvalue()
-        self.assertIn("present=1", printed)
-        self.assertIn(dp.CONDITIONS[0], printed)
+        self.assertIn("yes=1" if DENTVLM else "present=1", printed)
+        self.assertIn(first, printed)
 
     def test_results_stay_loadable_after_a_failure(self):
         _, results, _, _, run_dir = self._run(["img1", "img2"], {"img1"})
