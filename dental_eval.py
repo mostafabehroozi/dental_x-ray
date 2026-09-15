@@ -431,12 +431,17 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             "complete_case": (truths <= preds) if scored and not unparsed else None,
             "false_alarms": len(preds - truths), "unparseable": unparsed,
             "calls": results[image_id].get("call_count"),
+            "inference_calls": results[image_id].get("inference_call_count", results[image_id].get("call_count")),
+            "cache_hits": results[image_id].get("cache_hit_count", 0),
         })
 
     micro = {k: sum(r[k] for r in presence) for k in ("TP", "FP", "TN", "FN")}
     f1s = [r["f1"] for r in presence if r["f1"] is not None]
     complete_images = [r for r in per_image if r["complete_case"] is not None]
     scored_images = [r for r in per_image if r["scored_findings"]]
+    logical_calls = sum(r["calls"] or 0 for r in per_image)
+    inference_calls = sum(r["inference_calls"] or 0 for r in per_image)
+    cache_hits = sum(r["cache_hits"] or 0 for r in per_image)
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "protocol": protocol,
@@ -459,7 +464,13 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                                         sum(1 for r in per_image if r["gt_present_scored"])),
         "mean_false_alarms_per_image": _ratio(sum(r["false_alarms"] for r in scored_images), len(scored_images)),
         "images_with_false_alarm_rate": _ratio(sum(r["false_alarms"] > 0 for r in scored_images), len(scored_images)),
-        "mean_calls_per_image": _ratio(sum(r["calls"] or 0 for r in per_image), len(per_image)),
+        "logical_calls": logical_calls,
+        "inference_calls": inference_calls,
+        "cache_hits": cache_hits,
+        "mean_calls_per_image": _ratio(logical_calls, len(per_image)),
+        "mean_inference_calls_per_image": _ratio(inference_calls, len(per_image)),
+        "mean_cache_hits_per_image": _ratio(cache_hits, len(per_image)),
+        "cache_hit_rate": _ratio(cache_hits, logical_calls),
     }
     if whole_image:
         micro_whole = {k: sum(r[k] for r in whole_image) for k in ("TP", "FP", "TN", "FN")}

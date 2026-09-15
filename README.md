@@ -60,9 +60,19 @@ for the per-finding tables and saved diagnostics, for one image's raw answers,
 and for the dentist report (one report call per image, so it defaults to the
 inspected experiment).
 
-Running several experiments multiplies model calls. `"limit"` in `DATASETS` keeps
-a first sweep cheap, and every cell resumes, so a sweep can be extended, or an
-experiment added, without recomputing what is already saved.
+Running several experiments increases the number of logical questions. `"limit"`
+in `DATASETS` controls the selected images, and every cell resumes, so a sweep
+can be extended or an experiment added without recomputing saved results.
+
+Local DentVLM experiments share an exact response cache under
+`<output_root>/_response_cache`. This is especially useful here: the base question
+is also phrasing 1 of the three-phrasing run, the whole-image stage of the crop
+run, and the presence stage of the optional-count run. A reply is reused only
+when the converted model files, llama.cpp binary and server settings, complete
+request, prompt, generation settings, and image or crop bytes match. Changed
+phrasings, crops, token budgets, models, or runtime settings miss the cache.
+Set `reuse_local_responses=False` only when independently repeating identical
+deterministic calls is itself part of the experiment.
 
 ## Why it looks like this
 
@@ -135,13 +145,14 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell, side-convention check, CSV/JSON export |
 | `dental_analysis.py` | offline phrasing/vote and crop comparisons, recovery, case breakdowns, paired saved-run comparisons |
+| `response_cache.py` | immutable, content-addressed reuse of exact local DentVLM responses across compatible experiments |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image (tasks, cells, multiplicity, extra tasks, not-assessed findings), report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment |
 | `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction |
 | `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 11 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py`, `test_response_cache.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Small evaluation comparisons (Cells 11 and 12)
 
@@ -155,7 +166,7 @@ The existing finding, count and location scoring rules are preserved.
 | `phrasing_votes` | Agreement, disagreement, ties, and unresolved phrasings per task. Available when multiple phrasing answers were saved. |
 | `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules. Only for rationale mode with multiple saved phrasings; crop locations do not use this vote. |
 | `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
-| `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Missing usage is unavailable, with recorded-call denominators; transport attempts are not separate saved completions. |
+| `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Logical calls, actual inference calls and cache hits are separate, with inference-only token/latency totals. Missing usage is unavailable; transport attempts are not separate saved completions. |
 | `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
 | `case_condition_breakdown` | The same situations split by finding, including assessment status, raw confusion counts, coverage, optional count metrics, and six-cell location metrics. |
 

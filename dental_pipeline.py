@@ -35,6 +35,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import llm_api
+from response_cache import ResponseCache
 
 # Stable ontology in YOLO class order of the UMFIH 14-class dataset.
 CONDITIONS = (
@@ -406,6 +407,7 @@ class VisionRunner:
         request_options: dict | None = None,
         token_param: str = "max_tokens",
         api_call_retries: int = 2,
+        response_cache: ResponseCache | None = None,
         client=None,
     ) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
@@ -420,7 +422,10 @@ class VisionRunner:
         self.cache_prompt = cache_prompt
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
+        self.response_cache = response_cache
         self.calls = 0
+        self.requests = 0
+        self.cache_hits = 0
 
     @classmethod
     def from_api(cls, spec: dict, max_tokens: int = 4096, temperature: float | None = 0.0,
@@ -461,12 +466,24 @@ class VisionRunner:
             # in the authors' inference script (1.05).
             request["extra_body"] = {"cache_prompt": self.cache_prompt, "repeat_penalty": 1.05, "seed": 0}
         request.update(self.request_options)
+        self.requests += 1
+        cache_key = self.response_cache.key(request) if self.response_cache is not None else None
+        cached = self.response_cache.get(cache_key) if self.response_cache is not None else None
+        if cached is not None:
+            self.cache_hits += 1
+            result = {**cached, "cache_hit": True, "cache_key": cache_key}
+            print(f"request {self.requests} | CACHE HIT | prompt_tokens={result['prompt_tokens']} "
+                  f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
+            return result
         started = time.perf_counter()
         normalized = llm_api.call_with_retries(
             lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)), self.api_call_retries,
             f"analyzer model={self.model}")
         self.calls += 1
-        result = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3)}
+        result = {**normalized, "latency_seconds": round(time.perf_counter() - started, 3),
+                  "cache_hit": False, "cache_key": cache_key}
+        if self.response_cache is not None:
+            self.response_cache.put(cache_key, result)
         print(f"call {self.calls} | {result['latency_seconds']}s | prompt_tokens={result['prompt_tokens']} "
               f"| completion_tokens={result['completion_tokens']} | finish={result['finish_reason']}")
         return result
@@ -647,6 +664,8 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
         "findings": findings,
         "calls": calls,
         "call_count": len(calls),
+        "inference_call_count": sum(not call.get("cache_hit", False) for call in calls),
+        "cache_hit_count": sum(call.get("cache_hit", False) for call in calls),
         "parse_recovery": llm_api.parse_recovery_summary(calls),
         "aggregation_warnings": aggregation_warnings,
     }

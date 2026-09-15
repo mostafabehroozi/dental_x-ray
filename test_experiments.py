@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import experiments as xp
 
@@ -32,6 +33,10 @@ class BuildTests(unittest.TestCase):
             xp.build([{"name": "typo", "phrasing": 3}], SHARED)
         with self.assertRaisesRegex(ValueError, "shared: unknown knob"):
             xp.build([{"name": "base"}], {"outputroot": "/tmp/out"})
+
+    def test_response_reuse_switch_must_be_boolean(self):
+        with self.assertRaisesRegex(ValueError, "reuse_local_responses must be True or False"):
+            xp.build([{"name": "bad-cache", "reuse_local_responses": "yes"}], SHARED)
 
     def test_names_must_be_unique_and_directory_safe(self):
         with self.assertRaisesRegex(ValueError, "unique"):
@@ -111,6 +116,27 @@ class PathAndRoleTests(unittest.TestCase):
         local, = xp.build([{"name": "local", "backend": "local"}], SHARED)
         with self.assertRaisesRegex(ValueError, "needs a started llama.cpp server"):
             xp.runner(local)
+
+    def test_local_response_cache_is_shared_only_by_matching_runtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = [root / name for name in ("model.gguf", "mmproj.gguf", "llama-server")]
+            for path in files:
+                path.write_bytes(path.name.encode())
+            server = SimpleNamespace(model_path=files[0], mmproj_path=files[1], binary=files[2])
+            base, phrased, smaller = xp.build([
+                {"name": "base", "backend": "local"},
+                {"name": "phrased", "backend": "local", "phrasings": 3},
+                {"name": "smaller", "backend": "local", "image_max_tokens": 1369},
+            ], {**SHARED, "output_root": tmp})
+
+            base_cache = xp.local_response_cache(base, server)
+            phrased_cache = xp.local_response_cache(phrased, server)
+            smaller_cache = xp.local_response_cache(smaller, server)
+            self.assertEqual(base_cache.namespace_sha256, phrased_cache.namespace_sha256)
+            self.assertNotEqual(base_cache.namespace_sha256, smaller_cache.namespace_sha256)
+            self.assertEqual(base_cache.root, Path(tmp, "_response_cache"))
+            self.assertIsNone(xp.local_response_cache({**base, "reuse_local_responses": False}, server))
 
     def test_adapter_follows_the_location_knobs(self):
         off, windows = xp.build([{"name": "off", "evaluate_location": False},
