@@ -71,7 +71,12 @@ DEFAULTS = {
     # Dentist report: a text model turns one image's answers into a classified report.
     "reporter": {"provider": "openai", "model": "gpt-5",
                  "token_param": "max_completion_tokens", "temperature": None, "max_output_tokens": 8192,
-                 "include_rationale": False},
+                 "include_rationale": False,
+                 # ON: the report is also given the vote behind each answer (how many of the question's
+                 # wordings reported the finding, how many named each region) and describes that
+                 # agreement in words. Needs phrasings > 1 to measure anything. It changes the report
+                 # only: the predictions, the union/majority vote and the evaluation are untouched.
+                 "vote_agreement": False},
     "report_language": "English",
     "report_images": None,             # None = every image with a result; N = only the first N
 
@@ -147,6 +152,8 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
     if cfg["evaluate_location"] and cfg["location_truth"] == "llm":
         _check_spec(cfg["adapter"], "adapter", name)
     _check_spec(cfg["reporter"], "reporter", name)
+    if type(cfg["reporter"].get("vote_agreement", False)) is not bool:
+        raise ValueError(f"{name}: reporter vote_agreement must be True or False")
     protocol(cfg)  # the Protocol validates its own knobs
 
     # Retry and failure settings reach the roles that need them; a spec may override any of them.

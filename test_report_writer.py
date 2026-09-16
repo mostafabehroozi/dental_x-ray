@@ -424,5 +424,217 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(rw.load_reports(out).keys(), reports.keys())
 
 
+# Three wordings per task, disagreeing on purpose: the votes the agreement block has to preserve.
+# fillings  3/3 Yes, all three name the lower right, one also names the upper right (union merges them)
+# caries    1 Yes, 2 No           -> absent, but one wording reported it
+# implant   1 unreadable, 2 Yes   -> present on 2 of 2 readable answers, never 3/3
+# impacted  1 Yes, 1 No, 1 unreadable -> a tie: no decision
+VOTES = {
+    dp.questions_for("fillings")[0]: f"Yes\nFillings in {LOWER_LEFT}.",
+    dp.questions_for("fillings")[1]: f"Yes\nFillings in {LOWER_LEFT} and {UPPER_LEFT}.",
+    dp.questions_for("fillings")[2]: f"Yes\nFillings in {LOWER_LEFT}.",
+    dp.questions_for("caries")[0]: "Yes\nCaries is suspected.",
+    dp.questions_for("caries")[1]: "No\nNo caries.",
+    dp.questions_for("caries")[2]: "No\nNo caries.",
+    dp.questions_for("implant")[0]: "Yes and no.",
+    dp.questions_for("implant")[1]: f"Yes\nAn implant in {UPPER_ANTERIOR}.",
+    dp.questions_for("implant")[2]: f"Yes\nAn implant in {UPPER_ANTERIOR}.",
+    dp.questions_for("impacted_tooth")[0]: f"Yes\nAn impacted tooth in {LOWER_RIGHT}.",
+    dp.questions_for("impacted_tooth")[1]: "No\nNothing of the kind is seen.",
+    dp.questions_for("impacted_tooth")[2]: "Perhaps.",
+}
+
+
+class VoteAgreementTests(unittest.TestCase):
+    """The optional agreement block: the saved vote reaches the report as counts, off by default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.image = Path(self.tmp.name) / "img1.png"
+        self.image.write_bytes(b"\x89PNG")
+        self.result = self._run(dp.Protocol(phrasings=3))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, protocol):
+        result = dp.analyze_image(ScriptedRunner(VOTES), self.image, protocol=protocol)
+        result["image_id"] = "img1"
+        return result
+
+    def _findings(self, result=None, **options):
+        structured = rw.structured_findings(result or self.result, "DentVLM", vote_agreement=True, **options)
+        return structured, {f["finding"]: f for f in structured["findings"]}
+
+    def test_off_changes_nothing(self):
+        """The knob off: the same JSON, the same prompt, the same Markdown as before it existed."""
+        structured = rw.structured_findings(self.result, "DentVLM")
+        self.assertNotIn("agreement", json.dumps(structured))
+        self.assertNotIn("vote_agreement", structured["analysis"])
+        self.assertNotIn(rw.AGREEMENT_LIMITATION, structured["analysis"]["limitations"])
+        prompt = rw.user_prompt(structured, "English")
+        self.assertNotIn("AGREEMENT BETWEEN WORDINGS", prompt)
+        self.assertNotIn("7. Agreement", prompt)
+        self.assertEqual(rw.verify_report(good_report(structured), structured), [])
+        markdown = rw.render_markdown(good_report(structured), structured)
+        self.assertNotIn("agreement between wordings", markdown)
+        writer = rw.ReportWriter(None, "k", "m", client=FakeClient([]))
+        self.assertFalse(writer.vote_agreement)
+        self.assertNotIn("agreement_prompt", writer.settings())
+
+    def test_presence_and_region_votes_stay_apart(self):
+        """3/3 for one region and 1/3 for another survive the union that merged them into one list."""
+        _, by = self._findings()
+        filling = by["dental_filling"]
+        self.assertEqual(filling["located_in"], ["upper-right-posterior", "lower-right-posterior"])  # union
+        block = filling["agreement"]
+        self.assertTrue(block["measured"])
+        self.assertEqual((block["presence"]["vote"], block["presence"]["band"], block["presence"]["decision"]),
+                         ("3/3", "consistent", "present"))
+        self.assertEqual({name: vote["vote"] for name, vote in block["regions"].items()},
+                         {"upper-right-posterior": "1/3", "upper-anterior": "0/3", "upper-left-posterior": "0/3",
+                          "lower-right-posterior": "3/3", "lower-anterior": "0/3", "lower-left-posterior": "0/3"})
+        self.assertEqual((block["regions"]["lower-right-posterior"]["band"],
+                          block["regions"]["upper-right-posterior"]["band"]), ("consistent", "weak"))
+        self.assertEqual(block["region_vote_policy"], "union")
+        self.assertIn("not evidence that the region is free of the finding", block["regions_basis"])
+        self.assertNotIn("agreement", filling["tasks"][0])  # one task: the finding's block is that task's
+
+    def test_unreadable_answers_are_never_counted_as_votes(self):
+        """Two readable answers out of three wordings are 2/2, with the third named as unreadable."""
+        _, by = self._findings()
+        presence = by["dental_implant"]["agreement"]["presence"]
+        self.assertEqual((presence["vote"], presence["wordings_requested"], presence["unreadable"]), ("2/2", 3, 1))
+        self.assertEqual((presence["band"], presence["decision"], presence["tie"]), ("moderate", "present", False))
+        self.assertNotEqual(presence["vote"], "3/3")
+        self.assertEqual(by["dental_implant"]["agreement"]["regions"]["upper-anterior"]["vote"], "2/2")
+
+    def test_a_tie_is_named_as_a_tie(self):
+        """An even split is a tie with no decision, not an absence and not a quiet majority."""
+        _, by = self._findings()
+        impacted = by["impacted_tooth"]
+        self.assertEqual(impacted["status"], "unparseable")
+        presence = impacted["agreement"]["presence"]
+        self.assertEqual((presence["band"], presence["tie"], presence["decision"]), ("tie", True, "no decision"))
+        self.assertEqual((presence["present_votes"], presence["absent_votes"], presence["unreadable"]), (1, 1, 1))
+        self.assertIn("split evenly", presence["wording"])
+
+    def test_a_minority_report_is_kept_on_an_absent_finding(self):
+        """One wording of three reported caries: the finding stays absent, the vote stays visible."""
+        _, by = self._findings()
+        caries = by["carious_lesion"]
+        self.assertEqual(caries["status"], "absent")
+        presence = caries["agreement"]["presence"]
+        self.assertEqual((presence["vote"], presence["decision"], presence["present_votes"]), ("2/3", "absent", 1))
+
+    def test_not_assessed_and_single_wording_say_so(self):
+        """Nothing is claimed for a finding never asked, or for a run with one wording per task."""
+        _, by = self._findings()
+        never = by["furcation_lesion"]["agreement"]
+        self.assertEqual((never["measured"], never["presence"], never["regions"]), (False, None, {}))
+        self.assertIn("no question for this finding", never["reason"])
+
+        structured, by = self._findings(self._run(dp.Protocol()))
+        self.assertFalse(structured["analysis"]["vote_agreement"]["measured"])
+        single = by["dental_filling"]["agreement"]
+        self.assertFalse(single["measured"])
+        self.assertEqual((single["presence"]["band"], single["reason"]),
+                         ("single", "this run asked one wording per task"))
+        self.assertEqual(rw.agreement_note(by["dental_filling"]), "")
+
+    def test_region_questions_have_no_vote_to_report(self):
+        """In region mode each region is asked once, so no region agreement may be claimed."""
+        _, by = self._findings(self._run(dp.Protocol(phrasings=3, location="regions")))
+        block = by["dental_filling"]["agreement"]
+        self.assertEqual(block["regions"], {})
+        self.assertIn("asked each region its own question, once", block["regions_basis"])
+        self.assertIn("whole-image question only", block["scope"])
+
+    def test_several_tasks_keep_their_own_votes(self):
+        """A finding decided by two tasks is attributed, never summed."""
+        script = {**VOTES, dp.questions_for("prosthetic_bridge")[0]: f"Yes\nA bridge in {UPPER_ANTERIOR}.",
+                  dp.questions_for("prosthetic_bridge")[1]: f"Yes\nA bridge in {UPPER_ANTERIOR}.",
+                  dp.questions_for("prosthetic_bridge")[2]: "No\nNo bridge."}
+        result = dp.analyze_image(ScriptedRunner(script), self.image, protocol=dp.Protocol(phrasings=3))
+        result["image_id"] = "img1"
+        _, by = self._findings(result)
+        prosthetic = by["prosthetic_restoration"]
+        self.assertEqual(prosthetic["status"], "present")
+        block = prosthetic["agreement"]
+        self.assertEqual(block["tasks_voted"], ["prosthetic_crown", "prosthetic_bridge"])
+        self.assertEqual((block["presence"]["vote"], block["presence"]["from_task"]), ("2/3", "prosthetic_bridge"))
+        self.assertEqual(block["regions"]["upper-anterior"]["from_task"], "prosthetic_bridge")
+        self.assertEqual([t["agreement"]["presence"]["vote"] for t in prosthetic["tasks"]], ["3/3", "2/3"])
+
+    def test_prompt_and_legend_describe_the_counts(self):
+        structured, _ = self._findings()
+        prompt = rw.user_prompt(structured, "Persian")
+        self.assertIn("AGREEMENT BETWEEN WORDINGS", prompt)
+        self.assertIn("7. Agreement between wordings", prompt)
+        self.assertLess(prompt.index("AGREEMENT BETWEEN WORDINGS"), prompt.index("HOW TO WRITE"))
+        self.assertLess(prompt.index("7. Agreement between wordings"), prompt.index("OUTPUT\nJSON only"))
+        self.assertIn("NOT diagnostic confidence", prompt)
+        self.assertNotIn("{language}", prompt)
+        self.assertIn("agreement", structured["legend"])
+        self.assertIn(rw.AGREEMENT_LIMITATION, structured["analysis"]["limitations"])
+        self.assertEqual(structured["analysis"]["vote_agreement"]["wordings_per_task"], 3)
+        with self.assertRaises(ValueError):  # a prompt edit that loses an anchor fails loudly
+            rw.with_agreement("no anchors here")
+
+    def test_invented_counts_are_rejected(self):
+        structured, _ = self._findings()
+        report = good_report(structured)
+        self.assertEqual(rw.verify_report(report, structured), [])
+        for section in report["sections"]:
+            for entry in section["findings"]:
+                if entry["finding"] == "dental_filling":
+                    entry["statement"] = "Fillings: lower right 3/3, upper right 1/3, reported by 3/3 wordings."
+        self.assertEqual(rw.verify_report(report, structured), [])  # the counts the data holds are fine
+        for section in report["sections"]:
+            for entry in section["findings"]:
+                if entry["finding"] == "dental_implant":
+                    entry["statement"] = "An implant, reported by 3/3 wordings."
+        problems = rw.verify_report(report, structured)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("dental_implant: the statement quotes vote counts the data does not hold: 3/3", problems[0])
+        # The impression may quote any finding's counts, but not one that exists nowhere in the data.
+        report["impression"] = ["Fillings on 3/3 wordings, caries on 2/3."]
+        self.assertFalse(any(p.startswith("impression:") for p in rw.verify_report(report, structured)))
+        report["impression"] = ["Fillings reported by 3/2 answers."]
+        self.assertTrue(any(p.startswith("impression: quotes vote counts") for p in rw.verify_report(report, structured)))
+
+    def test_markdown_keeps_the_counts_and_the_caveat(self):
+        structured, by = self._findings()
+        markdown = rw.render_markdown(good_report(structured), structured, "gpt-5")
+        self.assertIn("agreement between wordings - 3/3 readable answers said present; "
+                      "regions upper-right-posterior 1/3, lower-right-posterior 3/3", markdown)
+        self.assertIn("2/2 readable answers said present (3 wordings asked, 1 unreadable)", markdown)
+        self.assertIn("the readable answers tied, 1 present to 1 absent", markdown)
+        self.assertIn("not probability or certainty", markdown)
+        self.assertNotIn("agreement between wordings", rw.agreement_note(by["furcation_lesion"]))
+
+    def test_writer_option_and_settings(self):
+        client = FakeClient([])
+        writer = rw.ReportWriter.from_api({"provider": "openai", "model": "gpt-5", "api_key": "k",
+                                           "base_url": "https://api.openai.com/v1", "vote_agreement": True},
+                                          client=client)
+        self.assertTrue(writer.vote_agreement)
+        self.assertIn("agreement_prompt", writer.settings())
+        self.assertNotIn("agreement_prompt", writer.public())
+        self.assertTrue(writer.public()["vote_agreement"])
+        # A run with the knob on must not resume into a directory written with it off.
+        off = rw.ReportWriter(None, "k", "gpt-5", client=FakeClient([]))
+        self.assertNotEqual(writer.settings(), off.settings())
+
+        structured = rw.structured_findings(self.result, "DentVLM", vote_agreement=True)
+        client.texts.append(json.dumps(good_report(structured)))
+        payload = writer.write(self.result, "DentVLM")
+        self.assertTrue(payload["verified"])
+        self.assertEqual(payload["structured"], structured)
+        self.assertIn("AGREEMENT BETWEEN WORDINGS", payload["prompt"])
+        self.assertIn('"vote": "3/3"', payload["prompt"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

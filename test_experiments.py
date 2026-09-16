@@ -38,6 +38,15 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reuse_local_responses must be True or False"):
             xp.build([{"name": "bad-cache", "reuse_local_responses": "yes"}], SHARED)
 
+    def test_reporter_vote_agreement_is_an_off_by_default_switch(self):
+        cfg, = xp.build([{"name": "base"}], SHARED)
+        self.assertFalse(cfg["reporter"]["vote_agreement"])
+        on, = xp.build([{"name": "votes", "phrasings": 3, "reporter": {"vote_agreement": True}}], SHARED)
+        self.assertTrue(on["reporter"]["vote_agreement"])
+        self.assertEqual(on["reporter"]["model"], xp.DEFAULTS["reporter"]["model"])  # merged, not replaced
+        with self.assertRaisesRegex(ValueError, "vote_agreement must be True or False"):
+            xp.build([{"name": "bad", "reporter": {"vote_agreement": "yes"}}], SHARED)
+
     def test_names_must_be_unique_and_directory_safe(self):
         with self.assertRaisesRegex(ValueError, "unique"):
             xp.build([{"name": "same"}, {"name": "same"}], SHARED)

@@ -336,6 +336,31 @@ actually produces:
    deterministically (sections in a fixed order; ● present, ○ absent,
    ? unparseable, – not assessed).
 
+**Agreement between wordings (`vote_agreement`, off).** With `phrasings > 1`
+every task is answered several times and voted, but the report was only ever
+given the decision, so `region_vote="union"` reached it with a region three
+wordings named and a region one wording named looking equally supported. With
+the reporter's `vote_agreement` knob on, each finding and each of its tasks
+also carries an `agreement` block read from the saved answers: how many of the
+readable answers reported the recorded status (`2/3`), how many wordings were
+asked, how many answers were unreadable, whether the readable answers tied, and
+per region how many of the answers that reported the finding named that region,
+counted over those answers and never added together (`lower-left 3/3` stays
+apart from `upper-right 1/3`). Each count comes with the fixed phrase to use for
+it - consistently identified, moderately supported, weakly supported / not
+consistent, not consistent (tie), or not measured - and the prompt gains two
+passages: what the counts are, and the rule to quote them as they stand, keep
+the regions apart, name unreadable answers and ties, and invent no percentage,
+probability or confidence. `verify_report` rejects a reply quoting a count the
+data does not hold, so `3/3` cannot be claimed where two answers were readable,
+and the Markdown prints the counts under each finding from the data itself.
+These counts measure how stable the model is under rewording; they are not a
+probability, not medical certainty and not diagnostic confidence, and both the
+prompt and the report's limitations say so. Nothing else moves: the answers,
+the union/majority decision and Cell 11 are untouched, and with the knob off the
+structured input, the prompt, the report and the Markdown are exactly what they
+were.
+
 Reports resume like the other loops: one `.json` (structured input, prompt,
 every attempt with its problems, the verified report, the Markdown) and one
 `.md` per image under `<dataset>/reports/<model>-<language>/reports/`, with a

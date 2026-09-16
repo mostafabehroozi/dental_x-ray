@@ -22,6 +22,11 @@ wants one report. This module
 
 The report model never sees the image: it can only reword what DentVLM answered. Its input is
 the parsed answers, not the rationale text, unless include_rationale is switched on.
+
+With vote_agreement switched on, the vote behind each answer reaches the report as well: how many
+of the question's wordings reported the finding, and how many of them named each region, as counts
+the report quotes rather than turns into a confidence. It is off by default, and while it is off
+the structured input, the prompt, the report and the rendering are exactly what they were.
 """
 from __future__ import annotations
 
@@ -162,7 +167,194 @@ def method_text(result: dict) -> str:
     return "; ".join(parts)
 
 
-def _task_entry(key: str, task: dict, flag: bool, model_text: str | None) -> dict:
+# ----------------------------------------------------------------------------
+# Agreement between prompt phrasings (optional, off by default)
+# ----------------------------------------------------------------------------
+# With protocol.phrasings > 1 every task is asked with several verbatim wordings of the same
+# question and dental_pipeline.vote() turns their answers into one decision. The vote is saved
+# per task under "answers"; the report only ever saw the decision. With vote_agreement switched
+# on, those saved answers reach the report as explicit counts: how many wordings reported the
+# finding, and how many of them named each region, so "lower-left 3/3" and "upper-right 1/3"
+# stay distinguishable instead of arriving already merged by region_vote="union".
+#
+# Nothing here changes a prediction. The counts are read from the saved answers, the decision
+# stays the one the pipeline made under its own union/majority policy, and the evaluation never
+# sees this module. The counts measure how stable the model is under rewording, which is not a
+# probability and not a confidence; every text below says so, because a reader will assume
+# otherwise unless told.
+
+AGREEMENT_BANDS = {
+    "consistent": "consistently identified: every wording asked gave a readable answer and all of them agreed",
+    "moderate": "moderately supported: most readable answers agreed, but not every wording agreed or not every wording was readable",
+    "weak": "weakly supported / not consistent: only a minority of the readable answers agreed",
+    "tie": "not consistent: the readable answers split evenly, so the analyzer recorded no decision",
+    "single_source": "single source: only one answer reported the finding, so there is no agreement between wordings to measure",
+    "none_named": "not named: no answer that reported the finding placed it in this region, which is not evidence that the region is free of it",
+    "single": "not measured: this run asked one wording per task, so there is no agreement between wordings to measure",
+    "none": "not measured: no answer to this question could be read as Yes or No",
+}
+AGREEMENT_DISCLAIMER = (
+    "Vote counts say how many rewordings of the same question, put to the same model on the same image, agreed "
+    "with each other. They are not a probability, not medical certainty and not diagnostic confidence: wordings "
+    "that agree can all be wrong together, and a finding only one wording reported can still be real."
+)
+AGREEMENT_LIMITATION = (
+    "Where this report gives vote counts, they say how many rewordings of the same question agreed with each "
+    "other; they are not a probability, not medical certainty and not a diagnostic confidence."
+)
+AGREEMENT_LEGEND = {
+    "what the counts are": AGREEMENT_DISCLAIMER,
+    "measured": "false when this run asked one wording per task, when no answer was readable, or when the finding "
+                "was never asked; the block then carries the reason in its 'wording' and there is no agreement to discuss",
+    "presence": "how many readable answers reported the status the analyzer recorded, out of the readable answers "
+                "('vote', e.g. '2/3'); 'wordings_requested' is how many wordings were asked, 'answers_received' how "
+                "many came back and 'unreadable' how many could not be read as Yes or No, so a vote is never reported "
+                "as 3/3 when only two answers were valid",
+    "presence.tie": "true when the readable answers split evenly; the analyzer then recorded no decision and the "
+                    "status of the finding is 'unparseable'",
+    "regions": "per region, how many of the answers that reported the finding named that region; 'out_of' is that "
+               "number of answers, never the number of wordings asked. Every region is listed with its own count and "
+               "the counts are never added up or merged, so a region named by every reporting answer and a region "
+               "named by one of them are never equally supported",
+    "regions_basis": "which answers the region counts are taken over, or why there are none",
+    "region_vote_policy": "how the run turned these region counts into the regions it reports: 'union' keeps every "
+                          "named region, 'majority' keeps the regions a majority of the reporting answers named. "
+                          "'located_in' and 'regions' on the finding are the decision; these counts are the evidence "
+                          "behind it, and they can disagree with it",
+    "band / wording": "the phrase to use for these counts, and no other confidence word. A presence count carries "
+                      "its phrase in 'wording'; a region count carries its 'band' only, and 'bands' below gives the "
+                      "phrase that belongs to every band",
+    "bands": AGREEMENT_BANDS,
+    "scope": "which question the presence counts describe",
+}
+
+
+def agreement_band(votes: int, readable: int, requested: int) -> str:
+    """Band for a presence vote. 'consistent' only when every wording asked answered and agreed."""
+    if requested < 2:
+        return "single"
+    if readable == 0:
+        return "none"
+    if votes * 2 == readable:
+        return "tie"
+    if votes == readable == requested:
+        return "consistent"
+    if votes * 2 > readable:
+        return "moderate"
+    return "weak"
+
+
+def region_band(votes: int, out_of: int) -> str:
+    """Band for a region vote, counted over the answers that reported the finding, not over the wordings."""
+    if out_of == 0:
+        return "none"
+    if votes == 0:
+        return "none_named"
+    if out_of == 1:
+        return "single_source"
+    if votes == out_of:
+        return "consistent"
+    if votes * 2 > out_of:
+        return "moderate"
+    return "weak"
+
+
+def _vote(votes: int, out_of: int, band: str, brief: bool = False, **extra) -> dict:
+    """One count. brief leaves out the phrase, which the legend's "bands" spells out for every band,
+    so six regions on one finding do not repeat the same sentence six times."""
+    return {"vote": f"{votes}/{out_of}", "votes": votes, "out_of": out_of, "band": band,
+            **({} if brief else {"wording": AGREEMENT_BANDS[band]}), **extra}
+
+
+def task_agreement(task: dict, requested: int, level: str, flag: bool, region_vote: str) -> dict:
+    """The saved per-wording answers of one task as counts. Reads only what the run saved; decides nothing.
+
+    An answer that could not be read as Yes or No is counted as unreadable, never as a No, so the
+    denominator is the readable answers and the wordings asked stay visible next to it.
+    """
+    answers = list(task.get("answers") or [])
+    readable = [a.get("answer") for a in answers if a.get("answer") in ("yes", "no")]
+    present, absent = readable.count("yes"), readable.count("no")
+    decision = task.get("whole_image", task.get("presence"))
+    votes = present if decision == "yes" else absent if decision == "no" else max(present, absent)
+    measured = requested >= 2 and bool(readable)
+    presence = _vote(votes, len(readable), agreement_band(votes, len(readable), requested),
+                     wordings_requested=requested, answers_received=len(answers),
+                     unreadable=len(answers) - len(readable),
+                     present_votes=present, absent_votes=absent,
+                     decision={"yes": "present", "no": "absent"}.get(decision, "no decision"),
+                     tie=bool(readable) and present == absent)
+
+    reporting = [a for a in answers if a.get("answer") == "yes"]
+    if level != "rationale":
+        regions, basis = {}, ("not measured: this run asked each region its own question, once, so there is no "
+                              "vote between wordings for a region" if level == "regions" else
+                              "not measured: this run asked for presence only, with no location")
+    elif not reporting:
+        regions, basis = {}, "no readable answer reported the finding, so no wording named a region"
+    else:
+        out_of = len(reporting)
+        counts = {c: sum(c in (a.get("regions") or []) for a in reporting) for c in ordered_cells(flag)}
+        if not any(counts.values()):  # nothing to keep apart: no wording that reported it named a region
+            regions, basis = {}, (f"the {out_of} answer(s) that reported the finding named no region, which is "
+                                  "not evidence that the finding is absent anywhere")
+        else:
+            regions = {patient_cell(c, flag): _vote(n, out_of, region_band(n, out_of), brief=True)
+                       for c, n in counts.items()}
+            basis = (f"counted over the {out_of} answer(s) that reported the finding; a region none of them named "
+                     f"is 0/{out_of}, which is not evidence that the region is free of the finding")
+    return {
+        "measured": measured,
+        "reason": "" if measured else ("this run asked one wording per task" if requested < 2
+                                       else "no answer to this task could be read as Yes or No"),
+        "scope": ("the whole-image question only; this run decided presence from the per-region questions"
+                  if level == "regions" else "the presence of this finding"),
+        "presence": presence, "regions": regions, "regions_basis": basis, "region_vote_policy": region_vote,
+    }
+
+
+def finding_agreement(blocks: dict[str, dict]) -> dict:
+    """One agreement block for a finding, attributed to the task whose vote carries it.
+
+    A finding can rest on several tasks (a prosthetic crown and a prosthetic bridge both make a
+    prosthetic restoration) and is present when any of them answers Yes. Its presence vote is then
+    the vote of the task that reported it, named in "from_task"; a region keeps the count of the
+    task that named it most often. Nothing is summed across tasks, and every task's own block stays
+    in the finding's "tasks" list, so no evidence is merged away here.
+    """
+    if not blocks:
+        return {"measured": False, "reason": "the analyzer has no question for this finding, so nothing was voted",
+                "wording": AGREEMENT_BANDS["none"], "presence": None, "regions": {},
+                "regions_basis": "the finding was never asked", "tasks_voted": []}
+    order = list(blocks)
+    reporting = [k for k in order if blocks[k]["presence"]["decision"] == "present"]
+    if reporting:  # any-yes aggregation: the task that reported it carries the finding
+        decided_by = max(reporting, key=lambda k: (blocks[k]["presence"]["votes"], -order.index(k)))
+    else:  # no task reported it: the least consistent answer is the honest one to show
+        decided_by = min(order, key=lambda k: (blocks[k]["presence"]["votes"], order.index(k)))
+    several = len(blocks) > 1
+    presence = {**blocks[decided_by]["presence"], **({"from_task": decided_by} if several else {})}
+
+    sources = reporting or order
+    names = next((list(blocks[k]["regions"]) for k in sources if blocks[k]["regions"]), [])
+    regions = {}
+    for name in names:
+        holders = [k for k in sources if name in blocks[k]["regions"]]
+        best = max(holders, key=lambda k: (blocks[k]["regions"][name]["votes"], -order.index(k)))
+        regions[name] = {**blocks[best]["regions"][name], **({"from_task": best} if several else {})}
+    return {
+        "measured": blocks[decided_by]["measured"],
+        "reason": blocks[decided_by]["reason"],
+        "scope": blocks[decided_by]["scope"],
+        "presence": presence, "regions": regions,
+        "regions_basis": blocks[decided_by]["regions_basis"],
+        "region_vote_policy": blocks[decided_by]["region_vote_policy"],
+        "tasks_voted": order,
+    }
+
+
+def _task_entry(key: str, task: dict, flag: bool, model_text: str | None,
+                agreement: dict | None = None) -> dict:
     answers = task.get("answers") or []
     entry = {
         "task": key, "name": task.get("name", dp.task_name(key)),
@@ -173,10 +365,13 @@ def _task_entry(key: str, task: dict, flag: bool, model_text: str | None) -> dic
     }
     if model_text is not None:
         entry["model_text"] = model_text
+    if agreement is not None:
+        entry["agreement"] = agreement
     return entry
 
 
-def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, include_rationale: bool) -> dict:
+def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, include_rationale: bool,
+           vote_agreement: bool = False) -> dict:
     """One dense entry for a benchmark finding or an extra DentVLM task."""
     level = result.get("location_level", "rationale")
     tasks_out = result.get("tasks") or {}
@@ -204,7 +399,16 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
                 continue
             if call.get("stage") == "presence" and call.get("task") in keys and call["task"] not in texts:
                 texts[call["task"]] = (call.get("text") or "")[:600]
-    tasks = [_task_entry(k, tasks_out[k], flag, texts.get(k) if include_rationale else None) for k in keys if k in tasks_out]
+    voted, blocks = [k for k in keys if k in tasks_out], {}
+    if vote_agreement:
+        protocol = result["protocol"]
+        wordings, policy = int(protocol.get("phrasings", 1) or 1), protocol.get("region_vote", "union")
+        blocks = {k: task_agreement(tasks_out[k], wordings, level, flag, policy) for k in voted}
+    # Only a finding decided by several tasks needs its tasks' votes spelled out: with one task the
+    # finding's own block is that task's block, and repeating it would double the prompt for nothing.
+    per_task = len(voted) > 1
+    tasks = [_task_entry(k, tasks_out[k], flag, texts.get(k) if include_rationale else None,
+                         blocks.get(k) if per_task else None) for k in voted]
 
     status = "not_assessed" if not asked else _status(presence)
     whole = "not_assessed" if not asked else _status(whole_image if whole_image is not None else presence)
@@ -244,7 +448,7 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         location_status = "not_localized: present on the whole image, no cell answered Yes"
     multiplicity = len(located_in) if status == "present" and region_source != "none" else "not_applicable"
 
-    return {
+    entry = {
         "finding": identifier, "label": LABELS[identifier], "category": FINDING_CATEGORY[identifier],
         "benchmark_class": benchmark_class, "trained": trained,
         "status": status, "whole_image": whole,
@@ -253,14 +457,22 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         "regions": region_map, "region_source": region_source, "located_in": located_in,
         "location_status": location_status, "multiplicity": multiplicity,
     }
+    if vote_agreement:
+        entry["agreement"] = finding_agreement(blocks)
+    return entry
 
 
-def structured_findings(result: dict, analyzer: str | None = None, include_rationale: bool = False) -> dict:
-    """One dense JSON for the report model: every finding, task and cell with an explicit status."""
+def structured_findings(result: dict, analyzer: str | None = None, include_rationale: bool = False,
+                       vote_agreement: bool = False) -> dict:
+    """One dense JSON for the report model: every finding, task and cell with an explicit status.
+
+    vote_agreement adds one "agreement" block per finding and per task, and its legend; with it off
+    the JSON is byte for byte the one the report writer has always been given.
+    """
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
     cell_answers = dp.cell_answers(result) if level == "regions" else {}  # the evaluator reads the same answers
-    findings = [_entry(i, result, cell_answers, flag, include_rationale) for i in IDENTIFIERS]
+    findings = [_entry(i, result, cell_answers, flag, include_rationale, vote_agreement) for i in IDENTIFIERS]
     status = {f["finding"]: f["status"] for f in findings}
     order = PATHOLOGY + TREATMENT
     limitations = list(LIMITATIONS)
@@ -268,8 +480,14 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
         limitations.append(RATIONALE_LIMITATION)
     if any(s == "not_assessed" for s in status.values()):
         limitations.append("Findings the analyzer has no question for were not assessed.")
+    if vote_agreement:
+        limitations.append(AGREEMENT_LIMITATION)
     region_legend = (LEGEND["regions (location from region questions)"] if level == "regions"
                      else LEGEND["regions (location from the rationale)"])
+    phrasings = int(result["protocol"].get("phrasings", 1) or 1)
+    agreement = {"wordings_per_task": phrasings, "measured": phrasings > 1,
+                 "region_vote_policy": result["protocol"].get("region_vote", "union"),
+                 "what_the_counts_are": AGREEMENT_DISCLAIMER} if vote_agreement else None
     return {
         "schema": SCHEMA,
         "image": {"id": result.get("image_id", Path(result["image"]).stem), "file": Path(result["image"]).name,
@@ -282,9 +500,11 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
             "regions": [{"name": patient_cell(c, flag), "location": cell_text(c, flag)} for c in ordered_cells(flag)],
             "method": method_text(result),
             "limitations": limitations,
+            **({"vote_agreement": agreement} if vote_agreement else {}),
         },
         "legend": {"status": LEGEND["status"], "regions": region_legend, "multiplicity": LEGEND["multiplicity"],
-                   "trained": LEGEND["trained"], "detection": LEGEND["detection"]},
+                   "trained": LEGEND["trained"], "detection": LEGEND["detection"],
+                   **({"agreement": AGREEMENT_LEGEND} if vote_agreement else {})},
         "categories": [{"key": key, "label": label, "findings": list(conditions)}
                        for key, (label, conditions) in CATEGORIES.items()],
         "findings": findings,
@@ -352,16 +572,44 @@ OUTPUT
 JSON only, exactly this shape; the English values are placeholders to translate, the structure and the identifiers are fixed:
 {output_schema}"""
 
+# The agreement passages. USER_PROMPT itself never changes: these are spliced in at two anchors when
+# the structured input carries agreement blocks, so with the knob off the model sees the same prompt.
+HOW_TO_WRITE_ANCHOR = "\nHOW TO WRITE\n"
+OUTPUT_ANCHOR = "\nOUTPUT\n"
+
+AGREEMENT_DATA = """
+AGREEMENT BETWEEN WORDINGS
+Every task was asked with several verbatim wordings of the same question, and the analyzer's answer is the vote of those wordings. Each finding and each of its tasks therefore carries an "agreement" block holding the counts of that vote, read from the saved answers. "presence" says how many of the readable answers reported the status that was recorded, out of the readable answers ("vote", for example "2/3"), and spells out next to it how many wordings were asked ("wordings_requested"), how many answers could not be read as Yes or No ("unreadable") and whether the readable answers split evenly ("tie"). "regions" says, region by region, how many of the answers that reported the finding named that region, counted over those answers only ("out_of"); the regions are listed separately and their counts are never added together. "band" and "wording" give the fixed phrase that belongs to those counts - a region count carries its "band" only, and the legend's "bands" gives the phrase for each one - and "measured": false means there is nothing to report for that finding, with the reason in its "wording". The "agreement" entry of the legend defines every field.
+These counts measure agreement between rewordings of one question, put to one model, on one image. They are NOT a probability, NOT medical certainty and NOT diagnostic confidence: wordings that agree can be wrong together, and a finding that only one wording reported can still be real.
+"""
+
+AGREEMENT_RULE = """7. Agreement between wordings: report the agreement of each finding next to that finding, from its "agreement" block. Give the counts exactly as they stand (presence as "<votes>/<out_of>", each region as "<region> <votes>/<out_of>") and the fixed phrase from "wording", in {language}. Never invent a percentage, a probability, a confidence, a certainty or any confidence word the block does not give you; never re-derive, round, average or add up the counts; never quote a count that is not in the block, and in particular never report a vote out of the wordings asked when fewer answers than that were readable. Keep every region separate with its own count, so a region named by every reporting answer and a region named by one of them are never presented as equally supported. Say in words when answers were unreadable, when the wordings tied, and when fewer answers were readable than wordings asked. Where the counts and the recorded result differ, because the run's region_vote policy kept a region a minority named or dropped one, report the recorded finding and its regions first and the counts as the evidence behind them. When "measured" is false, give the reason from its "wording" and say nothing further about agreement for that finding. Say once, in the limitations, that these counts measure agreement between rewordings of the same question and are not a probability, medical certainty or diagnostic confidence.
+"""
+
 REPAIR_PROMPT = """Your reply failed these checks against the data:
 {problems}
 
 Return the complete corrected JSON only: same shape, same language, every finding exactly once with its status unchanged."""
 
 
+def with_agreement(template: str) -> str:
+    """USER_PROMPT plus the two agreement passages. The anchors are checked, so a future edit of the
+    prompt that loses one fails loudly instead of dropping the rules from the message."""
+    for anchor, passage in ((HOW_TO_WRITE_ANCHOR, AGREEMENT_DATA), (OUTPUT_ANCHOR, AGREEMENT_RULE)):
+        if template.count(anchor) != 1:
+            raise ValueError(f"the report prompt no longer holds exactly one {anchor!r} anchor to splice into")
+        template = template.replace(anchor, passage + anchor)
+    return template
+
+
 def user_prompt(structured: dict, language: str) -> str:
-    """The user message for one image (placeholders are replaced, never str.format, because of the JSON braces)."""
+    """The user message for one image (placeholders are replaced, never str.format, because of the JSON braces).
+
+    The agreement passages are added exactly when the structured input carries agreement blocks, so the
+    prompt can never describe data the model was not given."""
     analysis = structured["analysis"]
-    return (USER_PROMPT.replace("{analyzer}", str(analysis["analyzer"])).replace("{method}", analysis["method"])
+    template = with_agreement(USER_PROMPT) if "agreement" in structured["legend"] else USER_PROMPT
+    return (template.replace("{analyzer}", str(analysis["analyzer"])).replace("{method}", analysis["method"])
             .replace("{findings_json}", json.dumps(structured, indent=1, ensure_ascii=False))
             .replace("{language}", language).replace("{output_schema}", OUTPUT_SCHEMA))
 
@@ -382,6 +630,31 @@ def extract_json(text: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_FRACTION = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def quoted_votes(text: str, limit: int) -> set[tuple[int, int]]:
+    """The vote counts a sentence quotes ("2/3", and the same in Eastern Arabic digits).
+
+    Only fractions whose denominator could be a vote are read, so a number that is not a vote is
+    left alone rather than turned into a false failure.
+    """
+    return {(int(v), int(n)) for v, n in _FRACTION.findall(str(text).translate(_DIGITS)) if 1 <= int(n) <= limit}
+
+
+def entry_votes(entry: dict) -> set[tuple[int, int]]:
+    """Every count the data offers for one finding: its own vote, its regions', and its tasks'."""
+    pairs = set()
+    for block in [entry.get("agreement")] + [t.get("agreement") for t in entry.get("tasks") or []]:
+        if not isinstance(block, dict):
+            continue
+        for vote in [block.get("presence")] + list((block.get("regions") or {}).values()):
+            if isinstance(vote, dict) and isinstance(vote.get("votes"), int):
+                pairs.add((vote["votes"], vote["out_of"]))
+    return pairs
 
 
 def _strings(value, minimum: int = 0, maximum: int | None = None) -> bool:
@@ -406,6 +679,11 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
                                              for k in ("image", "findings", "impression", "not_assessable", "limitations")):
         problems.append("'headings' must hold non-empty strings for image, findings, impression, not_assessable, limitations")
     expected = {f["finding"]: f for f in structured["findings"]}
+    # With vote agreement on, a count the report quotes must be one the data holds: the model may not
+    # claim 3/3 where two answers were readable, nor merge two regions' counts into one.
+    agreement = structured["analysis"].get("vote_agreement") if "agreement" in structured["legend"] else None
+    limit = max(1, int(agreement["wordings_per_task"])) if agreement else 0
+    votes = {c: entry_votes(f) for c, f in expected.items()} if limit else {}
     seen: dict[str, int] = {}
     if not isinstance(report["sections"], list):
         problems.append("'sections' must be a list")
@@ -428,6 +706,12 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
                     problems.append(f"{finding} belongs in section {expected[finding]['category']!r}, not {section['category']!r}")
                 if not isinstance(entry.get("statement"), str) or not entry["statement"].strip():
                     problems.append(f"{finding}: 'statement' must be a non-empty string")
+                elif limit:
+                    invented = quoted_votes(entry["statement"], limit) - votes[finding]
+                    if invented:
+                        problems.append(f"{finding}: the statement quotes vote counts the data does not hold: "
+                                        + ", ".join(f"{a}/{b}" for a, b in sorted(invented))
+                                        + "; quote only the counts in this finding's 'agreement' block")
         missing = [c for c in expected if c not in seen]
         duplicated = [c for c, n in seen.items() if n > 1]
         if missing:
@@ -445,17 +729,51 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
         problems.append("'not_assessable' must be empty: no finding was unparseable")
     if not _strings(report["limitations"], 1):
         problems.append("'limitations' must be a non-empty list of strings")
+    if limit:
+        known = set().union(*votes.values()) if votes else set()
+        for key in ("impression", "not_assessable", "limitations"):
+            if not _strings(report[key]):
+                continue
+            invented = set().union(*(quoted_votes(t, limit) for t in report[key])) - known if report[key] else set()
+            if invented:
+                problems.append(f"{key}: quotes vote counts the data does not hold: "
+                                + ", ".join(f"{a}/{b}" for a, b in sorted(invented)))
     return problems
 
 
 # ----------------------------------------------------------------------------
 # Rendering
 # ----------------------------------------------------------------------------
+def agreement_note(entry: dict) -> str:
+    """The vote counts behind one finding, as one line, regions kept apart.
+
+    Rendered from the data, not from the model's sentence, so the evidence survives whatever the
+    report model chose to say about it.
+    """
+    block = entry.get("agreement")
+    if not isinstance(block, dict) or not block.get("measured"):
+        return ""
+    presence = block["presence"]
+    if presence["decision"] == "no decision":
+        head = (f"the readable answers tied, {presence['present_votes']} present to {presence['absent_votes']} absent, "
+                f"so no decision was recorded")
+    else:
+        head = f"{presence['vote']} readable answers said {presence['decision']}"
+    if presence["unreadable"]:
+        head += f" ({presence['wordings_requested']} wordings asked, {presence['unreadable']} unreadable)"
+    parts = [head]
+    named = [f"{name} {vote['vote']}" for name, vote in (block.get("regions") or {}).items() if vote["votes"]]
+    if named:
+        parts.append("regions " + ", ".join(named))
+    return "; ".join(parts)
+
+
 def render_markdown(report: dict, structured: dict, writer_model: str | None = None) -> str:
     """Deterministic Markdown from a verified report: findings by section, impression, caveats."""
     headings = report["headings"]
     image, analysis = structured["image"], structured["analysis"]
     lines = [f"# {report['title']}", "", f"**{headings['image']}:** {image['file']}", "", f"## {headings['findings']}"]
+    by_finding = {f["finding"]: f for f in structured["findings"]}
     by_category: dict[str, dict] = {}
     for section in report["sections"]:
         slot = by_category.setdefault(section["category"], {"heading": section["heading"], "findings": []})
@@ -468,11 +786,16 @@ def render_markdown(report: dict, structured: dict, writer_model: str | None = N
         lines += ["", f"### {section['heading']}"]
         for entry in sorted(section["findings"], key=lambda e: order.get(e["finding"], len(order))):
             lines.append(f"- {GLYPHS[entry['status']]} {entry['statement'].strip()}")
+            note = agreement_note(by_finding.get(entry["finding"], {}))
+            if note:
+                lines.append(f"  - *agreement between wordings - {note}*")
     lines += ["", f"## {headings['impression']}"] + [f"- {b.strip()}" for b in report["impression"]]
     if report["not_assessable"]:
         lines += ["", f"## {headings['not_assessable']}"] + [f"- {t.strip()}" for t in report["not_assessable"]]
     lines += ["", f"## {headings['limitations']}"] + [f"- {t.strip()}" for t in report["limitations"]]
     footer = f"{analysis['analyzer']} · {analysis['questions_asked']} questions"
+    if "agreement" in structured["legend"]:
+        footer += " · vote counts are agreement between question wordings, not probability or certainty"
     if writer_model:
         footer += f" → {writer_model}"
     lines += ["", "---", f"*{footer}*", ""]
@@ -500,18 +823,19 @@ class ReportWriter:
     from_api() builds one from an llm_api spec. token_param "max_completion_tokens" and temperature
     None for OpenAI reasoning models; other request fields (reasoning_effort, response_format, ...)
     go through request_options. include_rationale adds DentVLM's own reply text per task to the
-    input (off by default: the report then rests on the parsed answers alone). One repair turn is
+    input (off by default: the report then rests on the parsed answers alone). vote_agreement adds
+    the vote counts behind those answers (off by default; see AGREEMENT_LEGEND). One repair turn is
     allowed: the reply's problems are sent back and the corrected JSON re-verified.
     """
 
     kind = "report"
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "request_options", "language", "repairs",
-               "include_rationale", "api_call_retries")
+               "include_rationale", "vote_agreement", "api_call_retries")
 
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = 0.0, language: str = "English",
-                 repairs: int = 1, include_rationale: bool = False, timeout: float = 600.0,
-                 request_options: dict | None = None, api_call_retries: int = 2,
+                 repairs: int = 1, include_rationale: bool = False, vote_agreement: bool = False,
+                 timeout: float = 600.0, request_options: dict | None = None, api_call_retries: int = 2,
                  call_log: str | None = None, client=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
@@ -522,6 +846,8 @@ class ReportWriter:
         self.base_url, self.model = base_url, model
         self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
         self.language, self.repairs, self.include_rationale = language.strip(), max(0, int(repairs)), bool(include_rationale)
+        self.vote_agreement = bool(vote_agreement)
+        self._noted_single_wording = False
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
         self.call_log = mon.CallLog("report", call_log)
@@ -554,15 +880,18 @@ class ReportWriter:
         return {"kind": self.kind, "model": self.model, "base_url": self.base_url, "token_param": self.token_param,
                 "max_output_tokens": self.max_output_tokens, "temperature": self.temperature, "language": self.language,
                 "repairs": self.repairs, "include_rationale": self.include_rationale,
-                "api_call_retries": self.api_call_retries,
+                "vote_agreement": self.vote_agreement, "api_call_retries": self.api_call_retries,
                 "request_options": self.request_options, "schema": SCHEMA,
                 "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT, "output_schema": OUTPUT_SCHEMA,
-                "repair_prompt": REPAIR_PROMPT}
+                "repair_prompt": REPAIR_PROMPT,
+                **({"agreement_prompt": [AGREEMENT_DATA, AGREEMENT_RULE], "agreement_bands": AGREEMENT_BANDS}
+                   if self.vote_agreement else {})}
 
     def public(self) -> dict:
         """The settings without the prompt texts, for printouts."""
         return {k: v for k, v in self.settings().items()
-                if k not in ("system_prompt", "user_prompt", "output_schema", "repair_prompt")}
+                if k not in ("system_prompt", "user_prompt", "output_schema", "repair_prompt",
+                             "agreement_prompt", "agreement_bands")}
 
     def _ask(self, messages: list[dict]) -> dict:
         request = {"model": self.model, "messages": messages,
@@ -576,7 +905,11 @@ class ReportWriter:
 
     def write(self, result: dict, analyzer: str | None = None) -> dict:
         """One image result -> {"structured", "report", "verified", "problems", "markdown", "attempts", ...}."""
-        structured = structured_findings(result, analyzer, self.include_rationale)
+        structured = structured_findings(result, analyzer, self.include_rationale, self.vote_agreement)
+        if self.vote_agreement and not structured["analysis"]["vote_agreement"]["measured"] and not self._noted_single_wording:
+            self._noted_single_wording = True
+            llm_api.monitor("REPORT NOTE", "vote_agreement is on but this run asked one wording per task",
+                            action="every finding will say agreement was not measured")
         prompt = user_prompt(structured, self.language)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
         attempts, report, problems = [], None, ["no reply"]
