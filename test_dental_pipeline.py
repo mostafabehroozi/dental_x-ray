@@ -1,4 +1,4 @@
-"""Offline tests: extraction rules, question wording, crops, the run loop with a fake model at both
+"""Offline tests: extraction rules, question wording, regions, the run loop with a fake model at both
 levels, in both region prompts (every region asked about every finding) and in both question forms
 (separate presence and count questions, or the combined presence-and-count question), with counting switched
 off, and evaluation."""
@@ -151,7 +151,7 @@ class QuestionTests(unittest.TestCase):
         self.assertEqual(dp.count_question("dental_filling", region="UL", mode="tagged"),
                          "How many visible teeth in the upper left quadrant appear to have dental fillings based on "
                          f"their radiopaque characteristics?\n\n{dp.THINK_SUFFIX}")
-        self.assertEqual([dp.region_phrase(r) for r in dp.CROPS["quadrant"]],
+        self.assertEqual([dp.region_phrase(r) for r in dp.REGION_WINDOWS["quadrant"]],
                          ["the upper right quadrant", "the upper left quadrant", "the lower left quadrant", "the lower right quadrant"])
         # With the words read as image sides, the image-left window UR gets the "left" words.
         self.assertEqual(dp.region_phrase("UR", patient_side=False), "the upper left quadrant")
@@ -180,10 +180,6 @@ class QuestionTests(unittest.TestCase):
         self.assertIn("present in the upper jaw of this image.", arch)
         self.assertIn("How many dental implants are visualized in the upper jaw of the panoramic radiograph? ", arch)
         self.assertIn("Scope: only the upper jaw (maxilla)", arch)
-        crop = dp.combined_question("dental_filling", crop=True)
-        self.assertIn(dp.presence_question("dental_filling"), crop)  # the whole-image wording goes with the crop
-        self.assertIn(WHOLE_IMAGE_COUNTS["dental_filling"], crop)
-        self.assertIn("Scope: this image, which is a cropped region of the radiograph", crop)
         self.assertTrue(dp.combined_question("dental_filling", mode="tagged").endswith(dp.THINK_SUFFIX))
         # Quadrant words are the patient's whatever the flag says: the scope note already names the image half.
         dp.QUADRANT_WORDS_ARE_PATIENT_SIDE = False
@@ -192,28 +188,29 @@ class QuestionTests(unittest.TestCase):
             self.assertIn("in the upper right quadrant appear to have", dp.combined_question("dental_filling", region="UR"))
         finally:
             dp.QUADRANT_WORDS_ARE_PATIENT_SIDE = True
-        for bad in ({"condition": "periodontal_bone_loss"}, {"condition": "dental_filling", "region": "UR", "crop": True}):
-            with self.assertRaises(ValueError):
-                dp.combined_question(**bad)
+        with self.assertRaises(ValueError):
+            dp.combined_question(condition="periodontal_bone_loss")
         self.assertEqual(set(dp.DEFINITIONS), set(dp.COUNTABLE))
-        self.assertEqual(set(dp.SCOPE_NOTES), set(dp.CROPS["quadrant"]) | set(dp.CROPS["arch"]))
+        self.assertEqual(set(dp.SCOPE_NOTES), set(dp.REGION_WINDOWS["quadrant"]) | set(dp.REGION_WINDOWS["arch"]))
 
     def test_protocol(self):
         default = dp.Protocol()
-        self.assertEqual((default.presence_level, default.count_level, default.region_scheme, default.region_prompt,
-                          default.question_form), ("region", "region", "quadrant", "words", "separate"))
+        self.assertEqual((default.presence_level, default.count_level, default.region_scheme,
+                          default.question_form), ("region", "region", "quadrant", "separate"))
+        with self.assertRaises(TypeError):  # the cropping knob is gone; a region is always words
+            dp.Protocol(region_prompt="crop")
         self.assertEqual(default.regions, ("UR", "UL", "LL", "LR"))
         self.assertEqual(dp.Protocol(region_scheme="arch", count_level="overall").regions, ("upper", "lower"))
         flat = dp.Protocol(presence_level="overall", count_level="overall")
         self.assertFalse(flat.uses_regions)
         self.assertEqual(flat.regions, ())
-        for bad in ({"presence_level": "crop"}, {"count_level": "none"}, {"region_scheme": "sextant"}, {"region_prompt": "json"},
+        for bad in ({"presence_level": "crop"}, {"count_level": "none"}, {"region_scheme": "sextant"},
                     {"question_form": "joint"}):
             with self.assertRaises(ValueError):
                 dp.Protocol(**bad)
         # The manifest hash follows every knob and the region words.
         hashes = {dp.run_config("plain", p, {"model": "x"})["hash"] for p in (
-            default, flat, dp.Protocol(region_prompt="crop"), dp.Protocol(count_level="overall"),
+            default, flat, dp.Protocol(counting=False), dp.Protocol(count_level="overall"),
             dp.Protocol(region_scheme="arch"), dp.Protocol(presence_level="overall"))}
         self.assertEqual(len(hashes), 6)
         self.assertNotEqual(dp.run_config("plain", default, {"model": "x"})["hash"],
@@ -224,7 +221,8 @@ class QuestionTests(unittest.TestCase):
         self.assertEqual(combined["protocol"]["question_form"], "combined")
         self.assertEqual((combined["combined"]["question"], combined["combined"]["definitions"]), (dp.COMBINED_QUESTION, dp.DEFINITIONS))
         self.assertEqual(list(combined["combined"]["scope_notes"]), ["UR", "UL", "LL", "LR"])
-        self.assertIsNone(dp.run_config("plain", dp.Protocol(question_form="combined", region_prompt="crop"), {"model": "x"})["combined"]["scope_notes"])
+        self.assertIsNone(dp.run_config("plain", dp.Protocol(question_form="combined", presence_level="overall",
+                                                             count_level="overall"), {"model": "x"})["combined"]["scope_notes"])
         self.assertIsNone(dp.run_config("plain", default, {"model": "x"})["combined"])
         # Counting off: no count level and no combined form; regions come through presence_level alone.
         off = dp.Protocol(counting=False)
@@ -243,7 +241,7 @@ class QuestionTests(unittest.TestCase):
 
 
 def _blank_image(path: Path, size=(560, 280), shade: int = 128) -> None:
-    """A test radiograph whose four quadrants differ, so crops are distinguishable bytes."""
+    """A test radiograph with a mark in each of the four quadrants."""
     from PIL import Image, ImageDraw
 
     image = Image.new("L", size, color=shade)
@@ -259,14 +257,14 @@ class FakeRunner:
     stage is "presence" (whole image), "region" (region presence), "count" (whole-image count) or
     "region_count". A combined presence-and-count question uses the key of the presence question of
     its scope ("presence" or "region", whatever stage the pipeline records for it) and a scripted text
-    such as "Answer: A. True\\nCount: 2". Word-based region questions are recognised by their text, crops
-    by their bytes (region_of maps the scripted image's crop bytes to the region name). Unscripted
-    answers are B and 0 ("Answer: B. False / Count: 0" for a combined question); images other than
-    scripted_image always answer B / 0.
+    such as "Answer: A. True\\nCount: 2". A region question is recognised by its text: the region is
+    named in it and the image sent is always the whole radiograph. Unscripted answers are B and 0
+    ("Answer: B. False / Count: 0" for a combined question); images other than scripted_image always
+    answer B / 0.
     """
 
-    def __init__(self, script: dict, region_of: dict | None = None, scripted_image: str = "img1"):
-        self.script, self.region_of, self.log = script, region_of or {}, []
+    def __init__(self, script: dict, scripted_image: str = "img1"):
+        self.script, self.log = script, []
         self.scripted_image = scripted_image
         self.lookup = {}
         for condition in dp.CONDITIONS:
@@ -274,9 +272,8 @@ class FakeRunner:
             if condition in dp.COUNTABLE:
                 self.lookup[dp.count_question(condition)] = ("count", condition, None, False)
                 self.lookup[dp.combined_question(condition)] = ("presence", condition, None, True)
-                self.lookup[dp.combined_question(condition, crop=True)] = ("presence", condition, None, True)
             for scheme in dp.REGION_SCHEMES:
-                for region in dp.CROPS[scheme]:
+                for region in dp.REGION_WINDOWS[scheme]:
                     self.lookup[dp.presence_question(condition, region=region, scheme=scheme)] = ("region", condition, region, False)
                     if condition in dp.COUNTABLE:
                         self.lookup[dp.count_question(condition, region=region, scheme=scheme)] = ("region_count", condition, region, False)
@@ -286,13 +283,9 @@ class FakeRunner:
         return {"model": "fake"}
 
     def ask(self, image, question):
+        assert not isinstance(image, (bytes, bytearray)), "no protocol crops the image; the region is words"
         stage, condition, region, combined = self.lookup[question.replace(f"\n\n{dp.THINK_SUFFIX}", "")]
-        if isinstance(image, bytes):  # a crop carries the whole-image question; the region is the picture
-            region = self.region_of.get(image)
-            stage = "region" if stage == "presence" else "region_count"
-            scripted = region is not None
-        else:
-            scripted = Path(image).stem == self.scripted_image
+        scripted = Path(image).stem == self.scripted_image
         key = (stage, condition, region)
         self.log.append(key)
         text = "Answer: B. False\nCount: 0" if combined else "0" if stage in ("count", "region_count") else "B"
@@ -313,7 +306,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         (self.root / "images").mkdir()
         (self.root / "labels").mkdir()
         _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png", shade=100)  # different bytes, so its crops are not img1's
+        _blank_image(self.root / "images" / "img2.png", shade=100)
         # img1: two fillings in the patient's upper-right (image left), one root canal treatment in the
         # upper-left (image right), one impacted tooth lower-left.
         (self.root / "labels" / "img1.txt").write_text(
@@ -325,20 +318,10 @@ class RunAndEvaluateTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, script, protocol, region_of=None, mode="tagged", out="run"):
-        runner = FakeRunner(script, region_of)
+    def _run(self, script, protocol, mode="tagged", out="run"):
+        runner = FakeRunner(script)
         run_dir = dp.run_dataset(runner, self.images, self.root / out, mode=mode, protocol=protocol)
         return runner, dp.load_results(run_dir)
-
-    def test_crops_have_expected_geometry(self):
-        crops = dp.make_crops(self.root / "images" / "img1.png", "quadrant", self.root / "crops")
-        from PIL import Image
-        import io
-
-        self.assertEqual(list(crops), ["UR", "UL", "LL", "LR"])
-        with Image.open(io.BytesIO(crops["UR"])) as ur:
-            self.assertEqual(ur.size, (round(0.55 * 560), round(0.60 * 280)))
-        self.assertTrue((self.root / "crops" / "img1_LL.png").is_file())
 
     def test_region_presence_and_region_counts_in_words(self):
         script = {
@@ -419,7 +402,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(regions["dental_filling"]["pred_all_regions_rate"], 0.0)
         summary = report["summary"]
         self.assertEqual(summary["protocol"], {"presence_level": "region", "count_level": "region",
-                                               "region_scheme": "quadrant", "region_prompt": "words",
+                                               "region_scheme": "quadrant",
                                                "question_form": "separate", "parse_retries": 0, "counting": True})
         self.assertEqual((summary["sensitivity"], summary["whole_image"]["sensitivity"]), (1.0, 0.6667))
         # UR (image left) holds the fillings, UL and LL (image right) the root canal and the impacted tooth,
@@ -480,9 +463,8 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual((rp[("endodontic_treatment", "UL")]["TP"], rp[("dental_filling", "UR")]["TP"], rp[("dental_filling", "UL")]["FP"]), (1, 1, 0))
         self.assertIn("Dental filling; count 2 (UR 2, UL 0, LL 0, LR 0); location UR", dp.dentist_report(results["img1"]))
 
-    def test_crop_prompt_with_whole_image_counts(self):
-        """Presence on quadrant crops for every finding, one whole-image count per positive."""
-        region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "quadrant").items()}
+    def test_region_presence_with_whole_image_counts(self):
+        """Presence in every named quadrant for every finding, one whole-image count per positive."""
         script = {
             ("presence", "dental_filling", None): "<think>..</think><answer>A</answer>",
             ("count", "dental_filling", None): "<answer>The image shows 2 teeth with fillings.</answer>",
@@ -491,20 +473,20 @@ class RunAndEvaluateTests(unittest.TestCase):
             ("count", "impacted_tooth", None): "1",
             ("region", "impacted_tooth", "LL"): "<answer>A</answer>",
             ("region", "impacted_tooth", "LR"): "A. True",
-            ("presence", "carious_lesion", None): "A",  # whole image only: no crop answers A, so it is not counted
-            ("region", "endodontic_treatment", "UL"): "A",  # recovered on the UL crop
+            ("presence", "carious_lesion", None): "A",  # whole image only: no region answers A, so it is not counted
+            ("region", "endodontic_treatment", "UL"): "A",  # recovered in the UL question
             ("count", "endodontic_treatment", None): "unclear",
         }
-        protocol = dp.Protocol(presence_level="region", count_level="overall", region_prompt="crop")
-        runner, results = self._run(script, protocol, region_of)
+        protocol = dp.Protocol(presence_level="region", count_level="overall")
+        runner, results = self._run(script, protocol)
         f = results["img1"]["findings"]
         self.assertEqual(f["dental_filling"], {"presence": "A", "whole_image": "A", "count": 2,
                                                "regions": {"UR": "A", "UL": "B", "LL": "B", "LR": "B"}, "region_counts": None})
         self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["count"]), ("B", None))
         self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["count"]), ("A", None))
-        # 14 whole image + 4 crops x 14 findings + 3 counts (filling, impacted, root canal) = 73; img2: 70.
+        # 14 whole image + 4 regions x 14 findings + 3 counts (filling, impacted, root canal) = 73; img2: 70.
         self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (73, 70))
-        self.assertTrue((self.root / "run" / "crops" / "img1_LL.png").is_file())
+        self.assertFalse((self.root / "run" / "crops").exists())
         self.assertIn(("region", "impacted_tooth", "LL"), runner.log)
 
         gt = ev.load_yolo(self.root / "images", self.root / "labels")
@@ -520,7 +502,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual((report["summary"]["mean_false_alarms_per_image"], report["summary"]["whole_image"]["FP"]), (0.0, 1))
         self.assertIn("Dental filling; count 2; location UR", dp.dentist_report(results["img1"]))
 
-    def test_arch_scheme_and_crop_region_counts(self):
+    def test_arch_scheme_region_counts(self):
         # The whole image answers B for fillings (the fake's default); the upper jaw recovers them.
         script = {("region", "dental_filling", "upper"): "A", ("region_count", "dental_filling", "upper"): "2"}
         _, results = self._run(script, dp.Protocol(region_scheme="arch"))
@@ -532,14 +514,10 @@ class RunAndEvaluateTests(unittest.TestCase):
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual((regions["dental_filling"]["level"], regions["dental_filling"]["TP"]), ("arch", 1))
         self.assertNotIn("side_agreement", report["summary"])
-
-        # Region counts by crops: the whole-image count question on each crop that answered A.
-        region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "arch").items()}
-        _, results = self._run(script, dp.Protocol(region_scheme="arch", region_prompt="crop"), region_of, out="crop_run")
-        f = results["img1"]["findings"]["dental_filling"]
-        self.assertEqual((f["regions"], f["region_counts"], f["count"]), ({"upper": "A", "lower": "B"}, {"upper": 2}, 2))
+        # The count question names the jaw and keeps the whole-image wording around it.
         question = next(c["question"] for c in results["img1"]["calls"] if c["stage"] == "region_count")
-        self.assertEqual(question.split("\n")[0], WHOLE_IMAGE_COUNTS["dental_filling"])
+        self.assertEqual(question.split("\n")[0], dp.count_question("dental_filling", region="upper", scheme="arch"))
+        self.assertIn("the upper jaw", question)
 
     def test_unresolved_mode_is_rejected_before_anything_is_written(self):
         out = self.root / "run_auto"
@@ -554,8 +532,8 @@ class RunAndEvaluateTests(unittest.TestCase):
         results = {"img1": {"location_level": "quadrant", "findings": img1, "call_count": 19},
                    "img2": {"location_level": "quadrant", "findings": blank, "call_count": 14}}
         report = ev.evaluate(ev.load_yolo(self.root / "images", self.root / "labels"), results, dataset="old")
-        self.assertEqual((report["summary"]["protocol"]["region_prompt"], report["summary"]["protocol"]["question_form"]),
-                         ("crop", "separate"))
+        self.assertEqual((report["summary"]["protocol"]["region_scheme"], report["summary"]["protocol"]["question_form"]),
+                         ("quadrant", "separate"))
         self.assertEqual({r["condition"]: r["TP"] for r in report["regions"]}["dental_filling"], 1)
         self.assertEqual((report["region_counts"], report["whole_image"]), ([], []))
         self.assertTrue(report["summary"]["protocol"]["counting"])  # results from before the switch took counts
@@ -800,8 +778,7 @@ class CombinedFormTests(RunAndEvaluateTests):
         self.assertEqual((counts["endodontic_treatment"]["exact_rate"], counts["impacted_tooth"]["count_unparseable"]), (1.0, 1))
         self.assertEqual({r["condition"]: r["FN"] for r in report["whole_image"]}["endodontic_treatment"], 1)
 
-    def test_overall_presence_with_crop_region_counts(self):
-        region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "quadrant").items()}
+    def test_overall_presence_with_region_counts(self):
         script = {
             ("presence", "dental_filling", None): "A",
             ("region", "dental_filling", "UR"): "Answer: A. True\nCount: 2",
@@ -809,8 +786,8 @@ class CombinedFormTests(RunAndEvaluateTests):
             ("region", "impacted_tooth", "LR"): "Answer: B. False\nCount: 1",  # B with 1: that region's count is unparseable
             ("region", "endodontic_treatment", "UL"): "Answer: A. True\nCount: 1",  # counted although missed on the whole image
         }
-        protocol = dp.Protocol(presence_level="overall", count_level="region", region_prompt="crop", question_form="combined")
-        _, results = self._run(script, protocol, region_of, mode="plain")
+        protocol = dp.Protocol(presence_level="overall", count_level="region", question_form="combined")
+        _, results = self._run(script, protocol, mode="plain")
         f = results["img1"]["findings"]
         self.assertEqual(f["dental_filling"], {"presence": "A", "whole_image": "A", "count": 2, "regions": None,
                                                "region_counts": {"UR": 2, "UL": 0, "LL": 0, "LR": 0}})
@@ -818,13 +795,14 @@ class CombinedFormTests(RunAndEvaluateTests):
         self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["region_counts"]["UL"], f["endodontic_treatment"]["count"]),
                          ("B", 1, 1))
         self.assertEqual(f["periodontal_bone_loss"]["region_counts"], None)
-        # 14 bare whole-image questions + 4 crops x 9 combined questions = 50; the whole-image wording goes with every crop.
+        # 14 bare whole-image questions + 4 regions x 9 combined questions = 50; each names its own region.
         self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (50, 50))
-        crop_calls = [c for c in results["img1"]["calls"] if c["stage"] == "region_count"]
-        self.assertEqual(len(crop_calls), 36)
-        self.assertTrue(all(c["question"] == dp.combined_question(c["condition"], crop=True) for c in crop_calls))
-        self.assertEqual(crop_calls[0]["parsed"], {"choice": "B", "count": 0, "consistent": True})
-        self.assertTrue((self.root / "run" / "crops" / "img1_LL.png").is_file())
+        region_calls = [c for c in results["img1"]["calls"] if c["stage"] == "region_count"]
+        self.assertEqual(len(region_calls), 36)
+        self.assertTrue(all(c["question"] == dp.combined_question(c["condition"], region=c["region"])
+                            for c in region_calls))
+        self.assertEqual(region_calls[0]["parsed"], {"choice": "B", "count": 0, "consistent": True})
+        self.assertFalse((self.root / "run" / "crops").exists())
         report = ev.evaluate(ev.load_yolo(self.root / "images", self.root / "labels"), results, dataset="toy")
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual((regions["dental_filling"]["from_counts"], regions["dental_filling"]["exact_set_match_rate"]), (1, 1.0))
@@ -834,14 +812,14 @@ class CombinedFormTests(RunAndEvaluateTests):
 
 
 class GeometryAndDentexTests(unittest.TestCase):
-    def test_box_regions_follow_crop_windows(self):
+    def test_box_regions_follow_region_windows(self):
         self.assertEqual(ev.box_regions({"xc": 0.2, "yc": 0.2, "w": 0.1, "h": 0.1}, "quadrant"), {"UR"})
         self.assertEqual(ev.box_regions({"xc": 0.8, "yc": 0.8, "w": 0.1, "h": 0.1}, "quadrant"), {"LL"})
         midline = {"xc": 0.5, "yc": 0.2, "w": 0.2, "h": 0.1}
         self.assertEqual(ev.box_regions(midline, "quadrant"), {"UR", "UL"})
         self.assertTrue(ev.straddling(midline, "quadrant"))
         self.assertEqual(ev.box_primary_region(midline, "quadrant"), "UR")  # counted once, first window in order
-        # A crown-level filling at y=0.55 is fully inside both the upper and lower crop windows.
+        # A crown-level filling at y=0.55 is fully inside both the upper and lower windows.
         occlusal = {"xc": 0.2, "yc": 0.55, "w": 0.05, "h": 0.05}
         self.assertEqual(ev.box_regions(occlusal, "quadrant"), {"UR", "LR"})
         self.assertEqual(ev.gt_regions([midline, occlusal], "arch"), {"upper", "lower"})

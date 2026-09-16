@@ -1,7 +1,7 @@
 """Translate ground-truth boxes into the quadrants DentalGPT localizes in, so location can be scored.
 
 Ground truth is numeric (YOLO boxes); the pipeline localizes a finding as the set of
-quadrant crops that answer True. Scoring location means deciding which quadrant windows
+named quadrants that answer True. Scoring location means deciding which quadrant windows
 each true box occupies. Fixed image fractions are a crude way to do that: the midline and
 the occlusal plane move with patient positioning and the shape of the arch. DentVLM's
 authors, facing the same problem, built their location labels anatomically (box ->
@@ -44,7 +44,7 @@ import llm_api
 import run_monitor as mon
 
 UNITS = dp.UNITS
-QUADRANTS = tuple(dp.CROPS["quadrant"])
+QUADRANTS = tuple(dp.REGION_WINDOWS["quadrant"])
 PALETTE = ("#ff3b30", "#34c759", "#00c7ff", "#ffcc00", "#ff2d95", "#ff9500", "#bf5af2", "#ffffff")
 
 

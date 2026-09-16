@@ -222,21 +222,19 @@ class RecoveryTests(unittest.TestCase):
 
     @unittest.skipIf(DENTVLM, "DentalGPT regional protocol")
     def test_regional_presence_and_count_retry_preserve_scope(self):
-        for region_prompt in ("words", "crop"):
-            with self.subTest(region_prompt=region_prompt):
-                # All whole-image answers negative; retry presence then count in the first region.
-                result, client, _, _ = self.run_image(
-                    ["B"] * 14 + ["???", "A", "???", "2"],
-                    presence_level="region", count_level="region",
-                    region_prompt=region_prompt, local=True)
-                finding = result["findings"]["dental_implant"]
-                self.assertEqual(finding["regions"]["UR"], "A")
-                self.assertEqual(finding["region_counts"]["UR"], 2)
-                self.assertEqual(result["parse_recovery"]["retry_calls"], 2)
-                a, b = client.requests[14:16]
-                self.assertEqual(a["messages"][0]["content"][0], b["messages"][0]["content"][0])
-                if region_prompt == "words":
-                    self.assertIn("upper right", b["messages"][0]["content"][1]["text"])
+        # All whole-image answers negative; retry presence then count in the first region.
+        result, client, _, _ = self.run_image(
+            ["B"] * 14 + ["???", "A", "???", "2"],
+            presence_level="region", count_level="region", local=True)
+        finding = result["findings"]["dental_implant"]
+        self.assertEqual(finding["regions"]["UR"], "A")
+        self.assertEqual(finding["region_counts"]["UR"], 2)
+        self.assertEqual(result["parse_recovery"]["retry_calls"], 2)
+        a, b = client.requests[14:16]
+        # The region is words, so the retry carries the same whole image and still names the region.
+        self.assertEqual(a["messages"][0]["content"][0], b["messages"][0]["content"][0])
+        self.assertEqual(len({json.dumps(r["messages"][0]["content"][0]) for r in client.requests}), 1)
+        self.assertIn("upper right", b["messages"][0]["content"][1]["text"])
 
     @unittest.skipIf(DENTVLM, "DentalGPT combined regional protocol")
     def test_combined_count_retry_keeps_patient_scope(self):

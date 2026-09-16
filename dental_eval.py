@@ -17,7 +17,7 @@ with unresolved findings rather than treating them as a success or failure.
 
 Location truth (which region windows a true box occupies) comes, in this order,
 from regions attached to the box by location_adapter (apply_adapted), from
-DENTEX FDI quadrant labels, or from the fixed crop windows. The evaluation
+DENTEX FDI quadrant labels, or from the fixed region windows. The evaluation
 summary reports which source placed how many boxes.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ import json
 from pathlib import Path
 
 import run_monitor as mon
-from dental_pipeline import (CONDITIONS, COUNTABLE, CROPS, QUADRANT_WORDS_ARE_PATIENT_SIDE, UNIT_QUADRANT,
+from dental_pipeline import (CONDITIONS, COUNTABLE, REGION_WINDOWS, QUADRANT_WORDS_ARE_PATIENT_SIDE, UNIT_QUADRANT,
                              quadrants_to_regions, units_to_regions)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
@@ -38,7 +38,7 @@ PAPER_COVERED = {"endodontic_treatment", "periapical_lesion", "impacted_tooth",
                  "periodontal_bone_loss", "carious_lesion", "dental_filling"}
 
 # Location truth is scored against the windows the regions are named after
-# (dental_pipeline.CROPS, which overlap on the midline and occlusal plane).
+# (dental_pipeline.REGION_WINDOWS, which overlap on the midline and occlusal plane).
 OVERLAP_FRACTION = 0.25  # a box counts in every window holding >= 25% of its area
 
 DENTEX_DISEASES = {
@@ -174,7 +174,7 @@ def geometric_regions(box: dict, level: str) -> set[str]:
     right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
     area = max(box["w"] * box["h"], 1e-9)
     hits = set()
-    for name, (wl, wt, wr, wb) in CROPS[level].items():
+    for name, (wl, wt, wr, wb) in REGION_WINDOWS[level].items():
         overlap = max(0.0, min(right, wr) - max(left, wl)) * max(0.0, min(bottom, wb) - max(top, wt))
         if overlap / area >= OVERLAP_FRACTION:
             hits.add(name)
@@ -193,7 +193,7 @@ def box_regions(box: dict, level: str) -> set[str]:
 def box_primary_region(box: dict, level: str) -> str | None:
     """The one window a box is counted in: the first, in window order, of the windows holding it."""
     hits = box_regions(box, level)
-    return next((name for name in CROPS[level] if name in hits), None)
+    return next((name for name in REGION_WINDOWS[level] if name in hits), None)
 
 
 def box_source(box: dict) -> str:
@@ -293,7 +293,7 @@ def result_protocol(result: dict) -> dict:
                 "counting": protocol.get("counting", True)}
     level = result.get("location_level", "none")
     return {"presence_level": "overall" if level == "none" else "region", "count_level": "overall",
-            "region_scheme": "quadrant" if level == "none" else level, "region_prompt": "crop",
+            "region_scheme": "quadrant" if level == "none" else level,
             "question_form": "separate", "counting": True}
 
 
@@ -354,7 +354,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     protocol = result_protocol(results[ids[0]]) if ids else None
     counting = protocol["counting"] if protocol else True
     level = result_scheme(results[ids[0]]) if ids else "none"
-    region_names = tuple(CROPS[level]) if evaluate_location and level != "none" else ()
+    region_names = tuple(REGION_WINDOWS[level]) if evaluate_location and level != "none" else ()
     per_region_counts = counting and bool(region_names) and protocol["count_level"] == "region"
     # The whole-image answers are a separate result only when presence was resolved per region.
     whole_image_kept = (bool(protocol) and protocol["presence_level"] == "region"
@@ -605,11 +605,10 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
 def side_agreement(gt: dict[str, dict], results: dict[str, dict]) -> dict:
     """How often a quadrant the model answered for holds a true box on that image side.
 
-    The windows are fixed to the image (UR and LR are image-left), so this reads, for word-based
-    regions, whether the model takes "right" as the patient's right the way the phrases assume
-    (QUADRANT_WORDS_ARE_PATIENT_SIDE): a rate far above 50% confirms it, far below means the
-    words should be flipped. For crops it is plain localization accuracy. Only findings whose true
-    boxes all lie on one side of the image are informative, so the others are skipped.
+    The windows are fixed to the image (UR and LR are image-left), so this reads whether the model
+    takes "right" as the patient's right the way the phrases assume (QUADRANT_WORDS_ARE_PATIENT_SIDE):
+    a rate far above 50% confirms it, far below means the words should be flipped. Only findings whose
+    true boxes all lie on one side of the image are informative, so the others are skipped.
     """
     named = agree = 0
     for image_id in sorted(set(gt) & set(results)):

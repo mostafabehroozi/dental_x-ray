@@ -301,7 +301,7 @@ class LlamaCppServer:
         # llama.cpp caps Qwen2.5-VL images at 4096 tokens (about 3.2 MP) unless told
         # otherwise; a full-size panoramic needs ~4400-5900 tokens to keep the
         # resolution the model was trained with. ctx must hold image + prompt + answer.
-        # No token floor: crops of small panoramics stay at native size, as in training.
+        # No token floor: small panoramics stay at native size, as in training.
         self.image_max_tokens = image_max_tokens
         self.image_min_tokens = image_min_tokens
         self.startup_timeout = startup_timeout

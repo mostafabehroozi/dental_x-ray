@@ -184,13 +184,12 @@ class AdapterTests(unittest.TestCase):
             la.adapt_dataset(la.LLMAdapter(None, "x", "other", client=client), self.gt, out)
         self.assertEqual(la.load_adapted(out)["img1"]["boxes"][0]["units"], ["Q2-posterior"])
 
-        # The fake DentalGPT answers True on the UR crop for fillings: a hit under geometry, a miss under the adapter.
-        region_of = {png: region for region, png in dp.make_crops(self.images["img1"], "quadrant").items()}
+        # The fake DentalGPT answers True for fillings in UR: a hit under geometry, a miss under the adapter.
         script = {("presence", "dental_filling", None): "A", ("count", "dental_filling", None): "2",
                   ("region", "dental_filling", "UR"): "A"}
         results = dp.load_results(dp.run_dataset(
-            FakeRunner(script, region_of), self.images, self.root / "run",
-            protocol=dp.Protocol(presence_level="region", count_level="overall", region_prompt="crop")))
+            FakeRunner(script), self.images, self.root / "run",
+            protocol=dp.Protocol(presence_level="region", count_level="overall")))
         geometry = {r["condition"]: r for r in ev.evaluate(self.gt, results, dataset="toy")["regions"]}
         self.assertEqual((geometry["dental_filling"]["TP"], geometry["dental_filling"]["FN"]), (1, 0))
         truth = ev.apply_adapted(self.gt, adapted)

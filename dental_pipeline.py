@@ -10,11 +10,14 @@ paper (arXiv 2512.11558) or in the panoramic benchmark it was scored on
 * Count: the Figure 1/9 filling-count question, and the same tooth-anchored
   "How many ..." shape for the other countable findings. The model counts
   teeth, so findings whose boxes are regions or devices are presence-only.
-* Region: the same two questions restricted to one region of the mouth. The
+* Region: the same two questions restricted to one region of the mouth, with the
+  region named inside the question and the whole image sent every time. The
   regions are the two jaws (the benchmark asks "in which jaw" and even counts
   "in the lower jaw") and the four FDI quadrants (the model walks them by name
-  in its own reasoning, Figure 9). The region is either named in the question
-  on the whole image ("words") or implied by sending a crop ("crop").
+  in its own reasoning, Figure 9), so a region is words the model already uses.
+  The image is never cropped: a cropped panoramic is a picture the model was
+  never trained or scored on, and the region windows exist only to score
+  location.
 
 Two levels are set independently (Protocol): where presence is resolved (the
 whole image only, or every region for every finding, with the whole-image
@@ -39,7 +42,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import mimetypes
 import re
@@ -92,7 +94,7 @@ LABELS = {
 
 # Figure 7 (Panorama-Classification) wording, verbatim except the label.
 PRESENCE_QUESTION = "Kindly evaluate if the condition '{label}' is present in this image.\nA. True\nB. False"
-# The same wording with the region named; used when Protocol.region_prompt is "words".
+# The same wording with the region named; this is how every regional question is asked.
 REGION_PRESENCE_QUESTION = "Kindly evaluate if the condition '{label}' is present in {region} of this image.\nA. True\nB. False"
 
 # Tooth-anchored count questions as (template, whole-image scope). The whole-image wording is
@@ -183,7 +185,7 @@ COMBINED_CONTEXT = ("The image is a panoramic dental radiograph (orthopantomogra
                     "orientation: the patient's right side is on the left of the image and the patient's left side "
                     "on the right; the maxilla (upper jaw) is at the top and the mandible (lower jaw) at the bottom.")
 
-# What the model may look at, per window (words) or for the whole image and a crop.
+# What the model may look at: one region named in words, or the whole radiograph.
 SCOPE_NOTES = {
     "UR": "the patient's upper right quadrant (FDI quadrant 1): the upper teeth on the LEFT half of the image as "
           "displayed, from the upper right central incisor back to the upper right third molar",
@@ -197,7 +199,6 @@ SCOPE_NOTES = {
     "lower": "the lower jaw (mandible): the lower teeth and the mandibular bone across the whole width of the image",
 }
 WHOLE_SCOPE = "the whole radiograph."
-CROP_SCOPE = "this image, which is a cropped region of the radiograph; consider only the teeth visible in it."
 
 # The template. {presence_question} is the Figure 7 question (whole image, or with the region named) and
 # {count_question} the Figure 9-shaped count sentence with the same scope, both verbatim; the reply ends
@@ -227,9 +228,9 @@ MODES = ("plain", "tagged")
 # Region windows as normalized (left, top, right, bottom). Quadrants use patient-side
 # names in FDI order (UR, UL, LL, LR); image left is the patient's right. Windows
 # overlap by 10% of the width and 20% of the height so a finding on the midline or
-# the occlusal plane is whole in at least one crop; location truth is scored
-# against these same windows.
-CROPS = {
+# the occlusal plane is whole in at least one window. These are evaluation geometry
+# only: they place ground-truth boxes and never touch the image sent to the model.
+REGION_WINDOWS = {
     "quadrant": {
         "UR": (0.00, 0.00, 0.55, 0.60),
         "UL": (0.45, 0.00, 1.00, 0.60),
@@ -241,7 +242,7 @@ CROPS = {
         "lower": (0.00, 0.40, 1.00, 1.00),
     },
 }
-REGION_SCHEMES = tuple(CROPS)
+REGION_SCHEMES = tuple(REGION_WINDOWS)
 
 # The regions as dental text, used when the region is named in the question. Quadrants carry
 # the patient's sides, as dentists and DentalGPT itself (Figure 9) name them, so "the upper
@@ -290,13 +291,13 @@ def unit_region(unit: str, level: str = "quadrant") -> str:
 
 def units_to_regions(units, level: str = "quadrant") -> list[str]:
     names = {unit_region(u, level) for u in units}
-    return [r for r in CROPS[level] if r in names]
+    return [r for r in REGION_WINDOWS[level] if r in names]
 
 
 def quadrants_to_regions(quadrants, level: str = "quadrant") -> list[str]:
     """Quadrant names (UR, UL, LL, LR) at the given level, in window order."""
     names = set(quadrants) if level == "quadrant" else {QUADRANT_ARCH[q] for q in quadrants}
-    return [r for r in CROPS[level] if r in names]
+    return [r for r in REGION_WINDOWS[level] if r in names]
 
 
 def region_phrase(region: str, scheme: str = "quadrant", patient_side: bool | None = None) -> str:
@@ -346,20 +347,18 @@ def count_question(condition: str, mode: str = "plain", region: str | None = Non
 
 
 def combined_question(condition: str, mode: str = "plain", region: str | None = None,
-                      scheme: str = "quadrant", crop: bool = False) -> str:
-    """Presence-and-count question for one countable finding: the whole image, one named region
-    (words), or the whole-image wording on a crop (crop=True). Quadrant words are the patient's sides
-    and the scope note names the image half, so QUADRANT_WORDS_ARE_PATIENT_SIDE does not apply."""
+                      scheme: str = "quadrant") -> str:
+    """Presence-and-count question for one countable finding: the whole image, or one named region.
+    Quadrant words are the patient's sides and the scope note names the image half, so
+    QUADRANT_WORDS_ARE_PATIENT_SIDE does not apply."""
     if condition not in COUNTABLE:
         raise ValueError(f"{condition!r} is presence-only; use presence_question")
-    if crop and region is not None:
-        raise ValueError("a crop carries the whole-image wording: give region or crop, not both")
     label = LABELS[condition]
     definition, counting_rule = DEFINITIONS[condition]
     template, _ = COUNT_TEMPLATES[condition]
     if region is None:
         presence = PRESENCE_QUESTION.format(label=label)
-        scope = CROP_SCOPE if crop else WHOLE_SCOPE
+        scope = WHOLE_SCOPE
     else:
         presence = REGION_PRESENCE_QUESTION.format(label=label, region=region_phrase(region, scheme, patient_side=True))
         scope = f"only {SCOPE_NOTES[region]}; ignore every tooth outside it."
@@ -489,7 +488,7 @@ def graded_pair(reply: dict) -> tuple[str | None, int | None]:
 
 
 # ----------------------------------------------------------------------------
-# Images and crops
+# Images
 # ----------------------------------------------------------------------------
 def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
     if isinstance(image, (bytes, bytearray)):
@@ -501,30 +500,6 @@ def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
             mime = guessed
         payload = path.read_bytes()
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
-
-
-def make_crops(image_path: str | Path, level: str, cache_dir: str | Path | None = None) -> dict[str, bytes]:
-    """Return {region: png_bytes} for the requested scheme, optionally cached on disk."""
-    if level not in CROPS:
-        raise ValueError(f"level must be one of {tuple(CROPS)}")
-    from PIL import Image
-
-    crops: dict[str, bytes] = {}
-    with Image.open(image_path) as source:
-        width, height = source.size
-        for region, (left, top, right, bottom) in CROPS[level].items():
-            target = Path(cache_dir) / f"{Path(image_path).stem}_{region}.png" if cache_dir else None
-            if target is not None and target.is_file():
-                crops[region] = target.read_bytes()
-                continue
-            box = (round(left * width), round(top * height), round(right * width), round(bottom * height))
-            buffer = io.BytesIO()
-            source.crop(box).save(buffer, format="PNG")
-            crops[region] = buffer.getvalue()
-            if target is not None:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(crops[region])
-    return crops
 
 
 # ----------------------------------------------------------------------------
@@ -685,7 +660,6 @@ def probe(runner, image_paths, n: int = 10) -> dict:
 # ----------------------------------------------------------------------------
 PRESENCE_LEVELS = ("overall", "region")
 COUNT_LEVELS = ("overall", "region")
-REGION_PROMPTS = ("words", "crop")
 
 
 @dataclass(frozen=True)
@@ -708,9 +682,9 @@ class Protocol:
                                presence_level is "region", else in every region for every
                                countable finding. The finding's count is the sum. A region count
                                of 0 is a valid answer.
-    region_scheme   "quadrant" (UR, UL, LL, LR) or "arch" (upper, lower).
-    region_prompt   "words": the region is named in the question and the whole image is sent.
-                    "crop":  the whole-image question is sent with the region crop.
+    region_scheme   "quadrant" (UR, UL, LL, LR) or "arch" (upper, lower). Either way the region is
+                    named inside the question and the whole image is sent; the windows of a scheme
+                    are evaluation geometry, never a crop of the model's input.
     question_form   "separate": the Figure 7 presence question, then the Figure 9-shaped count question
                                 for a positive countable finding (DentalGPT's shapes).
                     "combined": for hosted models. Wherever the separate form would ask a presence and
@@ -725,7 +699,6 @@ class Protocol:
     presence_level: str = "region"
     count_level: str = "region"
     region_scheme: str = "quadrant"
-    region_prompt: str = "words"
     question_form: str = "separate"
     parse_retries: int = 0  # extra attempts per failed question; notebook defaults to 1
     counting: bool = True
@@ -737,7 +710,6 @@ class Protocol:
         for value, allowed, name in ((self.presence_level, PRESENCE_LEVELS, "presence_level"),
                                      (self.count_level, COUNT_LEVELS, "count_level"),
                                      (self.region_scheme, REGION_SCHEMES, "region_scheme"),
-                                     (self.region_prompt, REGION_PROMPTS, "region_prompt"),
                                      (self.question_form, QUESTION_FORMS, "question_form")):
             if value not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
@@ -759,7 +731,7 @@ class Protocol:
     @property
     def regions(self) -> tuple[str, ...]:
         """Region names in window order, empty when both levels are "overall"."""
-        return tuple(CROPS[self.region_scheme]) if self.uses_regions else ()
+        return tuple(REGION_WINDOWS[self.region_scheme]) if self.uses_regions else ()
 
 
 # ----------------------------------------------------------------------------
@@ -773,14 +745,14 @@ def _record(calls: list, stage: str, condition: str, region: str | None, questio
     calls.append(call)
 
 
-def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol: Protocol = Protocol(),
-                  crop_dir: str | Path | None = None) -> dict:
+def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol: Protocol = Protocol()) -> dict:
     """Whole-image presence for all 14 findings (kept under "whole_image"), then, as the protocol
-    says, every region for every finding: presence, and a count as soon as a region answers A. The
-    whole-image answers never decide which regional questions are asked. Deterministic order:
-    region-major, so with crops the crop's image prefix stays cached; with words every call shares
-    the whole image. With question_form "combined", a slot that would take a presence question and
-    then a count question takes one presence-and-count question instead (countable findings only);
+    says, every region for every finding: presence, and a count as soon as a region answers A. A
+    region is named inside the question and the whole image is sent with it, so every call shares
+    the same image. The whole-image answers never decide which regional questions are asked.
+    Deterministic order: region-major. With question_form "combined", a slot that would take a
+    presence question and then a count question takes one presence-and-count question instead
+    (countable findings only);
     the call record keeps the raw pair, so a count rejected as contradictory stays visible. With
     counting off no count question is asked at all: only the presence answers are filled in."""
     path = Path(image_path)
@@ -788,7 +760,6 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
     findings = {c: {"presence": None, "whole_image": None, "count": None, "regions": None, "region_counts": None}
                 for c in CONDITIONS}
     scheme, regions = protocol.region_scheme, protocol.regions
-    by_crop = protocol.region_prompt == "crop"
     region_counts = protocol.counts_per_region
     combined = protocol.combined
 
@@ -835,9 +806,8 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
             count_only = value[0] is not None
             if count_only:
                 template, _ = COUNT_TEMPLATES[condition]
-                # Preserve the combined prompt's patient-side scope, including crop mode.
-                scope_region = region if region is not None and not by_crop else None
-                text = template.format(scope=count_scope(condition, scope_region, scheme, patient_side=True))
+                # Preserve the combined prompt's patient-side scope.
+                text = template.format(scope=count_scope(condition, region, scheme, patient_side=True))
                 definition, counting_rule = DEFINITIONS[condition]
                 text += f"\n\n{definition}\n{counting_rule}"
                 hint = "Return only the whole-number count in digits."
@@ -862,14 +832,6 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
             answer = ask("presence", condition, None, path, presence_question(condition, mode))
         findings[condition]["whole_image"] = findings[condition]["presence"] = answer
 
-    crops = make_crops(path, scheme, crop_dir) if (regions and by_crop) else {}
-
-    def image_for(region: str):
-        return crops[region] if by_crop else path
-
-    def named(region: str) -> str | None:
-        return None if by_crop else region
-
     if protocol.presence_level == "region":
         for condition in CONDITIONS:
             findings[condition]["regions"] = {}
@@ -878,17 +840,17 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
         for region in regions:
             for condition in CONDITIONS:
                 if combined and region_counts and condition in COUNTABLE:
-                    answer, count = ask_pair("region", condition, region, image_for(region),
-                                             combined_question(condition, mode, named(region), scheme, crop=by_crop))
+                    answer, count = ask_pair("region", condition, region, path,
+                                             combined_question(condition, mode, region, scheme))
                     if answer == "A":
                         findings[condition]["region_counts"][region] = count
                 else:
-                    answer = ask("region", condition, region, image_for(region),
-                                 presence_question(condition, mode, named(region), scheme))
+                    answer = ask("region", condition, region, path,
+                                 presence_question(condition, mode, region, scheme))
                     if answer == "A" and region_counts and condition in COUNTABLE:
                         findings[condition]["region_counts"][region] = ask(
-                            "region_count", condition, region, image_for(region),
-                            count_question(condition, mode, named(region), scheme))
+                            "region_count", condition, region, path,
+                            count_question(condition, mode, region, scheme))
                 findings[condition]["regions"][region] = answer
         for condition in CONDITIONS:
             answers = findings[condition]["regions"].values()
@@ -902,11 +864,11 @@ def analyze_image(runner, image_path: str | Path, mode: str = "plain", protocol:
         for region in regions:
             for condition in COUNTABLE:
                 if combined:
-                    _, count = ask_pair("region_count", condition, region, image_for(region),
-                                        combined_question(condition, mode, named(region), scheme, crop=by_crop))
+                    _, count = ask_pair("region_count", condition, region, path,
+                                        combined_question(condition, mode, region, scheme))
                 else:
-                    count = ask("region_count", condition, region, image_for(region),
-                                count_question(condition, mode, named(region), scheme))
+                    count = ask("region_count", condition, region, path,
+                                count_question(condition, mode, region, scheme))
                 findings[condition]["region_counts"][region] = count
 
     for condition in COUNTABLE if protocol.counting else ():
@@ -941,22 +903,21 @@ def run_config(mode: str, protocol: Protocol, runner_settings: dict, provenance:
     """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}; run the probe or set MODE to one of them")
-    words = protocol.uses_regions and protocol.region_prompt == "words"
+    regional = protocol.uses_regions
     combined = protocol.combined
     config = {
         "mode": mode, "protocol": asdict(protocol), "labels": LABELS,
         "presence_question": PRESENCE_QUESTION,
-        "region_presence_question": REGION_PRESENCE_QUESTION if words and protocol.presence_level == "region" else None,
+        "region_presence_question": REGION_PRESENCE_QUESTION if regional and protocol.presence_level == "region" else None,
         "region_phrases": ({r: region_phrase(r, protocol.region_scheme, patient_side=True if combined else None)
-                            for r in protocol.regions} if words else None),
+                            for r in protocol.regions} if regional else None),
         "count_questions": COUNT_QUESTIONS if protocol.counting else None,
         "count_templates": {c: t for c, (t, _) in COUNT_TEMPLATES.items()} if protocol.counts_per_region else None,
         "combined": ({"question": COMBINED_QUESTION, "context": COMBINED_CONTEXT, "definitions": DEFINITIONS,
-                      "whole_scope": WHOLE_SCOPE, "crop_scope": CROP_SCOPE,
-                      "scope_notes": {r: SCOPE_NOTES[r] for r in protocol.regions} if words else None}
+                      "whole_scope": WHOLE_SCOPE,
+                      "scope_notes": {r: SCOPE_NOTES[r] for r in protocol.regions} if regional else None}
                      if combined else None),
         "think_suffix": THINK_SUFFIX if mode == "tagged" else None,
-        "crops": CROPS[protocol.region_scheme] if protocol.uses_regions and protocol.region_prompt == "crop" else None,
         "runner": runner_settings, "provenance": provenance or {},
         "parse_recovery_version": 1,
     }
@@ -1014,7 +975,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, mode
             progress.skip(image_id)
             continue
         with mon.guard(f"{out.name}/{image_id}", failures) as step:
-            result = analyze_image(runner, path, mode=mode, protocol=protocol, crop_dir=out / "crops")
+            result = analyze_image(runner, path, mode=mode, protocol=protocol)
             result["image_id"] = image_id
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")

@@ -277,7 +277,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
                "location_truth": report["summary"]["location_truth"],
                "model": manifest.get("runner", {}).get("model"), "mode": manifest.get("mode"),
                "runner_settings": manifest.get("runner", {}),
-               **{k: saved.get(k) for k in ("presence_level", "counting", "count_level", "region_scheme", "region_prompt",
+               **{k: saved.get(k) for k in ("presence_level", "counting", "count_level", "region_scheme",
                                             "question_form", "parse_retries")},
                **metrics(report),
                "paired_checks": new["scored_finding_checks"], "paired_reference_f1": old["f1"],
@@ -323,7 +323,7 @@ def compact_views(reports):
         overview.append({
             "dataset": dataset, "experiment": experiment,
             **{k: protocol.get(k) for k in ("presence_level", "counting", "count_level", "region_scheme",
-                                             "region_prompt", "question_form", "parse_retries")},
+                                             "question_form", "parse_retries")},
             "evaluate_location": summary.get("evaluate_location"),
             "images": summary["images_scored"],
             "expected_checks": summary["expected_finding_checks"],

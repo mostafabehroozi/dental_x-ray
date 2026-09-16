@@ -56,8 +56,7 @@ DEFAULTS = {
     "presence_level": "region",        # "overall" | "region"
     "counting": True,                  # False: no count question at all, presence only (count_level and question_form idle)
     "count_level": "region",           # "overall" | "region"
-    "region_scheme": "quadrant",       # "quadrant" | "arch"
-    "region_prompt": "words",          # "words" | "crop"
+    "region_scheme": "quadrant",       # "quadrant" | "arch"; the region is always named in the question
     "question_form": "auto",           # "auto" = "combined" on api, "separate" on local | "separate" | "combined"
     "parse_retries": 1,                # extra attempts per unparseable finding question
     "probe_images": 2,
@@ -88,7 +87,7 @@ DEFAULTS = {
     "image_min_tokens": None,
 }
 
-PROTOCOL_KEYS = ("presence_level", "count_level", "region_scheme", "region_prompt", "question_form", "parse_retries",
+PROTOCOL_KEYS = ("presence_level", "count_level", "region_scheme", "question_form", "parse_retries",
                  "counting")
 SERVER_KEYS = ("model_filename", "mmproj_filename", "n_gpu_layers", "ctx_size", "image_max_tokens", "image_min_tokens")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")

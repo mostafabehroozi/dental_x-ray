@@ -31,7 +31,7 @@ def fixture():
         boxes = ([{"condition": CONDITION, "xc": .2, "yc": .2, "w": .1, "h": .1}] if truth else [])
         gt[image_id] = {"annotated": {CONDITION}, "boxes": boxes}
         findings = {c: {"presence": "B", "whole_image": "B", "count": None,
-                       "regions": {r: "B" for r in dp.CROPS["quadrant"]}, "region_counts": {}}
+                       "regions": {r: "B" for r in dp.REGION_WINDOWS["quadrant"]}, "region_counts": {}}
                     for c in dp.CONDITIONS}
         findings[CONDITION].update(presence=final, whole_image=whole, count=1 if final == "A" else None,
                                    regions={"UR": final, "UL": "B", "LL": "B", "LR": "B"},

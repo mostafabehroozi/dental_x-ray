@@ -65,9 +65,9 @@ can be extended or an experiment added without recomputing saved results.
 Local experiments also share an exact response cache under
 `<output_root>/_response_cache`. A reply is reused only when the model files,
 llama.cpp binary and server settings, complete request, prompt, generation
-settings, and image or crop bytes match. Each experiment still writes a normal
+settings, and image bytes match. Each experiment still writes a normal
 result with the raw reply and marks the call with `cache_hit`; changed prompts,
-crops, modes, token budgets, checkpoints, or runtime settings miss the cache.
+region wording, modes, token budgets, checkpoints, or runtime settings miss the cache.
 Set `reuse_local_responses=False` only when independently repeating identical
 deterministic calls is itself part of the experiment.
 
@@ -95,10 +95,11 @@ name. So:
   are presence-only.
 * **Regions** are the two jaws ("the upper jaw", benchmark-verbatim) or the four
   FDI quadrants ("the upper right quadrant", the model's own words, patient's
-  side). Nothing finer is ever named. A region is put to the model either in
-  words on the whole image (the image stays in distribution, no seams for
-  counts) or as a crop with the verbatim whole-image question (the question
-  stays verbatim, the picture does not).
+  side). Nothing finer is ever named. A region is always put to the model in
+  words, inside the question, with the whole uncropped image: the picture stays
+  in distribution, the sentence keeps its shape, and no seam splits a tooth in
+  two. The region windows exist only to place ground-truth boxes when location
+  is scored; they never cut the image the model sees.
 * **Bounded parse recovery.** The notebook sets `parse_retries = 1`: one extra
   attempt for an unparseable answer, on the same image/model with an output-format
   reminder. `0` means warn only. Each failure prints the full prompt and response.
@@ -150,8 +151,7 @@ experiment keeps it.
 | `counting` | `True`, `False` | `False`: no count question of any kind. The model only decides presence, on the whole image and, with `presence_level="region"`, in every region, so a finding's result is its presence and its region set; `count_level` and `question_form` then have no effect and every question is the bare Figure 7 question on both backends (the manifest records no count wording). The evaluation keeps the presence tables, adds presence per region (`region_presence.csv`, see "Evaluation outputs") and leaves the count tables out, so a class with several boxes in one image or one region is scored once, as present. |
 | `presence_level` | `overall`, `region` | `overall`: presence from the whole-image question only. `region`: the same question for every finding in every region, region by region, independent of the whole-image answers (kept under `whole_image`). A finding is present when any region answers A and absent only when every region answers B; the region set is the regions that answer A. |
 | `count_level` | `overall`, `region` | `overall`: one whole-image count per positive countable finding. `region`: one count per region, asked right after a region answers A when `presence_level="region"`, else in every region for every countable finding; the finding's count is the sum, and a region count above zero also localizes the finding. A region count of 0 is a valid answer. |
-| `region_scheme` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. |
-| `region_prompt` | `words`, `crop` | `words`: "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." on the whole image. `crop`: the whole-image questions on the region crop. |
+| `region_scheme` | `quadrant`, `arch` | UR, UL, LL, LR (patient-side FDI names) or upper, lower. Either way the region is named inside the question -- "Kindly evaluate if the condition 'X' is present in the upper right quadrant of this image." and "How many teeth in the upper right quadrant have ..." -- and the whole image is sent with it. |
 | `question_form` | `separate`, `combined` | `separate`: the Figure 7 presence question, then the Figure 9-shaped count question for a positive countable finding (DentalGPT's shapes). `combined`: for hosted models, one presence-and-count question wherever the separate form would ask both in the same scope (see "Combined presence-and-count question"); the five presence-only findings keep the bare question. |
 
 The whole-image wording is byte-identical in every configuration; the region
@@ -173,9 +173,9 @@ region-finding pairs that answered A for a countable finding.
 | region / region | 14 + R x 14 + Rp | 76 |
 
 The regional calls never depend on what the whole image answered, so an
-all-negative image needs 14, 70, 50 or 70 calls. With `region_prompt="words"`
-every call reuses the cached image prefix; with crops the loop is region-major,
-so each crop's prefix is built once. With `counting=False` there is no count
+all-negative image needs 14, 70, 50 or 70 calls. Every call sends the same whole
+image, so every one of them reuses the cached image prefix. With
+`counting=False` there is no count
 call at all: 14 calls with `presence_level="overall"`, 14 + R x 14 with
 `"region"`, whatever the image holds and whichever backend answers.
 
@@ -211,8 +211,8 @@ sends, verbatim: the Figure 7 sentence (whole image, or with the region named)
 and the Figure 9-shaped count sentence with the same scope. Around them it
 states the display convention (the patient's right is on the image's left),
 defines the finding and its counting unit in one line each (`DEFINITIONS`; edit
-there only), pins the scope (the whole radiograph, a crop, or one quadrant or
-jaw named both anatomically and as an image half, `SCOPE_NOTES`), and forbids
+there only), pins the scope (the whole radiograph, or one quadrant or jaw named
+both anatomically and as an image half, `SCOPE_NOTES`), and forbids
 the two inconsistent pairs (A with 0, B with more than 0). The model may reason
 first; only the last `Answer:` and `Count:` lines are read, with the lenient
 rules of the separate form as a fallback.
@@ -238,7 +238,8 @@ and whether it was consistent (`calls[*].parsed`), so a rejected count stays
 visible. The quadrant words of the combined form are always the patient's and
 the scope note names the image half, so `QUADRANT_WORDS_ARE_PATIENT_SIDE` does
 not apply to it; a low `side_agreement` on a combined run means the model
-ignored the scope note, and crops are the remedy. Force `"separate"` on the API
+ignored the scope note, so check the wording and the display convention rather
+than the geometry. Force `"separate"` on the API
 backend for a prompt-for-prompt comparison with DentalGPT; the manifest hash
 follows the form and the combined wording, so the two never mix in one run
 directory.
@@ -247,7 +248,7 @@ directory.
 
 | File | Role |
 | --- | --- |
-| `dental_pipeline.py` | prompts and region wording, answer extraction, crops, model runner, probe, `Protocol`, resumable run loop, dentist summary |
+| `dental_pipeline.py` | prompts and region wording, answer extraction, model runner, probe, `Protocol`, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. presence per region, per-region counts and the side check, CSV/JSON export |
 | `dental_analysis.py` | offline regional changes, parse recovery, case breakdowns, and paired saved-run comparisons |
 | `response_cache.py` | immutable, content-addressed reuse of exact local model responses across compatible experiments |
@@ -264,8 +265,8 @@ directory.
 
 * `--image-max-tokens 6144`: llama.cpp otherwise caps Qwen2.5-VL images at 4096
   tokens and silently downscales a full-size panoramic below training resolution.
-* No `--image-min-tokens` floor, so crops of small panoramics stay at native
-  size, as they would under the Hugging Face processor.
+* No `--image-min-tokens` floor, so a small panoramic stays at native size, as
+  it would under the Hugging Face processor.
 * `--ctx-size 16384` so image tokens, question, and a long `<think>` fit.
 * `max_tokens 4096`, temperature 0, `repeat_penalty 1.05` (the same value as the
   backbone's generation config; llama.cpp applies it over the last 64 tokens).
@@ -392,7 +393,7 @@ shape of the arch. `location_truth` in Cell 3 picks how it is done:
   resolves the patient-side convention; the quadrant follows in Python. The
   probe's `<think>/<answer>` mode is reused. Drawn boxes are outside the
   model's training images; unparseable answers follow `location_failure_policy`.
-* `"geometry"`: the fixed crop windows (a box counts in every window holding at
+* `"geometry"`: the fixed region windows (a box counts in every window holding at
   least a quarter of its area; the windows overlap on the midline and the
   occlusal plane). No model calls.
 
@@ -452,8 +453,9 @@ Two diagnostics decide whether word-based regions are being read:
   FDI quadrant labels are exact.
 * `pred_all_regions_rate` far above `truth_all_regions_rate` means the model
   answered A in every region whenever the whole image was positive, i.e. it
-  ignored the region clause; switch to `region_prompt="crop"` for that finding
-  set.
+  ignored the region clause. Read that finding's regional rows as unusable
+  rather than as localization, and compare the two region schemes: the two-jaw
+  wording is closer to the benchmark's own than the four quadrants are.
 
 ### Small ablation-style reports (Cells 10 and 11)
 
@@ -537,9 +539,10 @@ changes still need their own experiment (their own name and directory).
 * Every region is asked about every finding, so one region false alarm makes
   the finding present: compare `whole_image.csv` with `presence.csv` before
   reading the regional numbers as an improvement.
-* With `region_prompt="crop"` and `count_level="region"`, the windows overlap
-  by 10% of the width and 20% of the height, so teeth on the seams can be
-  counted twice; use words for region counts.
+* With `count_level="region"` the same tooth can be counted in two regions when
+  the model reads a tooth near the midline or the occlusal plane as belonging
+  to both: the regional counts are summed, so compare the sum with the
+  whole-image count before trusting it.
 * Apical surgery, root resorption, and furcation have very few positives in
   UMFIH; their rows are not statistically meaningful.
 * The combined form's definitions and counting rules (`DEFINITIONS`) are

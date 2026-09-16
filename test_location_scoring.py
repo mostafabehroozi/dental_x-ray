@@ -22,7 +22,7 @@ class LocationScoringTests(unittest.TestCase):
             region_counts={"UR": 1})
         results = {"image": {"findings": findings, "call_count": 71,
                             "location_level": "quadrant",
-                            "protocol": {"presence_level": "region", "count_level": "region", "region_scheme": "quadrant", "region_prompt": "words"}}}
+                            "protocol": {"presence_level": "region", "count_level": "region", "region_scheme": "quadrant"}}}
         gt = {"image": {"annotated": set(dp.CONDITIONS), "boxes": [
             {"condition": "dental_filling", "xc": 0.2, "yc": 0.25, "w": 0.05, "h": 0.05}]}}
         original = copy.deepcopy(results)
