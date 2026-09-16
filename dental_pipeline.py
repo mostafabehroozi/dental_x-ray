@@ -14,11 +14,17 @@ Communications 2026; arXiv 2509.23344) was trained and evaluated on:
   tooth-count question exists only as an explicitly out-of-distribution option
   (Protocol.count_question, off by default): without it the model only decides
   presence, and a finding is scored per image and per cell as present or absent.
-* The crop comparison asks every task on each of the six cell crops, whatever
-  the whole image answered (kept as a separate result), so a finding missed on
-  the whole image can be recovered in a cell.
+* The region comparison asks every task once per dental-arch region, on the
+  whole uncropped image, by naming the region inside the task's own question
+  with the model's own words: "... has caries in the left posterior region of
+  the lower dentition?". Every region is asked whatever the whole image
+  answered (kept as a separate result), so a finding missed with the model's
+  attention on the whole image can be recovered in a region. The image is
+  never cropped: a cropped panoramic is outside the model's image
+  distribution, while the six region descriptors are the exact strings it was
+  trained to write in its rationales.
 
-Nothing else (JSON contracts, <think> tags, region wording, paraphrase
+Nothing else (JSON contracts, <think> tags, invented region wording, paraphrase
 retries, forced zeros) is used. Findings the model has no task for are not
 asked by default and are reported as "not assessed".
 """
@@ -26,7 +32,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import mimetypes
 import re
@@ -251,8 +256,14 @@ def units_to_cells(units, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> list
     return [c for c in CELLS if c in cells]
 
 
-LOCATION_LEVELS = ("rationale", "crops", "none")
+LOCATION_LEVELS = ("rationale", "regions", "none")
 REGION_VOTES = ("union", "majority")
+
+# The descriptor of each single-region cell, inverted from DESCRIPTORS so the words asked in a
+# region question and the words the scorer matches in a rationale can never drift apart. The three
+# "both the upper and lower" descriptors name two cells at once and are never asked.
+CELL_DESCRIPTORS = {cells[0]: text for text, cells in DESCRIPTORS.items() if len(cells) == 1}
+assert set(CELL_DESCRIPTORS) == set(CELLS), "every cell needs one descriptor to be asked about"
 
 
 # ----------------------------------------------------------------------------
@@ -268,6 +279,22 @@ def questions_for(task: str) -> tuple[str, ...]:
 
 def task_name(task: str) -> str:
     return TASKS[task]["name"] if task in TASKS else LABELS[task]
+
+
+def region_question(task: str, cell: str, phrasing: int = 0) -> str:
+    """The task's own question restricted to one region, e.g. "Based on the imaging analysis, does
+    the patient have caries in the left posterior region of the lower dentition?".
+
+    The smallest change that adds a region to an in-distribution question: the verbatim sentence is
+    kept, and the only words added are one of the nine descriptors DentVLM was trained to write as
+    a location (Supplementary Note 1), so the region is asked in the model's own vocabulary and its
+    own left/right convention. Nothing explains the region: an explanation is text the model never
+    saw.
+    """
+    if cell not in CELL_DESCRIPTORS:
+        raise ValueError(f"unknown cell {cell!r}; expected one of {CELLS}")
+    stem = questions_for(task)[phrasing].strip().rstrip("?.").rstrip()
+    return f"{stem} in {CELL_DESCRIPTORS[cell]}?"
 
 
 def condition_tasks(condition: str, ask_untrained: bool = False) -> tuple[str, ...]:
@@ -345,7 +372,7 @@ def extract_count(text: str) -> int | None:
 
 
 # ----------------------------------------------------------------------------
-# Images and crops
+# Images
 # ----------------------------------------------------------------------------
 def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
     if isinstance(image, (bytes, bytearray)):
@@ -357,30 +384,6 @@ def image_data_uri(image: str | Path | bytes, mime: str = "image/png") -> str:
             mime = guessed
         payload = path.read_bytes()
     return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
-
-
-def make_crops(image_path: str | Path, windows: dict | None = None,
-               cache_dir: str | Path | None = None) -> dict[str, bytes]:
-    """Return {cell: png_bytes} for the cell windows, optionally cached on disk."""
-    from PIL import Image
-
-    windows = windows or CELL_WINDOWS
-    crops: dict[str, bytes] = {}
-    with Image.open(image_path) as source:
-        width, height = source.size
-        for cell, (left, top, right, bottom) in windows.items():
-            target = Path(cache_dir) / f"{Path(image_path).stem}_{cell}.png" if cache_dir else None
-            if target is not None and target.is_file():
-                crops[cell] = target.read_bytes()
-                continue
-            box = (round(left * width), round(top * height), round(right * width), round(bottom * height))
-            buffer = io.BytesIO()
-            source.crop(box).save(buffer, format="PNG")
-            crops[cell] = buffer.getvalue()
-            if target is not None:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(crops[cell])
-    return crops
 
 
 # ----------------------------------------------------------------------------
@@ -504,7 +507,7 @@ class Protocol:
 
     phrasings: int = 1            # 1, or up to 3 verbatim wordings per task with a majority vote
     region_vote: str = "union"    # with phrasings > 1: "union" (matching voting) or "majority"
-    location: str = "rationale"   # "rationale" (free, in-distribution) | "crops" (every cell, every task) | "none"
+    location: str = "rationale"   # "rationale" (free) | "regions" (every region named in the question, every task) | "none"
     count_question: bool = False  # out-of-distribution tooth-count question for positive countables
     ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
     extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
@@ -517,6 +520,9 @@ class Protocol:
         if self.region_vote not in REGION_VOTES:
             raise ValueError(f"region_vote must be one of {REGION_VOTES}")
         if self.location not in LOCATION_LEVELS:
+            if self.location == "crops":  # the cropping mode this replaced
+                raise ValueError("location 'crops' is gone: 'regions' names the region inside the "
+                                 "question and keeps the whole image, which the cropping never did")
             raise ValueError(f"location must be one of {LOCATION_LEVELS}")
 
     def tasks(self) -> tuple[str, ...]:
@@ -558,10 +564,10 @@ def _any_yes(answers) -> str | None:
 
 
 def cell_answers(result: dict) -> dict[str, dict[str, str | None]]:
-    """{task: {cell: yes/no/None}} from the saved crop calls (location "crops"): each cell's final answer."""
+    """{task: {cell: yes/no/None}} from the saved region calls (location "regions"): each region's answer."""
     answers: dict[str, dict] = {}
     for call in result.get("calls") or []:
-        if call.get("stage") == "crop" and call.get("cell"):
+        if call.get("stage") == "region" and call.get("cell"):
             recovery = call.get("parse_recovery")
             answer = recovery["value"] if recovery is not None else extract_answer(call["text"])
             answers.setdefault(call["task"], {})[call["cell"]] = answer
@@ -586,10 +592,10 @@ def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
             "region_count": len(regions) if regions is not None else None, "count": None}
 
 
-def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(),
-                  crop_dir: str | Path | None = None) -> dict:
-    """One yes/no question per task on the whole image; regions from the rationale, or from every cell
-    crop asked every task (the whole-image answers are then kept under "whole_image"). Deterministic order."""
+def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol()) -> dict:
+    """One yes/no question per task on the whole image; regions from the rationale, or from the same
+    question asked once per region with the region named in it (the whole-image answers are then kept
+    under "whole_image"). The image sent is always the whole radiograph. Deterministic order."""
     path = Path(image_path)
     calls: list[dict] = []
     tasks: dict[str, dict] = {}
@@ -627,16 +633,16 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
             llm_api.monitor("AGGREGATION WARNING", f"task={task}", reason="phrasing tie", policy="neutral")
         tasks[task]["whole_image"] = tasks[task]["presence"]
 
-    if protocol.location == "crops":
-        # Comparison only: cropped panoramics are outside DentVLM's image distribution. Every cell is
-        # asked every task, whatever the whole image answered, so a task missed on the whole image can
-        # be recovered in a cell: it is present when any cell says yes, absent when every cell says no.
-        crops = make_crops(path, CELL_WINDOWS, crop_dir)
+    if protocol.location == "regions":
+        # The same whole image, one question per region: the task's own sentence with one of the model's
+        # nine location descriptors inside it. Every region is asked every task, whatever the whole image
+        # answered, so a task missed with the model's attention spread over the whole image can be
+        # recovered in a region: it is present when any region says yes, absent when every region says no.
+        # Task-major (each finding walked region by region); every call shares the same image prefix.
         cell_answers = {task: {} for task in tasks}
-        for cell, png in crops.items():  # cell-major order keeps the image prefix cached
-            for task in tasks:
-                question = questions_for(task)[0]
-                answer, _ = ask("crop", task, cell, png, question)
+        for task in tasks:
+            for cell in CELLS:
+                answer, _ = ask("region", task, cell, path, region_question(task, cell))
                 cell_answers[task][cell] = answer
         for task, answers in cell_answers.items():
             presence = tasks[task]["presence"] = _any_yes(answers.values())
@@ -684,9 +690,10 @@ def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | Non
         "questions": {task: questions_for(task)[:protocol.phrasings] for task in protocol.tasks()},
         "count_questions": COUNT_QUESTIONS if protocol.count_question else None,
         "descriptors": DESCRIPTORS, "cells": CELLS,
-        # Cell windows shape the model input only in crop mode; elsewhere they are evaluation
-        # geometry, so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
-        "cell_windows": CELL_WINDOWS if protocol.location == "crops" else None,
+        # The region questions are model input; the cell windows never are (they are evaluation
+        # geometry), so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
+        "region_questions": ({task: {cell: region_question(task, cell) for cell in CELLS}
+                              for task in protocol.tasks()} if protocol.location == "regions" else None),
         "runner": runner_settings, "provenance": provenance or {},
         "parse_recovery_version": 1,
     }
@@ -749,7 +756,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
             progress.skip(image_id)
             continue
         with mon.guard(f"{out.name}/{image_id}", failures) as step:
-            result = analyze_image(runner, path, protocol=protocol, crop_dir=out / "crops")
+            result = analyze_image(runner, path, protocol=protocol)
             result["image_id"] = image_id
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")

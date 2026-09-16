@@ -66,11 +66,11 @@ can be extended or an experiment added without recomputing saved results.
 
 Local DentVLM experiments share an exact response cache under
 `<output_root>/_response_cache`. This is especially useful here: the base question
-is also phrasing 1 of the three-phrasing run, the whole-image stage of the crop
+is also phrasing 1 of the three-phrasing run, the whole-image stage of the region
 run, and the presence stage of the optional-count run. A reply is reused only
 when the converted model files, llama.cpp binary and server settings, complete
-request, prompt, generation settings, and image or crop bytes match. Changed
-phrasings, crops, token budgets, models, or runtime settings miss the cache.
+request, prompt, generation settings, and image bytes match. Changed
+phrasings, question wording, token budgets, models, or runtime settings miss the cache.
 Set `reuse_local_responses=False` only when independently repeating identical
 deterministic calls is itself part of the experiment.
 
@@ -92,9 +92,11 @@ cropped-panoramic training, and no JSON or tag format. So:
 * **Presence** uses one Table S7 question per task, worded as in the authors'
   released test set, on the whole image. Line 1 decides, as in the authors'
   scorer; both words or neither is unparseable.
-* **Location** is never asked in words. The nine descriptors are read from the
+* **Location** is never asked by default. The nine descriptors are read from the
   rationale by exact match, exactly as the authors compute their IoU, and mapped
-  onto six dental-arch cells (upper/lower x left/anterior/right).
+  onto six dental-arch cells (upper/lower x left/anterior/right). `location="regions"`
+  asks instead, region by region, using those same descriptor strings inside the
+  task's own question and never cropping the image.
 * **Multiplicity** is the number of cells named (0 to 6), reported as
   "in N region(s)". The tooth-count question from the DentalGPT branch is kept
   behind `count_question` as an explicitly out-of-distribution
@@ -162,7 +164,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 | --- | --- |
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell, side-convention check, CSV/JSON export |
-| `dental_analysis.py` | offline phrasing/vote and crop comparisons, recovery, case breakdowns, paired saved-run comparisons |
+| `dental_analysis.py` | offline phrasing/vote and region comparisons, recovery, case breakdowns, paired saved-run comparisons |
 | `response_cache.py` | immutable, content-addressed reuse of exact local DentVLM responses across compatible experiments |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
@@ -181,9 +183,9 @@ The existing finding, count and location scoring rules are preserved.
 
 | Table | DentVLM-specific comparison |
 | --- | --- |
-| `stage_changes` | First saved phrasing vs whole-image vote, and whole-image vs crop outcomes. Includes corrected errors, new errors, unchanged, unresolved and not-assessed outcomes; overall and per finding. |
+| `stage_changes` | First saved phrasing vs whole-image vote, and whole-image vs region-question outcomes. Includes corrected errors, new errors, unchanged, unresolved and not-assessed outcomes; overall and per finding. |
 | `phrasing_votes` | Agreement, disagreement, ties, and unresolved phrasings per task. Available when multiple phrasing answers were saved. |
-| `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules. Only for rationale mode with multiple saved phrasings; crop locations do not use this vote. |
+| `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules. Only for rationale mode with multiple saved phrasings; region-question locations do not use this vote. |
 | `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
 | `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Logical calls, actual inference calls and cache hits are separate, with inference-only token/latency totals. Missing usage is unavailable; transport attempts are not separate saved completions. |
 | `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
@@ -236,13 +238,22 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
   its majority voting). 39 calls per image. In-distribution.
 * `count_question=True`: one count call per positive countable finding.
   Out-of-distribution.
-* `location="crops"`: the primary question for every task on each of the six
-  cell crops, whatever the whole image answered (kept as `whole_image`). A task
-  is present when any cell answers Yes, so a finding missed with the model's
-  attention spread over the whole image can be recovered in a cell, and the
-  cells answering Yes are its regions. 13 + 6 x 13 = 91 calls per image.
-  Cropped panoramics are outside the model's image distribution, so this is a
-  comparison, not the default.
+* `location="regions"`: the primary question for every task asked once per
+  dental-arch region, with the region named inside the question and the whole
+  uncropped image sent every time: "Based on the imaging analysis, does the
+  patient have caries in the left posterior region of the lower dentition?".
+  The added words are one of the model's own nine location descriptors
+  (`dental_pipeline.CELL_DESCRIPTORS`, inverted from the scorer's `DESCRIPTORS`
+  so the two can never drift apart), so the region is asked in the vocabulary
+  and the left/right convention the model was trained to write, and the
+  question keeps its verbatim shape. Every region is asked whatever the whole
+  image answered (kept as `whole_image`). A task is present when any region
+  answers Yes, so a finding missed with the model's attention spread over the
+  whole image can be recovered in a region, and the regions answering Yes are
+  its regions. 13 + 13 x 6 = 91 calls per image. The model was not fine-tuned
+  on region-restricted questions, so this is a comparison, not the default;
+  cropping the panoramic instead would change the image distribution as well,
+  which is why the image is never cropped.
 * `location="none"`: presence only.
 
 ## Runtime settings that matter
@@ -301,10 +312,10 @@ actually produces:
    with their verbatim question and parsed answer (so the writer can say that
    the bridge, not the crown, answered Yes), every dental-arch region with an
    explicit value (`named` / `not_named` from the rationale, or
-   `present` / `absent` / `unparseable` from cell crops), the regions the
+   `present` / `absent` / `unparseable` from the region questions), the regions the
    finding was located in on the patient's side, the multiplicity, the
    optional out-of-distribution count, a `trained` flag for zero-shot
-   questions, and a `detection` note for the crop comparison. A legend, the
+   questions, and a `detection` note for the region comparison. A legend, the
    analyzer's method and its limitations go with it, so nothing is implicit
    and nothing is null. The rationale text itself stays out unless
    `include_rationale` is set: by default the report rests on the same parsed
@@ -317,7 +328,7 @@ actually produces:
    may reword and organise; it may not add, drop, soften or upgrade a finding,
    estimate a count, name a tooth, report a region the model did not name as
    free of the finding, or give a diagnosis, severity or advice. Untrained
-   questions, crop-only detections and experimental counts must be called
+   questions, region-only detections and experimental counts must be called
    what they are.
 3. **Verification and rendering.** `verify_report` checks the reply against
    the input: every finding exactly once, in its section, with its status
@@ -405,14 +416,14 @@ each source placed.
 `<output_root>/<experiment>/<dataset>/evaluation/` holds `presence.csv` (TP, FP, TN, FN,
 unparseable, sensitivity, specificity, PPV, F1 per finding, with a
 `trained_task` flag), `whole_image.csv` (the same table for the whole-image
-answers alone with `location="crops"`: read the two side by side to see what
-the cells recovered and what it cost in specificity), `region_presence.csv`
+answers alone with `location="regions"`: read the two side by side to see what
+the region questions recovered and what they cost in specificity), `region_presence.csv`
 (presence per finding and cell: every cell of every asked image, whatever the
 whole image answered, against the cells the true boxes occupy, as TP, FP, TN,
 FN, unparseable, sensitivity, specificity, PPV and F1; one cell per image, so
 several boxes in a cell are one presence; with `location="rationale"` a named
 cell is the prediction and an unnamed cell counts as not predicted, with
-`"crops"` each cell's own answer counts and an unparseable one is an excluded
+`"regions"` each region question's own answer counts and an unparseable one is an excluded
 cell; an image whose true boxes could not be placed is left out and counted
 under `location_truth_excluded`), `regions.csv` (per-cell TP, FP, TN, FN,
 exact-set match, Jaccard, unlocalized rate, over the localized true positives

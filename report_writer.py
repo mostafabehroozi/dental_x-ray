@@ -67,8 +67,8 @@ GLYPHS = {"present": "●", "absent": "○", "unparseable": "?", "not_assessed":
 
 LEGEND = {
     "status": {
-        "present": "the analyzer answered Yes (with several tasks: at least one answered Yes; with cell crops: at least one cell answered Yes)",
-        "absent": "the analyzer answered No (every task, or every cell, answered No)",
+        "present": "the analyzer answered Yes (with several tasks: at least one answered Yes; with region questions: at least one region answered Yes)",
+        "absent": "the analyzer answered No (every task, or every region, answered No)",
         "unparseable": "an answer could not be read as Yes or No; the finding is neither confirmed nor excluded",
         "not_assessed": "the analyzer has no question for this finding, so it was never asked",
     },
@@ -77,14 +77,14 @@ LEGEND = {
         "not_named": "the rationale did not name this region; this is NOT evidence that the region is free of the finding",
         "not_applicable": "the finding is not present, so no region applies",
     },
-    "regions (location from cell crops)": {
-        "present": "Yes on this cell's crop", "absent": "No on this cell's crop",
-        "unparseable": "the answer for this cell could not be read", "not_asked": "no crop question was asked",
+    "regions (location from region questions)": {
+        "present": "Yes when the question named this region", "absent": "No when the question named this region",
+        "unparseable": "the answer for this region could not be read", "not_asked": "no question named this region",
     },
     "multiplicity": "the number of distinct regions the model named (0 to 6); a lower bound on the number of occurrences, not a tooth count",
     "count": "an experimental tooth count from an out-of-distribution question, or 'not_asked', 'unparseable', 'not_countable'",
     "trained": "false when the analyzer was never trained on this question (zero-shot; the paper reports 52-64% accuracy on such diseases)",
-    "detection": "whether the whole-image answer and the cell-crop answers agree; a crop-only detection is a weaker signal",
+    "detection": "whether the whole-image answer and the region answers agree; a region-only detection is a weaker signal",
 }
 LIMITATIONS = (
     "Experimental output of an automated model for review by a dentist; not a diagnosis.",
@@ -129,23 +129,23 @@ def cell_text(cell: str, left_is_image_left: bool = dp.LEFT_IS_IMAGE_LEFT) -> st
     return f"{row} {side} posterior region (the patient's {side}: premolars and molars, {jaw})"
 
 
-def detection_note(status: str, whole_image: str, crops: bool) -> str:
-    """How the whole-image answer and the cell-crop answers relate, for the dentist's confidence."""
-    if not crops:
+def detection_note(status: str, whole_image: str, regional: bool) -> str:
+    """How the whole-image answer and the region answers relate, for the dentist's confidence."""
+    if not regional:
         return "whole-image question"
     if status == "present":
         if whole_image == "present":
-            return "whole-image and cell-crop answers agree"
+            return "whole-image and region answers agree"
         if whole_image == "absent":
-            return "cell crops only: the whole-image question answered No (weaker signal)"
-        return "cell crops only: the whole-image answer was unparseable"
+            return "region questions only: the whole-image question answered No (weaker signal)"
+        return "region questions only: the whole-image answer was unparseable"
     if status == "absent":
         if whole_image == "present":
-            return "every cell answered No although the whole-image question answered Yes (discordant; treated as absent)"
+            return "every region answered No although the whole-image question answered Yes (discordant; treated as absent)"
         if whole_image == "absent":
-            return "whole-image and cell-crop answers agree"
-        return "every cell answered No; the whole-image answer was unparseable"
-    return "no cell answered Yes and at least one cell answer was unparseable"
+            return "whole-image and region answers agree"
+        return "every region answered No; the whole-image answer was unparseable"
+    return "no region answered Yes and at least one region answer was unparseable"
 
 
 def method_text(result: dict) -> str:
@@ -156,8 +156,9 @@ def method_text(result: dict) -> str:
     if level == "rationale":
         parts.append("the location read from the model's own rationale, which names regions with nine fixed descriptors "
                      "mapped onto six dental-arch cells (upper/lower x right posterior/anterior/left posterior)")
-    elif level == "crops":
-        parts.append("then every task again on each of the six cell crops, whatever the whole image answered")
+    elif level == "regions":
+        parts.append("then every task again once per dental-arch region, on the same whole image, with the region "
+                     "named inside the question in the model's own words, whatever the whole image answered")
     else:
         parts.append("presence only, no location")
     if protocol.get("count_question"):
@@ -183,7 +184,7 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
     """One dense entry for a benchmark finding or an extra DentVLM task."""
     protocol, level = result["protocol"], result.get("location_level", "rationale")
     tasks_out = result.get("tasks") or {}
-    crops = level == "crops"
+    regional = level == "regions"
     if identifier in dp.CONDITIONS:
         finding = result["findings"][identifier]
         keys = list(finding["tasks"]) if finding["asked"] else []
@@ -214,8 +215,8 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
     cells = ordered_cells(flag)
     if not asked or level == "none":
         region_map, region_source = {}, "none"
-    elif crops:
-        region_source = "cell_crops"
+    elif regional:
+        region_source = "region_questions"
         region_map = {}
         for cell in cells:
             answers = [cell_answers.get(k, {}).get(cell, "missing") for k in keys]
@@ -260,7 +261,7 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         "finding": identifier, "label": LABELS[identifier], "category": FINDING_CATEGORY[identifier],
         "benchmark_class": benchmark_class, "trained": trained,
         "status": status, "whole_image": whole,
-        "detection": "not_assessed" if not asked else detection_note(status, whole, crops),
+        "detection": "not_assessed" if not asked else detection_note(status, whole, regional),
         "tasks": tasks,
         "regions": region_map, "region_source": region_source, "located_in": located_in,
         "location_status": location_status, "multiplicity": multiplicity,
@@ -272,7 +273,7 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
     """One dense JSON for the report model: every finding, task, cell and count with an explicit status."""
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
-    cell_answers = dp.cell_answers(result) if level == "crops" else {}  # the evaluator reads the same answers
+    cell_answers = dp.cell_answers(result) if level == "regions" else {}  # the evaluator reads the same answers
     findings = [_entry(i, result, cell_answers, flag, include_rationale) for i in IDENTIFIERS]
     status = {f["finding"]: f["status"] for f in findings}
     order = PATHOLOGY + TREATMENT
@@ -281,7 +282,7 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
         limitations.append(RATIONALE_LIMITATION)
     if any(s == "not_assessed" for s in status.values()):
         limitations.append("Findings the analyzer has no question for were not assessed.")
-    region_legend = (LEGEND["regions (location from cell crops)"] if level == "crops"
+    region_legend = (LEGEND["regions (location from region questions)"] if level == "regions"
                      else LEGEND["regions (location from the rationale)"])
     return {
         "schema": SCHEMA,
@@ -307,7 +308,7 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
             "unparseable": [c for c in order if status[c] == "unparseable"],
             "not_assessed": [c for c in order if status[c] == "not_assessed"],
             "regional_only": [f["finding"] for f in findings if f["status"] == "present" and f["whole_image"] != "present"
-                              and level == "crops"],
+                              and level == "regions"],
         },
     }
 
@@ -357,9 +358,9 @@ HOW TO WRITE
 1. Language: write every human-readable value (title, headings, statements, impression, not_assessable, limitations) in {language}, with the dental terminology a dentist reading that language expects. Keep the JSON keys and every "finding" and "category" identifier exactly as given, in English.
 2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State regions, multiplicity and counts exactly as given; never estimate a count, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "not_stated" or "unparseable", say so in words. A finding with status "not_assessed" gets one sentence saying the analyzer does not assess it.
 3. Wording: as a radiologist reports to a colleague. Short declarative sentences, present tense, attributed to the automated analysis ("The analysis flags ..."). Locate findings on the patient's side ("upper right posterior region"); never say image left or image right. A region the model did not name is never reported as free of the finding. An absent finding gets one short pertinent-negative sentence. When a finding was decided by several tasks (for example a prosthetic crown and a prosthetic bridge), say which task answered Yes. No diagnosis, no differential, no severity, no treatment advice.
-4. Confidence: say when a finding comes from a question the analyzer was not trained on ("trained": false), when "detection" says it was flagged on cell crops only, and that a count is experimental.
+4. Confidence: say when a finding comes from a question the analyzer was not trained on ("trained": false), when "detection" says it was flagged by region questions only, and that a count is experimental.
 5. Impression: 1 to 6 short bullets. Pathology first (caries, periapical lesions, periodontal disease, calculus, furcation involvement, impacted teeth, insufficient eruption space, residual roots and crowns, root resorption), then existing treatment (fillings, crowns or bridges, root canal treatments, implants, appliances, surgical hardware), then what could not be assessed. Absent and not-assessed findings stay out of the impression, unless every assessed finding is absent: then say so in one bullet.
-6. Limitations: the sentences in "analysis.limitations", in the dentist's language, plus any caveat the data raises (unparseable answers, untrained questions, crop-only detections).
+6. Limitations: the sentences in "analysis.limitations", in the dentist's language, plus any caveat the data raises (unparseable answers, untrained questions, region-only detections).
 
 OUTPUT
 JSON only, exactly this shape; the English values are placeholders to translate, the structure and the identifiers are fixed:

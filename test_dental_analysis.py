@@ -102,13 +102,13 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(any(r["condition"] == "dental_filling" and r["transition"] == "FN -> unresolved"
                             for r in report["stage_changes"]))
 
-    def test_crops_have_their_own_transitions_and_no_rationale_replay(self):
+    def test_regions_have_their_own_transitions_and_no_rationale_replay(self):
         gt, results = fixture()
-        results["img"]["location_level"] = results["img"]["protocol"]["location"] = "crops"
+        results["img"]["location_level"] = results["img"]["protocol"]["location"] = "regions"
         results["img"]["findings"]["dental_filling"].update(whole_image="no", presence="yes")
         report = ev.evaluate(gt, results)
         self.assertEqual(report["region_vote_comparison"], [])
-        self.assertTrue(any(r["comparison"] == "whole_image_to_crops" and r["transition"] == "FN -> TP"
+        self.assertTrue(any(r["comparison"] == "whole_image_to_regions" and r["transition"] == "FN -> TP"
                             for r in report["stage_changes"]))
 
     def test_recovery_separates_phrasings_and_respects_composite_truth(self):
@@ -126,7 +126,7 @@ class AnalysisTests(unittest.TestCase):
 
     def test_location_toggle_and_legacy_metadata(self):
         gt, results = fixture()
-        results["img"]["calls"] = [call("fillings", "yes", stage="crop", cell="upper-left")]
+        results["img"]["calls"] = [call("fillings", "yes", stage="region", cell="upper-left")]
         with patch.object(ev, "gt_regions", side_effect=AssertionError("location evaluated")):
             report = ev.evaluate(gt, results, evaluate_location=False)
         self.assertEqual(report["region_vote_comparison"], [])

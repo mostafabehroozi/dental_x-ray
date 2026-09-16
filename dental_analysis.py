@@ -233,7 +233,7 @@ def phrasing_analysis(gt, results, evaluate_location):
                   "unresolved_phrasings": sum(n for _, n in items), "image_ids": sorted({i for i, _ in items})}
                  for (task, status), items in sorted(votes.items())]
     region_rows = []
-    # Rationale regions only: crops overwrite task regions and do not use region_vote.
+    # Rationale regions only: region questions overwrite task regions and do not use region_vote.
     subset = {i: e for i, e in eligible.items() if results[i]["location_level"] == "rationale"}
     if evaluate_location and subset:
         for mode in ("union", "majority"):
@@ -294,9 +294,9 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
             condition_rows.append({"situation": situation, "group": group, **row,
                                    "image_ids": sorted(i for i, conditions in members.items()
                                                        if row["condition"] in conditions)})
-    crops = {i: e for i, e in gt.items() if results[i]["location_level"] == "crops"}
+    regional = {i: e for i, e in gt.items() if results[i]["location_level"] == "regions"}
     changes, votes, region_votes = phrasing_analysis(gt, results, evaluate_location)
-    changes += presence_changes(crops, results, results, "whole_image_to_crops", before_field="whole_image")
+    changes += presence_changes(regional, results, results, "whole_image_to_regions", before_field="whole_image")
     return {"stage_changes": changes, "phrasing_votes": votes, "region_vote_comparison": region_votes,
             "parse_recovery": recovery_rows(gt, results, evaluate_location),
             "call_usage": call_usage(results), "case_breakdown": rows,
@@ -377,7 +377,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
 
 
 def compact_views(ground_truth, reports):
-    """Join DentVLM reports without losing task support, votes, crops, or not-assessed states."""
+    """Join DentVLM reports without losing task support, votes, region answers, or not-assessed states."""
     overview, findings, situations, situation_findings = [], [], [], []
     stages, phrasings, vote_replays, recoveries, usage = [], [], [], [], []
     for (experiment, dataset), report in sorted(reports.items()):

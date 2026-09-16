@@ -8,7 +8,7 @@ one run directory and the evaluation cell scores them side by side on the same i
     EXPERIMENTS = xp.build([
         {"name": "base"},
         {"name": "three-phrasings", "phrasings": 3},
-        {"name": "crops", "location": "crops"},
+        {"name": "regions", "location": "regions"},
         {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
         {"name": "dentvlm-local", "backend": "local"},
     ], shared={"output_root": "/kaggle/working/dental_outputs"})
@@ -53,7 +53,7 @@ DEFAULTS = {
     # Protocol: the paper's protocol by default (see dental_pipeline.Protocol).
     "phrasings": 1,                    # 3 = three verbatim wordings per task and a vote
     "region_vote": "union",            # with phrasings > 1: "union" | "majority"
-    "location": "rationale",           # "rationale" | "crops" (every cell asked every task) | "none"
+    "location": "rationale",           # "rationale" | "regions" (every region named in the question) | "none"
     "count_question": False,           # out-of-distribution tooth count for positive findings
     "ask_untrained": False,            # also ask the five UMFIH classes DentVLM has no task for
     "extra_tasks": True,               # residual crown, eruption space, calculus: reported, not scored

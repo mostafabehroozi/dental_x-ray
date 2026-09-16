@@ -249,14 +249,20 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(retry["region"], "UR")
         self.assertEqual(retry["parse_recovery"]["value"], ("A", 2))
 
-    @unittest.skipUnless(DENTVLM, "DentVLM crop protocol")
-    def test_crop_exhaustion_is_neutral_in_report_as_well(self):
+    @unittest.skipUnless(DENTVLM, "DentVLM region protocol")
+    def test_region_exhaustion_is_neutral_in_report_as_well(self):
         n_tasks = len(protocol().tasks())
-        result, _, _, _ = self.run_image(
-            ["No"] * n_tasks + [("Yes\nunfinished", "length")] * 2, location="crops")
+        result, client, _, _ = self.run_image(
+            ["No"] * n_tasks + [("Yes\nunfinished", "length")] * 2, location="regions")
         self.assertIsNone(result["findings"]["dental_implant"]["presence"])
         cells = dp.cell_answers(result)
         self.assertIsNone(cells["implant"][dp.CELLS[0]])
+        # The region is words, so every call carries the same whole image, and the first region call
+        # is the first task's own question with the first cell's descriptor inside it.
+        images = {json.dumps(r["messages"][0]["content"][0]) for r in client.requests}
+        self.assertEqual(len(images), 1)
+        self.assertEqual(client.requests[n_tasks]["messages"][0]["content"][1]["text"],
+                         dp.region_question("implant", dp.CELLS[0]))
         self.assertIsNone(ev.predicted_cells(result, "dental_implant")[dp.CELLS[0]])
         self.assertFalse(ev.predicted_cells(result, "dental_implant")[dp.CELLS[1]])
         self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)

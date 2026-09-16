@@ -66,10 +66,10 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(cfg["adapter"]["failure_policy"], "exclude")
 
     def test_protocol_carries_every_question_knob(self):
-        cfg, = xp.build([{"name": "loud", "phrasings": 3, "region_vote": "majority", "location": "crops",
+        cfg, = xp.build([{"name": "loud", "phrasings": 3, "region_vote": "majority", "location": "regions",
                           "count_question": True, "ask_untrained": True, "extra_tasks": False}], SHARED)
         protocol = xp.protocol(cfg)
-        self.assertEqual((protocol.phrasings, protocol.region_vote, protocol.location), (3, "majority", "crops"))
+        self.assertEqual((protocol.phrasings, protocol.region_vote, protocol.location), (3, "majority", "regions"))
         self.assertEqual((protocol.count_question, protocol.ask_untrained, protocol.extra_tasks),
                          (True, True, False))
 

@@ -98,7 +98,7 @@ class ExtractionTests(unittest.TestCase):
 
 
 def _blank_image(path: Path, size=(560, 280), shade: int = 128) -> None:
-    """A test radiograph whose regions differ, so crops are distinguishable bytes."""
+    """A test radiograph with a mark in every region window."""
     from PIL import Image, ImageDraw
 
     image = Image.new("L", size, color=shade)
@@ -110,26 +110,29 @@ def _blank_image(path: Path, size=(560, 280), shade: int = 128) -> None:
 
 
 class FakeRunner:
-    """Answers from a script keyed by (stage, task, cell); the scripted image's crops are recognised by bytes."""
+    """Answers from a script keyed by (stage, task, cell); the region asked is read out of the question."""
 
-    def __init__(self, script: dict, cell_of: dict | None = None, scripted_image: str = "img1"):
-        self.script, self.cell_of, self.log = script, cell_of or {}, []
+    def __init__(self, script: dict, scripted_image: str = "img1"):
+        self.script, self.log = script, []
         self.scripted_image = scripted_image  # other images always answer No / 0
 
     def settings(self):
         return {"model": "fake"}
 
     def ask(self, image, question):
-        task = next((t for t in list(dp.TASKS) + list(dp.UNTRAINED_LABELS) if question in dp.questions_for(t)), None)
-        stage = "presence"
-        if task is None:
-            stage = "count"
-            task = next(c for c, q in dp.COUNT_QUESTIONS.items() if q == question)
-        if isinstance(image, bytes):  # a crop; only the scripted image's crops are known
-            cell, stage = self.cell_of.get(image), "crop"
-            scripted = cell is not None
+        assert not isinstance(image, (bytes, bytearray)), "no protocol crops the image; the region is words"
+        keys = list(dp.TASKS) + list(dp.UNTRAINED_LABELS)
+        cell = next((c for c, d in dp.CELL_DESCRIPTORS.items() if question.endswith(f" in {d}?")), None)
+        if cell is not None:  # a region question: the same whole image with the region named in it
+            stage = "region"
+            task = next(t for t in keys if dp.region_question(t, cell) == question)
         else:
-            cell, scripted = None, Path(image).stem == self.scripted_image
+            task = next((t for t in keys if question in dp.questions_for(t)), None)
+            stage = "presence"
+            if task is None:
+                stage = "count"
+                task = next(c for c, q in dp.COUNT_QUESTIONS.items() if q == question)
+        scripted = Path(image).stem == self.scripted_image
         key = (stage, task, cell)
         self.log.append(key)
         text = "0" if stage == "count" else "No\nNothing of the kind is seen."
@@ -158,7 +161,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         (self.root / "images").mkdir()
         (self.root / "labels").mkdir()
         _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png", shade=100)  # different bytes, so its crops are not img1's
+        _blank_image(self.root / "images" / "img2.png", shade=100)
         # img1: two fillings in the upper image-left cell, one impacted tooth in the lower image-right cell.
         (self.root / "labels" / "img1.txt").write_text(
             "2 0.20 0.25 0.05 0.05\n2 0.30 0.30 0.05 0.05\n6 0.80 0.80 0.10 0.10\n")
@@ -260,33 +263,34 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(counts["dental_filling"]["exact_rate"], 1.0)
         self.assertEqual(counts["impacted_tooth"]["mae"], 1.0)
 
-    def test_crop_location_mode(self):
-        """Every cell is asked every task, whatever the whole image answered; the whole image is kept separately."""
-        cell_of = {png: cell for cell, png in dp.make_crops(self.images["img1"]).items()}
-        self.assertEqual(len(cell_of), 6)
+    def test_region_location_mode(self):
+        """Every region is asked every task, whatever the whole image answered; the whole image is kept separately."""
         script = dict(SCRIPT)
-        script[("crop", "fillings", "upper-left")] = "Yes\nFillings are visible."
-        script[("crop", "impacted_tooth", "lower-right")] = "Yes"
-        script[("crop", "root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, recovered in a cell
-        script[("crop", "residual_root", "upper-anterior")] = "Yes and no."  # one unparseable cell
-        runner = FakeRunner(script, cell_of)
-        out = dp.run_dataset(runner, self.images, self.root / "run_crops", protocol=dp.Protocol(location="crops"))
+        script[("region", "fillings", "upper-left")] = "Yes\nFillings are visible."
+        script[("region", "impacted_tooth", "lower-right")] = "Yes"
+        script[("region", "root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, found by region
+        script[("region", "residual_root", "upper-anterior")] = "Yes and no."  # one unparseable region
+        runner = FakeRunner(script)
+        out = dp.run_dataset(runner, self.images, self.root / "run_regions", protocol=dp.Protocol(location="regions"))
         results = dp.load_results(out)
         f = results["img1"]["findings"]
         self.assertEqual((f["dental_filling"]["presence"], f["dental_filling"]["regions"]), ("yes", ["upper-left"]))
         self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right"])
         self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["whole_image"],
                           f["endodontic_treatment"]["regions"]), ("yes", "no", ["upper-right"]))
-        # Caries and the bridge were yes on the whole image only: no cell answers yes, so they are absent.
+        # Caries and the bridge were yes on the whole image only: no region answers yes, so they are absent.
         self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["whole_image"]), ("no", "yes"))
         self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]), ("no", None))
         self.assertEqual(results["img1"]["tasks"]["implant"]["presence"], "no")  # unparseable on the whole image only
-        self.assertIsNone(results["img1"]["findings"]["root_fragment"]["presence"])  # no yes, one unparseable cell
+        self.assertIsNone(results["img1"]["findings"]["root_fragment"]["presence"])  # no yes, one unparseable region
         self.assertEqual((dp.cell_answers(results["img1"])["fillings"]["upper-left"],
                           dp.cell_answers(results["img1"])["residual_root"]["upper-anterior"]), ("yes", None))
-        # 13 whole-image calls + 6 cells x 13 tasks, for every image.
+        # 13 whole-image calls + 13 tasks x 6 regions, for every image, and no image was ever cropped.
         self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (91, 91))
-        self.assertTrue((out / "crops" / "img1_upper-left.png").is_file())
+        region_calls = [c for c in results["img1"]["calls"] if c["stage"] == "region"]
+        self.assertEqual(len(region_calls), 78)
+        self.assertTrue(all(c["question"].endswith(f" in {dp.CELL_DESCRIPTORS[c['cell']]}?") for c in region_calls))
+        self.assertFalse((out / "crops").exists())
 
         gt = ev.load_yolo(self.root / "images", self.root / "labels")
         report = ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
@@ -297,8 +301,8 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual((presence["dental_implant"]["unparseable"], whole["dental_implant"]["unparseable"]), (0, 1))
         self.assertEqual(report["summary"]["whole_image"]["FP"], 2)  # caries and the bridge
         self.assertTrue((out / "evaluation" / "whole_image.csv").is_file())
-        # Presence per cell reads each cell's own answer: the implant's six No cells count although the whole
-        # image was unparseable, and only the one unparseable residual-root cell is excluded.
+        # Presence per cell reads each region's own answer: the implant's six No regions count although the
+        # whole image was unparseable, and only the one unparseable residual-root region is excluded.
         rp = {(r["condition"], r["region"]): r for r in report["region_presence"]}
         self.assertEqual((rp[("dental_filling", "upper-left")]["TP"], rp[("endodontic_treatment", "upper-right")]["FP"]), (1, 1))
         self.assertEqual((rp[("dental_implant", "upper-left")]["TN"], rp[("dental_implant", "upper-left")]["images"]), (2, 2))
@@ -321,14 +325,14 @@ class PredictedCellsTests(unittest.TestCase):
         self.assertIsNone(ev.predicted_cells({**result, "location_level": "none", "findings": {"dental_filling": finding}},
                                              "dental_filling"))
 
-    def test_crops_merge_the_tasks_cell_by_cell(self):
+    def test_region_answers_merge_the_tasks_cell_by_cell(self):
         def call(task, cell, text):
-            return {"stage": "crop", "task": task, "cell": cell, "text": text, "parse_recovery": {"value": dp.extract_answer(text)}}
+            return {"stage": "region", "task": task, "cell": cell, "text": text, "parse_recovery": {"value": dp.extract_answer(text)}}
 
         calls = [call("prosthetic_crown", c, "Yes" if c == "upper-anterior" else "No") for c in dp.CELLS]
         calls += [call("prosthetic_bridge", c, "Yes and no." if c == "lower-left" else "No") for c in dp.CELLS]
         finding = {"asked": True, "tasks": ["prosthetic_crown", "prosthetic_bridge"], "presence": "yes", "regions": ["upper-anterior"]}
-        result = {"location_level": "crops", "findings": {"prosthetic_restoration": finding}, "calls": calls}
+        result = {"location_level": "regions", "findings": {"prosthetic_restoration": finding}, "calls": calls}
         expected = {c: True if c == "upper-anterior" else None if c == "lower-left" else False for c in dp.CELLS}
         self.assertEqual(ev.predicted_cells(result, "prosthetic_restoration"), expected)
         # A result saved without its calls falls back to the finding's cell set.

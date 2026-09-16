@@ -20,19 +20,21 @@ UPPER_ANTERIOR = "the anterior region of the upper dentition"
 
 
 class ScriptedRunner:
-    """Answers by question text (whole image) or by (task, cell) for crop bytes; unscripted answers are No / 0."""
+    """Answers by question text, or by (task, cell) when the question names a region; unscripted are No / 0."""
 
-    def __init__(self, script: dict, cell_of: dict | None = None):
-        self.script, self.cell_of, self.calls = script, cell_of or {}, 0
+    def __init__(self, script: dict):
+        self.script, self.calls = script, 0
 
     def settings(self):
         return {"model": "fake"}
 
     def ask(self, image, question):
         self.calls += 1
-        if isinstance(image, bytes):
-            task = next(t for t in list(dp.TASKS) + list(dp.UNTRAINED_LABELS) if question in dp.questions_for(t))
-            text = self.script.get((task, self.cell_of[image]), "No\nNothing of the kind is seen.")
+        cell = next((c for c, d in dp.CELL_DESCRIPTORS.items() if question.endswith(f" in {d}?")), None)
+        if cell is not None:
+            task = next(t for t in list(dp.TASKS) + list(dp.UNTRAINED_LABELS)
+                        if dp.region_question(t, cell) == question)
+            text = self.script.get((task, cell), "No\nNothing of the kind is seen.")
         elif question in dp.COUNT_QUESTIONS.values():
             text = self.script.get(question, "0")
         else:
@@ -183,37 +185,25 @@ class StructuredInputTests(unittest.TestCase):
         self.assertNotIn("were not assessed", s["analysis"]["limitations"][-1])
         self.assertIn("out-of-distribution tooth-count", s["analysis"]["method"])
 
-    def test_crop_locations(self):
-        if importlib.util.find_spec("PIL") is None:
-            self.skipTest("Pillow not installed")
-        from PIL import Image, ImageDraw
-
-        image = Image.new("L", (560, 280), color=128)  # each cell gets its own mark, so the crops differ as bytes
-        draw = ImageDraw.Draw(image)
-        for index, (left, top, _, _) in enumerate(dp.CELL_WINDOWS.values()):
-            x, y = int(left * 560) + 5 + index * 3, int(top * 280) + 5
-            draw.rectangle((x, y, x + 12, y + 12), fill=20 + 30 * index)
-        image.save(self.image)
-        cell_of = {png: cell for cell, png in dp.make_crops(self.image).items()}
-        self.assertEqual(len(cell_of), 6)
+    def test_region_locations(self):
         script = dict(SCRIPT)
         script[("fillings", "upper-left")] = "Yes\nFillings are visible."
         script[("impacted_tooth", "lower-right")] = "Yes"
-        script[("root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, recovered in a cell
-        script[("implant", "lower-anterior")] = "Yes and no."  # unparseable cell
-        result = dp.analyze_image(ScriptedRunner(script, cell_of), self.image, protocol=dp.Protocol(location="crops"))
+        script[("root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, found by region
+        script[("implant", "lower-anterior")] = "Yes and no."  # unparseable region
+        result = dp.analyze_image(ScriptedRunner(script), self.image, protocol=dp.Protocol(location="regions"))
         s = rw.structured_findings(result)
         by = {f["finding"]: f for f in s["findings"]}
-        self.assertEqual(s["analysis"]["location_source"], "crops")
-        self.assertEqual(s["legend"]["regions"], rw.LEGEND["regions (location from cell crops)"])
+        self.assertEqual(s["analysis"]["location_source"], "regions")
+        self.assertEqual(s["legend"]["regions"], rw.LEGEND["regions (location from region questions)"])
         filling = by["dental_filling"]
         self.assertEqual(filling["regions"], {"upper-right-posterior": "present", "upper-anterior": "absent", "upper-left-posterior": "absent",
                                               "lower-right-posterior": "absent", "lower-anterior": "absent", "lower-left-posterior": "absent"})
         self.assertEqual((filling["located_in"], filling["region_source"], filling["detection"]),
-                         (["upper-right-posterior"], "cell_crops", "whole-image and cell-crop answers agree"))
+                         (["upper-right-posterior"], "region_questions", "whole-image and region answers agree"))
         endo = by["endodontic_treatment"]
         self.assertEqual((endo["status"], endo["whole_image"], endo["located_in"]), ("present", "absent", ["upper-left-posterior"]))
-        self.assertIn("cell crops only", endo["detection"])
+        self.assertIn("region questions only", endo["detection"])
         caries = by["carious_lesion"]
         self.assertEqual((caries["status"], caries["whole_image"]), ("absent", "present"))
         self.assertIn("discordant", caries["detection"])

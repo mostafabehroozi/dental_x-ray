@@ -2,8 +2,8 @@
 
 Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
 Metrics stay simple: image-level TP/FP/TN/FN per finding (and the same table
-for the whole-image answers alone in the crop comparison, to show what the
-cells recovered and what it cost), presence per cell (every cell of every
+for the whole-image answers alone in the region comparison, to show what the
+region questions recovered and what they cost), presence per cell (every cell of every
 image, present or absent, against the cells the true boxes occupy, so a finding
 class is scored once per cell rather than counted), cell-level TP/FP/TN/FN for
 the localized true positives, count agreement when the optional count question
@@ -289,14 +289,14 @@ def predicted_cells(result: dict, condition: str) -> dict[str, bool | None] | No
 
     Rationale: the cells the model named are the prediction and every other cell counts as not predicted,
     the same reading as regions.csv (a cell the rationale did not name is not evidence of absence there).
-    Crops: each cell's own answer, merged over the finding's tasks (any yes, all no, else unparseable);
-    a result saved without its calls or task list falls back to the finding's cell set.
+    Regions: each region question's own answer, merged over the finding's tasks (any yes, all no, else
+    unparseable); a result saved without its calls or task list falls back to the finding's cell set.
     """
     finding = result["findings"][condition]
     level = result.get("location_level", "none")
     if not finding["asked"] or level == "none":
         return None
-    if level == "crops":
+    if level == "regions":
         answers, tasks = cell_answers(result), finding.get("tasks") or []
         if tasks and all(task in answers for task in tasks):
             cells = {}
@@ -347,8 +347,8 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     protocol = results[ids[0]].get("protocol") if ids else None
     level = next((results[i]["location_level"] for i in ids), "none")
     count_asked = any(results[i].get("protocol", {}).get("count_question") for i in ids)
-    # The whole-image answers are a separate result only in the crop comparison.
-    whole_image_kept = level == "crops" and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]]
+    # The whole-image answers are a separate result only in the region comparison.
+    whole_image_kept = level == "regions" and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]]
 
     for condition in CONDITIONS:
         annotated = [i for i in ids if condition in gt[i]["annotated"]]

@@ -21,7 +21,7 @@ class LocationScoringTests(unittest.TestCase):
             regions=["upper-left"],
             region_counts={"UR": 1})
         results = {"image": {"findings": findings, "call_count": 71,
-                            "location_level": "crops",
+                            "location_level": "regions",
                             "protocol": {"count_question": True}}}
         gt = {"image": {"annotated": set(dp.CONDITIONS), "boxes": [
             {"condition": "dental_filling", "xc": 0.2, "yc": 0.25, "w": 0.05, "h": 0.05}]}}
