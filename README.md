@@ -16,7 +16,7 @@ does not mention comes from the `SHARED` dictionary above it, and then from
 EXPERIMENTS = xp.build([
     {"name": "base"},
     {"name": "three-phrasings", "phrasings": 3},
-    {"name": "with-counts", "count_question": True},
+    {"name": "six-regions", "location": "regions"},
     {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
     {"name": "dentvlm-local", "backend": "local"},
 ], shared=SHARED)
@@ -24,7 +24,7 @@ EXPERIMENTS = xp.build([
 
 Anything in `experiments.DEFAULTS` may vary per experiment: the backend (local
 DentVLM through llama.cpp or a hosted model), the analyzer, adapter and reporter
-models, the seven protocol knobs, the retry budgets, the location truth, the
+models, the six protocol knobs, the retry budgets, the location truth, the
 report language, and the local checkpoint source, context size and image-token
 cap. A dictionary knob (`analyzer`, `adapter`, `reporter`) merges key by key, so
 changing the model keeps the provider and its request options; every other knob
@@ -44,7 +44,7 @@ and ranks them:
 
 * `<output_root>/leaderboard.csv`: one row per experiment and dataset with the
   protocol knobs, raw TP/TN/FP/FN, scored/expected/annotated denominators,
-  coverage, detection rates, count diagnostics, six-cell location diagnostics,
+  coverage, detection rates, six-cell location diagnostics,
   side agreement, and calls per image. Each row is scored against that
   experiment's own location truth.
 * `<output_root>/overview/`: joined experiment, finding, situation,
@@ -66,8 +66,8 @@ can be extended or an experiment added without recomputing saved results.
 
 Local DentVLM experiments share an exact response cache under
 `<output_root>/_response_cache`. This is especially useful here: the base question
-is also phrasing 1 of the three-phrasing run, the whole-image stage of the region
-run, and the presence stage of the optional-count run. A reply is reused only
+is also phrasing 1 of the three-phrasing run and the whole-image stage of the
+region run. A reply is reused only
 when the converted model files, llama.cpp binary and server settings, complete
 request, prompt, generation settings, and image bytes match. Changed
 phrasings, question wording, token budgets, models, or runtime settings miss the cache.
@@ -98,13 +98,10 @@ cropped-panoramic training, and no JSON or tag format. So:
   asks instead, region by region, using those same descriptor strings inside the
   task's own question and never cropping the image.
 * **Multiplicity** is the number of cells named (0 to 6), reported as
-  "in N region(s)". The tooth-count question from the DentalGPT branch is kept
-  behind `count_question` as an explicitly out-of-distribution
-  experiment. That knob is the counting switch, and it is off by default: the
-  model is asked presence only, and the evaluation scores each finding as
-  present or absent per image and per cell (`region_presence.csv`), so a class
-  that occurs several times in an image or a cell is scored once. Only
-  `count_question=True` adds a count and the count tables.
+  "in N region(s)". DentVLM is never asked to count teeth: it has no count
+  task, so the model is asked presence only and the evaluation scores each
+  finding as present or absent per image and per cell (`region_presence.csv`),
+  so a class that occurs several times in an image or a cell is scored once.
 * **Findings without a DentVLM task** (furcation involvement, apical surgery,
   root resorption, orthodontic appliances, surgical plates) are not asked and
   are reported as "not assessed by this model". `ask_untrained`
@@ -114,8 +111,8 @@ cropped-panoramic training, and no JSON or tag format. So:
   the prosthetic crown and prosthetic bridge tasks, regions merged.
 * **Bounded parse recovery.** The notebook sets `parse_retries = 1`: one extra
   attempt per unparseable answer, on the same image/model with a reminder to put
-  Yes/No on line 1 and retain the rationale/location. Optional counts use an
-  integer-only reminder. Every failed attempt prints the full prompt and response;
+  Yes/No on line 1 and retain the rationale/location.
+  Every failed attempt prints the full prompt and response;
   all attempts and the recovery summary are saved. Truncated replies are unresolved.
   Retries repair individual phrasings, not votes: valid but conflicting phrasings
   still follow the existing vote rule. Exhausted results remain `None`, never
@@ -179,7 +176,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 
 Cell 11 saves, and Cell 12 displays, compact diagnostics with supporting image IDs
 in `<output_root>/<experiment>/<dataset>/evaluation/evaluation.json` and matching CSV files.
-The existing finding, count and location scoring rules are preserved.
+The existing finding and location scoring rules are preserved.
 
 | Table | DentVLM-specific comparison |
 | --- | --- |
@@ -189,7 +186,7 @@ The existing finding, count and location scoring rules are preserved.
 | `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
 | `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Logical calls, actual inference calls and cache hits are separate, with inference-only token/latency totals. Missing usage is unavailable; transport attempts are not separate saved completions. |
 | `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
-| `case_condition_breakdown` | The same situations split by finding, including assessment status, raw confusion counts, coverage, optional count metrics, and six-cell location metrics. |
+| `case_condition_breakdown` | The same situations split by finding, including assessment status, raw confusion counts, coverage, and six-cell location metrics. |
 
 Cell 11 also writes the joined versions to `<output_root>/overview/` as
 `experiment_overview`, `finding_comparison`, `situation_comparison`,
@@ -204,13 +201,13 @@ combined with the existing OR rule before finding scoring. Their individual retr
 answers cannot be graded from the merged restoration label, so correctness is
 unavailable for those tasks; extra tasks without benchmark labels are likewise
 unscored. A recovered parse can still be wrong. Named-cell multiplicity is never
-treated as a tooth count; count metrics require the optional count question.
+treated as a tooth count.
 
 Cell 11 compares the experiments of Cell 3 automatically: every experiment with a
 complete set of results for a dataset is scored paired against the first one and
 written to `<output_root>/comparison/<dataset>/`. `run_comparison` reports each
-experiment's knobs (`phrasings`, `region_vote`, `location`, `count_question`,
-`ask_untrained`, `extra_tasks`, `parse_retries`), coverage, metrics and recorded
+experiment's knobs (`phrasings`, `region_vote`, `location`, `ask_untrained`,
+`extra_tasks`, `parse_retries`), coverage, metrics and recorded
 usage; `run_changes` contains paired outcomes and image IDs. Every selected image
 must exist in each run with identical image hashes and a consistent saved
 protocol; an experiment still missing images is left out of the paired table (its
@@ -222,7 +219,7 @@ same supplied ground truth.
 Paired F1 uses only findings asked and resolved in both runs. Newly assessed and
 unresolved transitions remain separate, so enabling untrained tasks cannot be
 counted as repairing old errors. Coverage is scored/expected **asked** checks;
-not-assessed checks have their own column. Count and location metrics retain each
+not-assessed checks have their own column. Location metrics retain each
 run's true-positive subset. Case groups describe associations, not causal effects;
 empty denominators are unavailable. Reload the updated project imports and rerun
 Cell 11 with ground truth/location adaptation already loaded; no model calls are
@@ -236,8 +233,6 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 * `phrasings=3`: ask three verbatim wordings per task and vote (majority for
   yes/no; `region_vote="union"` is the paper's matching voting, `"majority"`
   its majority voting). 39 calls per image. In-distribution.
-* `count_question=True`: one count call per positive countable finding.
-  Out-of-distribution.
 * `location="regions"`: the primary question for every task asked once per
   dental-arch region, with the region named inside the question and the whole
   uncropped image sent every time: "Based on the imaging analysis, does the
@@ -313,9 +308,9 @@ actually produces:
    the bridge, not the crown, answered Yes), every dental-arch region with an
    explicit value (`named` / `not_named` from the rationale, or
    `present` / `absent` / `unparseable` from the region questions), the regions the
-   finding was located in on the patient's side, the multiplicity, the
-   optional out-of-distribution count, a `trained` flag for zero-shot
-   questions, and a `detection` note for the region comparison. A legend, the
+   finding was located in on the patient's side, the multiplicity, a
+   `trained` flag for zero-shot questions, and a `detection` note for the
+   region comparison. A legend, the
    analyzer's method and its limitations go with it, so nothing is implicit
    and nothing is null. The rationale text itself stays out unless
    `include_rationale` is set: by default the report rests on the same parsed
@@ -326,10 +321,10 @@ actually produces:
    language, an impression with pathology before treatment history, the
    unparseable findings under "not assessable", and limitations. The writer
    may reword and organise; it may not add, drop, soften or upgrade a finding,
-   estimate a count, name a tooth, report a region the model did not name as
-   free of the finding, or give a diagnosis, severity or advice. Untrained
-   questions, region-only detections and experimental counts must be called
-   what they are.
+   estimate a number of teeth, name a tooth, report a region the model did not
+   name as free of the finding, or give a diagnosis, severity or advice.
+   Untrained questions and region-only detections must be called what they
+   are.
 3. **Verification and rendering.** `verify_report` checks the reply against
    the input: every finding exactly once, in its section, with its status
    unchanged, no unknown finding, impression and limitations present, "not
@@ -427,7 +422,7 @@ cell is the prediction and an unnamed cell counts as not predicted, with
 cell; an image whose true boxes could not be placed is left out and counted
 under `location_truth_excluded`), `regions.csv` (per-cell TP, FP, TN, FN,
 exact-set match, Jaccard, unlocalized rate, over the localized true positives
-only), `counts.csv` (only when the count question was asked), `per_image.csv`,
+only), `per_image.csv`,
 and `evaluation.json` with a summary: the saved protocol, micro and macro F1,
 complete-case rate, mean false alarms per image, the presence-per-cell micro
 numbers under `region_presence`, left/right side agreement when location is
@@ -456,9 +451,10 @@ location truth, so they follow `evaluate_location`.
 
 In an experiment, set `evaluate_location = True` (default) to score locations,
 or `False` to skip location scoring and location-truth adapter calls. Finding
-scores and total-count scores remain enabled; inference, counting questions,
-and saved predictions are unchanged. Presence per cell follows this switch.
+scores remain enabled; inference and saved predictions are unchanged. Presence per cell follows this switch.
 Re-run Cell 3, Cell 10, and Cell 11 to evaluate existing results with this setting;
 no inference rerun is required. Cell 13 also skips its side check when disabled.
 The report records `summary.evaluate_location`. Re-exporting a report with location
 scoring disabled removes its previous location CSVs so stale metrics are not shown.
+The same rule retires `counts.csv`: this branch has no count question, so a
+`counts.csv` written by an earlier version is deleted on re-export.

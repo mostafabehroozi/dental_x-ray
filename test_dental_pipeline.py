@@ -74,20 +74,6 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(dp.vote(tie, "union"), {"presence": None, "regions": None})
         self.assertEqual(dp.vote([{"answer": "no", "regions": []}], "union"), {"presence": "no", "regions": None})
 
-    def test_count_forms(self):
-        cases = {
-            "The panoramic X-ray demonstrates 10 teeth with visible dental fillings.": 10,
-            "Three teeth show root canal treatment.": 3,
-            "There are 2 teeth (#16, #26) with fillings.": 2,
-            "A total of three teeth have fillings, on 16, 26 and 36.": 3,
-            "Only tooth 36 shows a periapical lesion.": None,
-            "No teeth have fillings.": 0,
-            "It is hard to say.": None,
-        }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                self.assertEqual(dp.extract_count(text), expected)
-
     def test_cell_descriptions(self):
         self.assertEqual(dp.describe_cell("upper-left"), "patient's upper right posterior (image left)")
         self.assertEqual(dp.describe_cell("lower-right"), "patient's lower left posterior (image right)")
@@ -114,7 +100,7 @@ class FakeRunner:
 
     def __init__(self, script: dict, scripted_image: str = "img1"):
         self.script, self.log = script, []
-        self.scripted_image = scripted_image  # other images always answer No / 0
+        self.scripted_image = scripted_image  # other images always answer No
 
     def settings(self):
         return {"model": "fake"}
@@ -127,15 +113,12 @@ class FakeRunner:
             stage = "region"
             task = next(t for t in keys if dp.region_question(t, cell) == question)
         else:
-            task = next((t for t in keys if question in dp.questions_for(t)), None)
             stage = "presence"
-            if task is None:
-                stage = "count"
-                task = next(c for c, q in dp.COUNT_QUESTIONS.items() if q == question)
+            task = next(t for t in keys if question in dp.questions_for(t))
         scripted = Path(image).stem == self.scripted_image
         key = (stage, task, cell)
         self.log.append(key)
-        text = "0" if stage == "count" else "No\nNothing of the kind is seen."
+        text = "No\nNothing of the kind is seen."
         if scripted:
             text = self.script.get(key, text)
         return {"text": text, "finish_reason": "stop", "truncated": False,
@@ -180,7 +163,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(set(results), {"img1", "img2"})
         f = results["img1"]["findings"]
         self.assertEqual(f["dental_filling"], {"asked": True, "tasks": ["fillings"], "presence": "yes", "whole_image": "yes",
-                                               "regions": ["upper-left"], "region_count": 1, "count": None})
+                                               "regions": ["upper-left"], "region_count": 1})
         self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right", "lower-left"])
         self.assertEqual(f["prosthetic_restoration"]["tasks"], ["prosthetic_crown", "prosthetic_bridge"])
         self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]),
@@ -189,7 +172,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertIsNone(f["dental_implant"]["presence"])
         self.assertEqual(f["surgical_device"]["asked"], False)
         self.assertEqual(f["root_fragment"], {"asked": True, "tasks": ["residual_root"], "presence": "no", "whole_image": "no",
-                                             "regions": None, "region_count": None, "count": None})
+                                             "regions": None, "region_count": None})
         self.assertEqual(results["img1"]["tasks"]["residual_crown"]["presence"], "yes")
         self.assertEqual(results["img1"]["call_count"], 13)
         self.assertEqual(results["img2"]["call_count"], 13)
@@ -212,7 +195,7 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertTrue(presence["dental_filling"]["trained_task"])
         self.assertEqual(presence["carious_lesion"]["FP"], 1)
         self.assertEqual((presence["dental_implant"]["unparseable"], presence["dental_implant"]["TN"]), (1, 1))
-        self.assertEqual((report["counts"], report["whole_image"]), ([], []))  # presence is the whole-image answer here
+        self.assertEqual(report["whole_image"], [])  # presence is the whole-image answer here
         regions = {r["condition"]: r for r in report["regions"]}
         self.assertEqual(regions["dental_filling"]["exact_set_match_rate"], 1.0)
         self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
@@ -235,6 +218,11 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(summary["complete_case_rate"], 1.0)
         self.assertEqual(summary["mean_false_alarms_per_image"], 1.0)
         self.assertTrue((out / "evaluation" / "presence.csv").is_file())
+        # The count question is gone: no counts table, and a counts.csv left by an older
+        # version is removed on re-export rather than sitting next to fresh metrics.
+        self.assertNotIn("counts", report)
+        (out / "evaluation" / "counts.csv").write_text("condition,mae\ndental_filling,3.0\n")
+        ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
         self.assertFalse((out / "evaluation" / "counts.csv").exists())
         self.assertEqual(ev.side_agreement(gt, results), {"sides_named": 3, "agree": 2, "agreement_rate": 0.6667,
                                                           "left_is_image_left": True})
@@ -244,24 +232,6 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertIn("Also present (no benchmark class): Residual Crown", text)
         self.assertIn("Not assessable (unparseable answer): Dental implant", text)
         self.assertIn("Not assessed by this model: Furcation involvement", text)
-
-    def test_count_question_is_optional(self):
-        script = dict(SCRIPT)
-        script[("count", "dental_filling", None)] = "The image shows 2 teeth with fillings."
-        runner = FakeRunner(script)
-        out = dp.run_dataset(runner, self.images, self.root / "run_counts", protocol=dp.Protocol(count_question=True))
-        results = dp.load_results(out)
-        self.assertEqual(results["img1"]["findings"]["dental_filling"]["count"], 2)
-        self.assertEqual(results["img1"]["findings"]["impacted_tooth"]["count"], 0)  # the fake model's default reply
-        # 13 presence calls + one count call per positive countable finding
-        # (filling, impacted tooth, caries, prosthetic restoration).
-        self.assertEqual(results["img1"]["call_count"], 17)
-        self.assertEqual(results["img2"]["call_count"], 13)
-        gt = ev.load_yolo(self.root / "images", self.root / "labels")
-        report = ev.evaluate(gt, results, dataset="toy")
-        counts = {r["condition"]: r for r in report["counts"]}
-        self.assertEqual(counts["dental_filling"]["exact_rate"], 1.0)
-        self.assertEqual(counts["impacted_tooth"]["mae"], 1.0)
 
     def test_region_location_mode(self):
         """Every region is asked every task, whatever the whole image answered; the whole image is kept separately."""

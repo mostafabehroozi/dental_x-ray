@@ -10,10 +10,9 @@ Communications 2026; arXiv 2509.23344) was trained and evaluated on:
   the location with one of nine fixed descriptors ("the left posterior region
   of the upper dentition", ...). Location is read from that rationale exactly
   as the authors' scorer does; nothing about location is ever asked in words.
-* Multiplicity is the number of distinct regions the model names (0-6). A
-  tooth-count question exists only as an explicitly out-of-distribution option
-  (Protocol.count_question, off by default): without it the model only decides
-  presence, and a finding is scored per image and per cell as present or absent.
+* Multiplicity is the number of distinct regions the model names (0-6). The
+  model is never asked to count teeth: it only decides presence, and a finding
+  is scored per image and per cell as present or absent.
 * The region comparison asks every task once per dental-arch region, on the
   whole uncropped image, by naming the region inside the task's own question
   with the model's own words: "... has caries in the left posterior region of
@@ -167,21 +166,6 @@ UNTRAINED_TEMPLATE = "Based on the imaging, determine whether the patient has {l
 
 # DentVLM panoramic tasks without a UMFIH class: asked for the dentist report, never scored.
 EXTRA_TASKS = ("residual_crown", "insufficient_eruption_space", "calculus")
-
-# Out-of-distribution tooth-count questions (DentVLM has no count task). Used only with
-# Protocol.count_question, for the positive countable findings.
-COUNT_QUESTIONS = {
-    "dental_implant": "How many dental implants are visualized in the panoramic radiograph?",
-    "prosthetic_restoration": "How many teeth in the image have a dental crown or bridge?",
-    "dental_filling": "How many visible teeth in the image appear to have dental fillings based on their radiopaque characteristics?",
-    "endodontic_treatment": "How many teeth in the image have root canal treatment?",
-    "carious_lesion": "How many teeth in the image are suspected to have caries?",
-    "impacted_tooth": "How many impacted teeth are visualized in the panoramic radiograph?",
-    "periapical_lesion": "How many teeth in the image show signs of a periapical lesion?",
-    "root_fragment": "How many residual roots are visualized in the panoramic radiograph?",
-    "root_resorption": "How many teeth in the image show root resorption?",
-}
-COUNTABLE = tuple(c for c in CONDITIONS if c in COUNT_QUESTIONS)
 
 # The nine location descriptors DentVLM writes in its rationale (Supplementary Note S1), in
 # the order of the authors' scorer, and the six dental-arch cells they map onto. "left" and
@@ -339,38 +323,6 @@ def extract_regions(text: str) -> list[str]:
     return [c for c in CELLS if c in found]
 
 
-_NUMBER_WORDS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
-}
-_FDI_NUMBERS = {q * 10 + t for q in (1, 2, 3, 4) for t in range(1, 9)}
-_TOOTH_REFERENCE = re.compile(r"\b(?:tooth|teeth)[\s:(]*#?\d{1,2}(?:\s*(?:,|and|&)\s*#?\d{1,2})*|#\d{1,2}", re.I)
-
-
-def extract_count(text: str) -> int | None:
-    """Count of teeth/instances in a reply to the out-of-distribution count question; None if absent."""
-    body = text.strip()
-    unit_counts = re.findall(
-        r"(?<![\d#])\b(\d{1,3})\s+(?:visible\s+|distinct\s+)?(?:teeth|tooth|dental|implants?|roots?|residual|impacted|lesions?|crowns?|fillings?)\b",
-        body, flags=re.I)
-    if unit_counts:
-        return int(unit_counts[-1])
-    body = _TOOTH_REFERENCE.sub(" ", body)  # "teeth 16, 26 and 36", "tooth 36", "#16" are not counts
-    digits = [int(d) for d in re.findall(r"(?<![\d#])\b(\d{1,3})\b", body)]
-    words = [w.lower() for w in re.findall(r"[A-Za-z]+", body)]
-    numbers = [_NUMBER_WORDS[w] for w in words if w in _NUMBER_WORDS]
-    if digits and all(d in _FDI_NUMBERS for d in digits) and any(n > 0 for n in numbers):
-        return [n for n in numbers if n > 0][-1]  # "three teeth ..., on 16, 26 and 36" -> 3
-    if digits:
-        return digits[-1]
-    if numbers:
-        return numbers[-1]
-    if {"no", "none"} & set(words):
-        return 0
-    return None
-
-
 # ----------------------------------------------------------------------------
 # Images
 # ----------------------------------------------------------------------------
@@ -508,7 +460,6 @@ class Protocol:
     phrasings: int = 1            # 1, or up to 3 verbatim wordings per task with a majority vote
     region_vote: str = "union"    # with phrasings > 1: "union" (matching voting) or "majority"
     location: str = "rationale"   # "rationale" (free) | "regions" (every region named in the question, every task) | "none"
-    count_question: bool = False  # out-of-distribution tooth-count question for positive countables
     ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
     extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
     parse_retries: int = 0        # extra attempts per failed question; notebook defaults to 1
@@ -578,7 +529,7 @@ def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
     keys = condition_tasks(condition, protocol.ask_untrained)
     if not keys or any(k not in tasks for k in keys):
         return {"asked": False, "tasks": [], "presence": None, "whole_image": None, "regions": None,
-                "region_count": None, "count": None}
+                "region_count": None}
     presence = _any_yes(tasks[k]["presence"] for k in keys)
     regions = None
     if presence == "yes" and protocol.location != "none":
@@ -589,7 +540,7 @@ def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
         regions = [c for c in CELLS if c in named]
     return {"asked": True, "tasks": list(keys), "presence": presence,
             "whole_image": _any_yes(tasks[k]["whole_image"] for k in keys), "regions": regions,
-            "region_count": len(regions) if regions is not None else None, "count": None}
+            "region_count": len(regions) if regions is not None else None}
 
 
 def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol()) -> dict:
@@ -602,16 +553,13 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
     aggregation_warnings: list[dict] = []
 
     def ask(stage, task, cell, image, question):
-        counting = stage == "count"
-        extract = extract_count if counting else extract_answer
-        hint = ("Return only the whole-number count in digits." if counting else
-                "Start your reply with exactly Yes or No on the first line, choosing one. "
+        hint = ("Start your reply with exactly Yes or No on the first line, choosing one. "
                 "Then give your brief rationale and location as requested.")
 
         def parse(reply):
             # A cut-off rationale can contain incomplete locations even if line 1 is readable.
-            value = None if reply.get("truncated") else extract(reply["text"])
-            return value, None if value is not None else "missing_count" if counting else "missing_or_ambiguous_decision"
+            value = None if reply.get("truncated") else extract_answer(reply["text"])
+            return value, None if value is not None else "missing_or_ambiguous_decision"
 
         return llm_api.ask_parsed(
             runner, image, question, parse=parse, retries=protocol.parse_retries,
@@ -660,11 +608,6 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
             aggregation_warnings.append(warning)
             llm_api.monitor("AGGREGATION WARNING", f"condition={condition}", reason="task conflict",
                             policy="any-yes")
-    if protocol.count_question:
-        for condition in COUNTABLE:
-            if findings[condition]["presence"] == "yes":
-                question = COUNT_QUESTIONS[condition]
-                findings[condition]["count"], _ = ask("count", condition, None, path, question)
 
     return {
         "image": str(path.resolve()),
@@ -688,7 +631,6 @@ def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | Non
     config = {
         "protocol": asdict(protocol),
         "questions": {task: questions_for(task)[:protocol.phrasings] for task in protocol.tasks()},
-        "count_questions": COUNT_QUESTIONS if protocol.count_question else None,
         "descriptors": DESCRIPTORS, "cells": CELLS,
         # The region questions are model input; the cell windows never are (they are evaluation
         # geometry), so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
@@ -711,8 +653,7 @@ def result_line(result: dict) -> str:
     parts = [f"yes={len(present)} no={sum(findings[c]['presence'] == 'no' for c in asked)} "
              f"unclear={len(unclear)} not_asked={len(CONDITIONS) - len(asked)}"]
     if present:
-        named = [c + ("" if findings[c]["count"] is None else f" x{findings[c]['count']}") for c in present[:3]]
-        parts.append(", ".join(named) + (f", +{len(present) - 3}" if len(present) > 3 else ""))
+        parts.append(", ".join(present[:3]) + (f", +{len(present) - 3}" if len(present) > 3 else ""))
     if unclear:
         parts.append("unresolved: " + ", ".join(unclear[:3]) + (f", +{len(unclear) - 3}" if len(unclear) > 3 else ""))
     warnings = result.get("aggregation_warnings") or ()
@@ -835,8 +776,6 @@ def dentist_report(result: dict) -> str:
                              + ", ".join(describe_cell(c, flag) for c in finding["regions"]))
             elif finding["regions"] is not None:
                 parts.append("region not stated")
-            if finding["count"] is not None:
-                parts.append(f"count {finding['count']} (experimental)")
             present.append(" - " + "; ".join(parts))
         elif finding["presence"] == "no":
             absent.append(label)

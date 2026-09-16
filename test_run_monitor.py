@@ -25,8 +25,7 @@ NO = "no" if DENTVLM else "B"
 
 def protocol(**kwargs):
     """The cheapest protocol on either branch: whole-image presence, no counts, no crops."""
-    base = {"location": "none", "count_question": False} if DENTVLM else {"presence_level": "overall",
-                                                                          "counting": False}
+    base = {"location": "none"} if DENTVLM else {"presence_level": "overall", "counting": False}
     return dp.Protocol(**dict(base, **kwargs))
 
 

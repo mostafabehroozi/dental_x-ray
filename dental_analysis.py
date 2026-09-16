@@ -49,19 +49,12 @@ def metrics(gt, report):
     row["annotated_checks"] = sum(len(e["annotated"]) for e in gt.values())
     row["not_assessed_checks"] = row["annotated_checks"] - row["expected_finding_checks"]
     row["coverage"] = ev._ratio(row["scored_finding_checks"], row["expected_finding_checks"])
-    for table, weight, metrics in (("counts", "n_scored", ("mae", "exact_rate", "within_1_rate")),
-                                   ("regions", "n_localized_cases", ("exact_set_match_rate", "mean_jaccard"))):
-        rows = report[table]
-        row[table + "_scored"] = sum(r[weight] for r in rows)
-        for metric in metrics:
-            usable = [r for r in rows if r[metric] is not None]
-            row[table + "_" + metric] = ev._ratio(
-                sum(r[metric] * r[weight] for r in usable), sum(r[weight] for r in usable))
-    strict = [r for r in report["counts"] if r["strict_mae"] is not None]
-    row["counts_strict_scored"] = sum(r["strict_n"] for r in strict)
-    row["counts_strict_mae"] = ev._ratio(sum(r["strict_mae"] * r["strict_n"] for r in strict),
-                                         row["counts_strict_scored"])
-    row["counts_unparseable"] = sum(r["count_unparseable"] for r in report["counts"])
+    rows = report["regions"]
+    row["regions_scored"] = sum(r["n_localized_cases"] for r in rows)
+    for metric in ("exact_set_match_rate", "mean_jaccard"):
+        usable = [r for r in rows if r[metric] is not None]
+        row["regions_" + metric] = ev._ratio(sum(r[metric] * r["n_localized_cases"] for r in usable),
+                                             sum(r["n_localized_cases"] for r in usable))
     row["regions_excluded"] = sum(r["excluded_location_checks"] for r in report["regions"])
     location = ({k: sum(r[k] for r in report["regions"]) for k in ("TP", "TN", "FP", "FN")}
                 if report["regions"] else {k: None for k in ("TP", "TN", "FP", "FN")})
@@ -79,7 +72,6 @@ def finding_rows(gt, report):
     dataset = summary["dataset"]
     presence = {r["condition"]: r for r in report.get("presence", [])}
     whole = {r["condition"]: r for r in report.get("whole_image", [])}
-    counts = {r["condition"]: r for r in report.get("counts", [])}
     regions = {r["condition"]: r for r in report.get("regions", [])}
     region_presence = defaultdict(list)
     for row in report.get("region_presence", []):
@@ -99,7 +91,7 @@ def finding_rows(gt, report):
                     **{k: None for k in ("TP", "TN", "FP", "FN")}, "unparseable": 0,
                     **{k: None for k in ("sensitivity", "specificity", "ppv", "f1")}}
         scored = sum(base[k] or 0 for k in ("TP", "TN", "FP", "FN"))
-        before, count, location = whole.get(condition, {}), counts.get(condition, {}), regions.get(condition, {})
+        before, location = whole.get(condition, {}), regions.get(condition, {})
         regional = region_presence.get(condition, [])
         regional_cells = {k: sum(r.get(k, 0) for r in regional) for k in ("TP", "TN", "FP", "FN")}
         regional_scores = (ev._prf(regional_cells["TP"], regional_cells["FP"],
@@ -117,12 +109,6 @@ def finding_rows(gt, report):
             "scored_checks": scored,
             "coverage": ev._ratio(scored, base["images"]),
             "whole_image_f1": before.get("f1"),
-            "count_n_scored": count.get("n_scored"),
-            "count_exact_rate": count.get("exact_rate"),
-            "count_within_1_rate": count.get("within_1_rate"),
-            "count_mae": count.get("mae"),
-            "count_strict_mae": count.get("strict_mae"),
-            "count_unparseable": count.get("count_unparseable"),
             "region_presence_TP": regional_cells["TP"] if regional else None,
             "region_presence_TN": regional_cells["TN"] if regional else None,
             "region_presence_FP": regional_cells["FP"] if regional else None,
@@ -182,13 +168,11 @@ def recovery_rows(gt, results, evaluate_location):
             stage, task, cell = first["stage"], first["task"], first.get("cell")
             old, new = first["parse_recovery"]["value"], last["parse_recovery"]["value"]
             status = "first_pass" if old is not None else "recovered" if new is not None else "unresolved"
-            condition = task if stage == "count" else task_conditions.get(task)
+            condition = task_conditions.get(task)
             correct = None
             if condition in entry["annotated"] and new is not None:
                 boxes = [b for b in entry["boxes"] if b["condition"] == condition]
-                if stage == "count":
-                    correct = new == len(boxes)
-                elif cell is None:
+                if cell is None:
                     correct = (new == "yes") == bool(boxes)
                 elif evaluate_location and not any(b.get("location_excluded") for b in boxes):
                     correct = (new == "yes") == (cell in ev.gt_regions(boxes))
@@ -344,7 +328,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
         old, new = _score(paired, reference, False)["summary"], _score(paired, results, False)["summary"]
         row = {"run": name, "reference": reference_name, "dataset": dataset, "config_hash": manifest.get("hash"),
                "model": manifest.get("runner", {}).get("model"), "runner_settings": manifest.get("runner", {}),
-               **{k: manifest["protocol"].get(k) for k in ("phrasings", "region_vote", "location", "count_question",
+               **{k: manifest["protocol"].get(k) for k in ("phrasings", "region_vote", "location",
                                                          "ask_untrained", "extra_tasks", "parse_retries")},
                "evaluate_location": evaluate_location, "location_truth": report["summary"]["location_truth"],
                **metrics(gt, report), "paired_checks": new["scored_finding_checks"],
@@ -386,7 +370,7 @@ def compact_views(ground_truth, reports):
         protocol = summary.get("protocol") or {}
         overview.append({
             "dataset": dataset, "experiment": experiment,
-            **{k: protocol.get(k) for k in ("phrasings", "region_vote", "location", "count_question",
+            **{k: protocol.get(k) for k in ("phrasings", "region_vote", "location",
                                              "ask_untrained", "extra_tasks", "parse_retries")},
             "evaluate_location": summary.get("evaluate_location"),
             "images": summary["images_scored"], "annotated_checks": extra["annotated_checks"],
@@ -398,10 +382,6 @@ def compact_views(ground_truth, reports):
                                         "complete_case_rate", "mean_false_alarms_per_image", "mean_calls_per_image",
                                         "logical_calls", "inference_calls", "cache_hits",
                                         "mean_inference_calls_per_image", "mean_cache_hits_per_image", "cache_hit_rate")},
-            "count_n_scored": extra["counts_scored"], "count_exact_rate": extra["counts_exact_rate"],
-            "count_within_1_rate": extra["counts_within_1_rate"], "count_mae": extra["counts_mae"],
-            "count_strict_n": extra["counts_strict_scored"], "count_strict_mae": extra["counts_strict_mae"],
-            "count_unparseable": extra["counts_unparseable"],
             "localized_cases": extra["regions_scored"],
             **{"location_" + k: extra["regions_" + k] for k in ("TP", "TN", "FP", "FN")},
             "location_f1": extra["regions_f1"], "region_exact_rate": extra["regions_exact_set_match_rate"],

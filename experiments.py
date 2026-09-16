@@ -54,7 +54,6 @@ DEFAULTS = {
     "phrasings": 1,                    # 3 = three verbatim wordings per task and a vote
     "region_vote": "union",            # with phrasings > 1: "union" | "majority"
     "location": "rationale",           # "rationale" | "regions" (every region named in the question) | "none"
-    "count_question": False,           # out-of-distribution tooth count for positive findings
     "ask_untrained": False,            # also ask the five UMFIH classes DentVLM has no task for
     "extra_tasks": True,               # residual crown, eruption space, calculus: reported, not scored
     "parse_retries": 1,                # extra attempts per unparseable question
@@ -88,8 +87,7 @@ DEFAULTS = {
     "image_min_tokens": None,
 }
 
-PROTOCOL_KEYS = ("phrasings", "region_vote", "location", "count_question", "ask_untrained", "extra_tasks",
-                 "parse_retries")
+PROTOCOL_KEYS = ("phrasings", "region_vote", "location", "ask_untrained", "extra_tasks", "parse_retries")
 SERVER_KEYS = ("model_filename", "mmproj_filename", "n_gpu_layers", "ctx_size", "image_max_tokens", "image_min_tokens")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -311,7 +309,7 @@ def table(configs: list[dict]) -> list[dict]:
     """One row per experiment holding only the knobs the experiments disagree on."""
     varying = [k for k in DEFAULTS if len({_digest(public(c)[k]) for c in configs}) > 1]
     if not varying:
-        varying = ["backend", "analyzer", "phrasings", "location", "count_question", "ask_untrained"]
+        varying = ["backend", "analyzer", "phrasings", "location", "ask_untrained"]
     return [{"name": c["name"], **{k: _cell(public(c)[k]) for k in varying}} for c in configs]
 
 

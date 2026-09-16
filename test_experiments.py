@@ -67,11 +67,10 @@ class BuildTests(unittest.TestCase):
 
     def test_protocol_carries_every_question_knob(self):
         cfg, = xp.build([{"name": "loud", "phrasings": 3, "region_vote": "majority", "location": "regions",
-                          "count_question": True, "ask_untrained": True, "extra_tasks": False}], SHARED)
+                          "ask_untrained": True, "extra_tasks": False}], SHARED)
         protocol = xp.protocol(cfg)
         self.assertEqual((protocol.phrasings, protocol.region_vote, protocol.location), (3, "majority", "regions"))
-        self.assertEqual((protocol.count_question, protocol.ask_untrained, protocol.extra_tasks),
-                         (True, True, False))
+        self.assertEqual((protocol.ask_untrained, protocol.extra_tasks), (True, False))
 
 
 class PathAndRoleTests(unittest.TestCase):

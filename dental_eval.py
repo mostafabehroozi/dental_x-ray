@@ -6,9 +6,8 @@ for the whole-image answers alone in the region comparison, to show what the
 region questions recovered and what they cost), presence per cell (every cell of every
 image, present or absent, against the cells the true boxes occupy, so a finding
 class is scored once per cell rather than counted), cell-level TP/FP/TN/FN for
-the localized true positives, count agreement when the optional count question
-was asked, and two per-image numbers a dentist cares about (complete-case rate,
-false alarms).
+the localized true positives, and two per-image numbers a dentist cares about
+(complete-case rate, false alarms).
 
 Findings the model was not asked about are listed as not assessed and skipped.
 Unparseable answers are excluded from the per-finding confusion tables and
@@ -28,7 +27,7 @@ import json
 from pathlib import Path
 
 import run_monitor as mon
-from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, COUNTABLE, LEFT_IS_IMAGE_LEFT, TRAINED, cell_answers,
+from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, LEFT_IS_IMAGE_LEFT, TRAINED, cell_answers,
                              fdi_unit, unit_cell, units_to_cells)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
@@ -343,10 +342,9 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     """Score saved results against ground truth. Images missing from either side are skipped."""
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, whole_image, counts, region_presence, regions, per_image, not_assessed = [], [], [], [], [], [], []
+    presence, whole_image, region_presence, regions, per_image, not_assessed = [], [], [], [], [], []
     protocol = results[ids[0]].get("protocol") if ids else None
     level = next((results[i]["location_level"] for i in ids), "none")
-    count_asked = any(results[i].get("protocol", {}).get("count_question") for i in ids)
     # The whole-image answers are a separate result only in the region comparison.
     whole_image_kept = level == "regions" and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]]
 
@@ -361,7 +359,6 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         table = {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0}
         whole = dict(table)
         positives = 0
-        exact = within1 = abs_err = signed_err = n_count = strict_n = strict_abs = unparsed_count = 0
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = 0
         region_unparseable = location_truth_excluded = 0
         jaccard_sum = 0.0
@@ -390,21 +387,6 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             if not _tally(table, truth, finding["presence"]):
                 continue
             positive = finding["presence"] == "yes"
-
-            if count_asked and condition in COUNTABLE and truth:
-                strict_pred = 0 if not positive else finding["count"]
-                if strict_pred is None:
-                    unparsed_count += 1
-                else:
-                    strict_n += 1
-                    strict_abs += abs(len(boxes) - strict_pred)
-                if positive and finding["count"] is not None:
-                    n_count += 1
-                    diff = finding["count"] - len(boxes)
-                    exact += diff == 0
-                    within1 += abs(diff) <= 1
-                    abs_err += abs(diff)
-                    signed_err += diff
 
             if evaluate_location and level != "none" and truth and positive:
                 location_boxes = [b for b in boxes if not b.get("location_excluded")]
@@ -448,14 +430,6 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                     **_prf(cell["TP"], cell["FP"], cell["TN"], cell["FN"]),
                     "location_truth_excluded": rp_excluded,
                 })
-        if count_asked and condition in COUNTABLE:
-            counts.append({
-                "dataset": dataset, "condition": condition, "n_scored": n_count,
-                "exact_rate": _ratio(exact, n_count), "within_1_rate": _ratio(within1, n_count),
-                "mae": _ratio(abs_err, n_count), "mean_signed_error": _ratio(signed_err, n_count),
-                "strict_n": strict_n, "strict_mae": _ratio(strict_abs, strict_n), "count_unparseable": unparsed_count,
-                "expected_count_checks": strict_n + unparsed_count, "excluded_count_checks": unparsed_count,
-            })
         if evaluate_location and level != "none":
             regions.append({
                 "dataset": dataset, "condition": condition, "level": level, "n_localized_cases": n_loc,
@@ -533,7 +507,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                                       "unparseable": sum(r["unparseable"] for r in region_presence)}
     if evaluate_location and level != "none":
         summary["side_agreement"] = side_agreement({i: gt[i] for i in ids}, results)
-    report = {"summary": summary, "presence": presence, "whole_image": whole_image, "counts": counts,
+    report = {"summary": summary, "presence": presence, "whole_image": whole_image,
               "region_presence": region_presence, "regions": regions, "per_image": per_image,
               "missing_results": missing}
     if include_analysis:
@@ -599,11 +573,18 @@ def pooled_presence(reports: list[dict]) -> list[dict]:
     return rows
 
 
+# Tables this branch no longer produces. Their CSVs are deleted on re-export so a directory
+# written by an older version never shows stale metrics next to fresh ones.
+RETIRED_TABLES = ("counts",)
+
+
 def write_report(report: dict, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
-    for name in ("presence", "whole_image", "counts", "region_presence", "regions", "per_image", "stage_changes",
+    for name in RETIRED_TABLES:
+        (out / f"{name}.csv").unlink(missing_ok=True)
+    for name in ("presence", "whole_image", "region_presence", "regions", "per_image", "stage_changes",
                  "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage",
                  "case_breakdown", "case_condition_breakdown", "run_comparison", "run_changes",
                  "experiment_overview", "finding_comparison", "situation_comparison",

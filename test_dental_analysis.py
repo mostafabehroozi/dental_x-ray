@@ -85,8 +85,6 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(modes["union"]["regions_exact_set_match_rate"], .5)
         self.assertEqual(modes["majority"]["regions_exact_set_match_rate"], 1)
         self.assertEqual(modes["union"]["TP"], modes["majority"]["TP"])
-        self.assertEqual(modes["union"]["counts_scored"], 0)
-        self.assertIsNone(modes["union"]["counts_mae"])
 
     def test_crown_bridge_or_and_ties_are_not_invented_errors(self):
         gt, results = fixture()
@@ -115,14 +113,13 @@ class AnalysisTests(unittest.TestCase):
         gt, results = fixture()
         results["img"]["calls"] = [call("fillings", None), call("fillings", "no", 2),
             call("fillings", "yes"), call("prosthetic_crown", None), call("prosthetic_crown", "yes", 2),
-            call("calculus", "yes"), call("dental_filling", 1, stage="count")]
+            call("calculus", "yes")]
         rows = {(r["task"], r["status"]): r for r in da.recovery_rows(gt, results, True)}
         self.assertEqual(rows["fillings", "recovered"]["correct"], 0)
         self.assertEqual(rows["fillings", "first_pass"]["correct"], 1)
         self.assertEqual(rows["prosthetic_crown", "recovered"]["correctness_scored"], 0)
         self.assertEqual(rows["calculus", "first_pass"]["correctness_scored"], 0)
-        self.assertEqual(rows["dental_filling", "first_pass"]["correct"], 1)
-        self.assertEqual(sum(r["calls"] for r in da.call_usage(results)), 7)
+        self.assertEqual(sum(r["calls"] for r in da.call_usage(results)), 6)
 
     def test_location_toggle_and_legacy_metadata(self):
         gt, results = fixture()
@@ -146,7 +143,6 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNone(rows["task_support", "untrained"]["coverage"])
         self.assertEqual(rows["instances_of_finding", "1"]["TP"], 2)
         self.assertIsNone(rows["instances_of_finding", "1"]["specificity"])
-        self.assertEqual(rows["predicted_named_cells", "2+"]["counts_scored"], 0)
         detail = [r for r in report["case_condition_breakdown"]
                   if r["situation"] == "task_support" and r["group"] == "untrained"]
         self.assertEqual(len(detail), 5)

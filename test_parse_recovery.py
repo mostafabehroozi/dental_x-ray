@@ -267,15 +267,6 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(ev.predicted_cells(result, "dental_implant")[dp.CELLS[1]])
         self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)
 
-    @unittest.skipUnless(DENTVLM, "DentVLM optional count protocol")
-    def test_optional_count_recovery(self):
-        n_tasks = len(protocol().tasks())
-        result, _, _, _ = self.run_image(
-            ["Yes"] + ["No"] * (n_tasks - 1) + ["???", "2"], count_question=True)
-        self.assertEqual(result["findings"]["dental_implant"]["count"], 2)
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 1)
-        self.assertEqual(result["calls"][-1]["stage"], "count")
-
 
 if __name__ == "__main__":
     unittest.main()

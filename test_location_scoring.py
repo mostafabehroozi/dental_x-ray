@@ -12,17 +12,15 @@ import dental_pipeline as dp
 
 
 class LocationScoringTests(unittest.TestCase):
-    def test_toggle_preserves_finding_and_total_count_scores(self):
+    def test_toggle_preserves_finding_scores(self):
         findings = {c: {"asked": True, "presence": "no", "whole_image": "no",
-                        "count": 0, "regions": [],
-                        "region_counts": {}} for c in dp.CONDITIONS}
+                        "regions": [], "region_count": 0} for c in dp.CONDITIONS}
         findings["dental_filling"].update(
-            presence="yes", whole_image="yes", count=1,
-            regions=["upper-left"],
-            region_counts={"UR": 1})
+            presence="yes", whole_image="yes",
+            regions=["upper-left"], region_count=1)
         results = {"image": {"findings": findings, "call_count": 71,
                             "location_level": "regions",
-                            "protocol": {"count_question": True}}}
+                            "protocol": {"location": "regions"}}}
         gt = {"image": {"annotated": set(dp.CONDITIONS), "boxes": [
             {"condition": "dental_filling", "xc": 0.2, "yc": 0.25, "w": 0.05, "h": 0.05}]}}
         original = copy.deepcopy(results)
@@ -43,7 +41,7 @@ class LocationScoringTests(unittest.TestCase):
             self.assertEqual(disabled["region_presence"], [])  # presence per cell needs the location truth
             self.assertNotIn("region_presence", disabled["summary"])
             self.assertFalse((out / "region_presence.csv").exists())
-            for key in ("presence", "whole_image", "counts", "per_image"):
+            for key in ("presence", "whole_image", "per_image"):
                 self.assertEqual(enabled[key], disabled[key])
             self.assertEqual(results, original)
             restored = ev.evaluate(gt, results, out_dir=out, evaluate_location=True)

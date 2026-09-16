@@ -35,8 +35,6 @@ class ScriptedRunner:
             task = next(t for t in list(dp.TASKS) + list(dp.UNTRAINED_LABELS)
                         if dp.region_question(t, cell) == question)
             text = self.script.get((task, cell), "No\nNothing of the kind is seen.")
-        elif question in dp.COUNT_QUESTIONS.values():
-            text = self.script.get(question, "0")
         else:
             text = self.script.get(question, "No\nNothing of the kind is seen.")
         return {"text": text, "finish_reason": "stop", "truncated": False,
@@ -110,7 +108,7 @@ class StructuredInputTests(unittest.TestCase):
         for f in s["findings"]:
             self.assertIn(f["status"], rw.STATUSES)
             self.assertEqual(f["category"], rw.FINDING_CATEGORY[f["finding"]])
-            self.assertNotIn(None, (f["count"], f["location_status"], f["detection"], f["multiplicity"]))
+            self.assertNotIn(None, (f["location_status"], f["detection"], f["multiplicity"]))
             if f["status"] != "not_assessed":
                 self.assertEqual(list(f["regions"]), patient_cells)
                 self.assertTrue(all(v in ("named", "not_named", "not_applicable") for v in f["regions"].values()))
@@ -121,9 +119,9 @@ class StructuredInputTests(unittest.TestCase):
                                              "regions_named": ["upper-right-posterior"], "phrasings": 1}])
         self.assertEqual(filling["regions"]["upper-right-posterior"], "named")
         self.assertEqual(filling["regions"]["lower-anterior"], "not_named")
-        self.assertEqual((filling["located_in"], filling["multiplicity"], filling["location_status"], filling["count"]),
-                         (["upper-right-posterior"], 1, "located", "not_asked"))
-        self.assertEqual((filling["trained"], filling["benchmark_class"], filling["countable"]), (True, True, True))
+        self.assertEqual((filling["located_in"], filling["multiplicity"], filling["location_status"]),
+                         (["upper-right-posterior"], 1, "located"))
+        self.assertEqual((filling["trained"], filling["benchmark_class"]), (True, True))
         restoration = by["prosthetic_restoration"]
         self.assertEqual([(t["task"], t["answer"]) for t in restoration["tasks"]],
                          [("prosthetic_crown", "absent"), ("prosthetic_bridge", "present")])
@@ -137,8 +135,8 @@ class StructuredInputTests(unittest.TestCase):
         self.assertEqual((implant["status"], implant["multiplicity"], set(implant["regions"].values())),
                          ("unparseable", "not_applicable", {"not_applicable"}))
         furcation = by["furcation_lesion"]
-        self.assertEqual((furcation["status"], furcation["tasks"], furcation["regions"], furcation["detection"], furcation["count"]),
-                         ("not_assessed", [], {}, "not_assessed", "not_countable"))
+        self.assertEqual((furcation["status"], furcation["tasks"], furcation["regions"], furcation["detection"]),
+                         ("not_assessed", [], {}, "not_assessed"))
         crown = by["residual_crown"]
         self.assertEqual((crown["status"], crown["benchmark_class"], crown["category"], crown["label"]),
                          ("present", False, "teeth_and_eruption", "Residual Crown"))
@@ -170,20 +168,16 @@ class StructuredInputTests(unittest.TestCase):
         self.assertEqual(by["dental_filling"]["tasks"][0]["model_text"], SCRIPT[q("fillings")])
         self.assertEqual(by["prosthetic_restoration"]["tasks"][0]["model_text"], "No\nNothing of the kind is seen.")
 
-    def test_untrained_questions_and_counts(self):
+    def test_untrained_questions(self):
         script = dict(SCRIPT)
         script[q("furcation_lesion")] = "Yes\nFurcation involvement is seen."
-        script[dp.COUNT_QUESTIONS["dental_filling"]] = "There are 2 teeth with fillings."
-        result = dp.analyze_image(ScriptedRunner(script), self.image, protocol=dp.Protocol(ask_untrained=True, count_question=True))
+        result = dp.analyze_image(ScriptedRunner(script), self.image, protocol=dp.Protocol(ask_untrained=True))
         s = rw.structured_findings(result)
         by = {f["finding"]: f for f in s["findings"]}
         self.assertEqual((by["furcation_lesion"]["status"], by["furcation_lesion"]["trained"]), ("present", False))
         self.assertEqual(by["furcation_lesion"]["tasks"][0]["question"], dp.questions_for("furcation_lesion")[0])
-        self.assertEqual((by["dental_filling"]["count"], by["impacted_tooth"]["count"], by["carious_lesion"]["count"]), (2, 0, 0))
-        self.assertEqual((by["endodontic_treatment"]["count"], by["periodontal_bone_loss"]["count"]), ("not_asked", "not_countable"))
         self.assertEqual(s["summary"]["not_assessed"], [])
         self.assertNotIn("were not assessed", s["analysis"]["limitations"][-1])
-        self.assertIn("out-of-distribution tooth-count", s["analysis"]["method"])
 
     def test_region_locations(self):
         script = dict(SCRIPT)

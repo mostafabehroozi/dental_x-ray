@@ -8,9 +8,8 @@ wants one report. This module
 * condenses a saved result into one dense, fixed-shape JSON (structured_findings): every
   finding of the benchmark vocabulary and every extra DentVLM task, each with an explicit
   status ("present", "absent", "unparseable", "not_assessed"), the task(s) that decided it with
-  their verbatim question and answer, every cell with an explicit value, the multiplicity, and
-  the optional out-of-distribution count. Nothing is implicit or null, so the report model
-  never has to guess what a missing value means;
+  their verbatim question and answer, every cell with an explicit value, and the multiplicity.
+  Nothing is implicit or null, so the report model never has to guess what a missing value means;
 * sends that JSON to a text LLM (ReportWriter, described by an llm_api spec exactly like the
   analyzer's API backend and the location adapter) with a fixed prompt that asks for a
   radiology-style report in the dentist's language, returned as JSON with one entry per
@@ -82,7 +81,6 @@ LEGEND = {
         "unparseable": "the answer for this region could not be read", "not_asked": "no question named this region",
     },
     "multiplicity": "the number of distinct regions the model named (0 to 6); a lower bound on the number of occurrences, not a tooth count",
-    "count": "an experimental tooth count from an out-of-distribution question, or 'not_asked', 'unparseable', 'not_countable'",
     "trained": "false when the analyzer was never trained on this question (zero-shot; the paper reports 52-64% accuracy on such diseases)",
     "detection": "whether the whole-image answer and the region answers agree; a region-only detection is a weaker signal",
 }
@@ -161,8 +159,6 @@ def method_text(result: dict) -> str:
                      "named inside the question in the model's own words, whatever the whole image answered")
     else:
         parts.append("presence only, no location")
-    if protocol.get("count_question"):
-        parts.append("an experimental, out-of-distribution tooth-count question for each positive countable finding")
     return "; ".join(parts)
 
 
@@ -182,23 +178,23 @@ def _task_entry(key: str, task: dict, flag: bool, model_text: str | None) -> dic
 
 def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, include_rationale: bool) -> dict:
     """One dense entry for a benchmark finding or an extra DentVLM task."""
-    protocol, level = result["protocol"], result.get("location_level", "rationale")
+    level = result.get("location_level", "rationale")
     tasks_out = result.get("tasks") or {}
     regional = level == "regions"
     if identifier in dp.CONDITIONS:
         finding = result["findings"][identifier]
         keys = list(finding["tasks"]) if finding["asked"] else []
         presence, whole_image = finding["presence"], finding.get("whole_image")
-        regions, region_count, count = finding.get("regions"), finding.get("region_count"), finding.get("count")
-        benchmark_class, countable = True, identifier in dp.COUNTABLE
+        regions, region_count = finding.get("regions"), finding.get("region_count")
+        benchmark_class = True
         trained = identifier in dp.TRAINED
     else:
         task = tasks_out.get(identifier)
         keys = [identifier] if task else []
         presence, whole_image = (task["presence"], task.get("whole_image")) if task else (None, None)
-        regions, count = (task.get("regions") if task else None), None
+        regions = task.get("regions") if task else None
         region_count = len(regions) if regions is not None else None
-        benchmark_class, countable, trained = False, False, True
+        benchmark_class, trained = False, True
     asked = bool(keys)
 
     texts = {}
@@ -248,15 +244,6 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         location_status = "not_localized: present on the whole image, no cell answered Yes"
     multiplicity = len(located_in) if status == "present" and region_source != "none" else "not_applicable"
 
-    if not countable:
-        count_value = "not_countable"
-    elif not protocol.get("count_question"):
-        count_value = "not_asked"
-    elif status != "present":
-        count_value = "not_asked"
-    else:
-        count_value = count if count is not None else "unparseable"
-
     return {
         "finding": identifier, "label": LABELS[identifier], "category": FINDING_CATEGORY[identifier],
         "benchmark_class": benchmark_class, "trained": trained,
@@ -265,12 +252,11 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         "tasks": tasks,
         "regions": region_map, "region_source": region_source, "located_in": located_in,
         "location_status": location_status, "multiplicity": multiplicity,
-        "countable": countable, "count": count_value,
     }
 
 
 def structured_findings(result: dict, analyzer: str | None = None, include_rationale: bool = False) -> dict:
-    """One dense JSON for the report model: every finding, task, cell and count with an explicit status."""
+    """One dense JSON for the report model: every finding, task and cell with an explicit status."""
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
     cell_answers = dp.cell_answers(result) if level == "regions" else {}  # the evaluator reads the same answers
@@ -298,7 +284,7 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
             "limitations": limitations,
         },
         "legend": {"status": LEGEND["status"], "regions": region_legend, "multiplicity": LEGEND["multiplicity"],
-                   "count": LEGEND["count"], "trained": LEGEND["trained"], "detection": LEGEND["detection"]},
+                   "trained": LEGEND["trained"], "detection": LEGEND["detection"]},
         "categories": [{"key": key, "label": label, "findings": list(conditions)}
                        for key, (label, conditions) in CATEGORIES.items()],
         "findings": findings,
@@ -350,15 +336,15 @@ OUTPUT_SCHEMA = """{
 USER_PROMPT = """Write the dentist's report for the automated analysis below.
 
 WHAT THE DATA IS
-An automated analyzer ({analyzer}) was asked {method}. The JSON lists the 14 findings of the benchmark vocabulary and the analyzer's extra tasks, each with an explicit status, the task(s) that decided it with their verbatim question and answer, every dental-arch region with an explicit value, the multiplicity (number of regions the model named), and the optional count. Region names are on the PATIENT's side ("analysis.regions" spells them out). "unparseable" means an answer could not be read as Yes or No, so that finding is neither confirmed nor excluded; "not_assessed" means the analyzer has no question for that finding and was never asked. Every value is spelled out; there are no implicit defaults.
+An automated analyzer ({analyzer}) was asked {method}. The JSON lists the 14 findings of the benchmark vocabulary and the analyzer's extra tasks, each with an explicit status, the task(s) that decided it with their verbatim question and answer, every dental-arch region with an explicit value, and the multiplicity (number of regions the model named). Region names are on the PATIENT's side ("analysis.regions" spells them out). "unparseable" means an answer could not be read as Yes or No, so that finding is neither confirmed nor excluded; "not_assessed" means the analyzer has no question for that finding and was never asked. Every value is spelled out; there are no implicit defaults.
 
 {findings_json}
 
 HOW TO WRITE
 1. Language: write every human-readable value (title, headings, statements, impression, not_assessable, limitations) in {language}, with the dental terminology a dentist reading that language expects. Keep the JSON keys and every "finding" and "category" identifier exactly as given, in English.
-2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State regions, multiplicity and counts exactly as given; never estimate a count, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "not_stated" or "unparseable", say so in words. A finding with status "not_assessed" gets one sentence saying the analyzer does not assess it.
+2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State regions and multiplicity exactly as given; never estimate a number of teeth, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "not_stated" or "unparseable", say so in words. A finding with status "not_assessed" gets one sentence saying the analyzer does not assess it.
 3. Wording: as a radiologist reports to a colleague. Short declarative sentences, present tense, attributed to the automated analysis ("The analysis flags ..."). Locate findings on the patient's side ("upper right posterior region"); never say image left or image right. A region the model did not name is never reported as free of the finding. An absent finding gets one short pertinent-negative sentence. When a finding was decided by several tasks (for example a prosthetic crown and a prosthetic bridge), say which task answered Yes. No diagnosis, no differential, no severity, no treatment advice.
-4. Confidence: say when a finding comes from a question the analyzer was not trained on ("trained": false), when "detection" says it was flagged by region questions only, and that a count is experimental.
+4. Confidence: say when a finding comes from a question the analyzer was not trained on ("trained": false) and when "detection" says it was flagged by region questions only.
 5. Impression: 1 to 6 short bullets. Pathology first (caries, periapical lesions, periodontal disease, calculus, furcation involvement, impacted teeth, insufficient eruption space, residual roots and crowns, root resorption), then existing treatment (fillings, crowns or bridges, root canal treatments, implants, appliances, surgical hardware), then what could not be assessed. Absent and not-assessed findings stay out of the impression, unless every assessed finding is absent: then say so in one bullet.
 6. Limitations: the sentences in "analysis.limitations", in the dentist's language, plus any caveat the data raises (unparseable answers, untrained questions, region-only detections).
 
