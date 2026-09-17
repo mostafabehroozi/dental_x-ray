@@ -15,6 +15,12 @@ in the loop:
   merge into one cell), so the mapping to DentVLM's vocabulary is deterministic
   (dental_pipeline.unit_cell) and the same adapter output also serves a quadrant
   vocabulary. One call per image (chunked for crowded images); strict JSON back.
+* AreaAdapter: the same kind of model, asked once per image about the untouched radiograph -
+  not about the findings. It returns where the six cells lie in THIS image as normalized areas,
+  because that is what patient positioning, arch shape, centring and missing teeth move; Python
+  then places every ground-truth box in the area covering most of it (or, when no area touches
+  it, the nearest one). The model never sees a box, so it cannot classify a finding, and the
+  placement is deterministic and auditable: the areas, the reply and a marked image are saved.
 * FdmAdapter (experimental, off by default): DentVLM itself. It has no question about
   a marked region, so the task is split into one in-distribution question per box: a
   "spotlight" copy of the radiograph that shows only the box plus a margin, the
@@ -78,6 +84,25 @@ def _label(draw, text: str, x: int, y: int, fill: str, font) -> None:
     draw.text((x + 3 - left, y + 2 - top), text, fill="black", font=font)
 
 
+def _canvas(image_path: str | Path, max_side: int):
+    """The radiograph as an RGB canvas (longest side <= max_side) with its draw handle, stroke and font."""
+    from PIL import Image, ImageDraw
+
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    scale = min(1.0, max_side / max(image.size))
+    if scale < 1.0:
+        image = image.resize((round(image.width * scale), round(image.height * scale)), Image.LANCZOS)
+    short = min(image.size)
+    return image, ImageDraw.Draw(image), max(2, round(short / 250)), _font(max(14, round(short / 32)))
+
+
+def _jpeg(image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
+
+
 def draw_boxes(image_path: str | Path, boxes: list[dict], max_side: int = 2048, numbered: bool = True,
                corner_labels: bool = True, color: str | None = None) -> tuple[bytes, int, int, list[list[int]]]:
     """Draw the boxes on a copy of the radiograph (longest side <= max_side).
@@ -87,17 +112,8 @@ def draw_boxes(image_path: str | Path, boxes: list[dict], max_side: int = 2048, 
     quadrant names into the corners (Q1 top-left, Q2 top-right, Q3 bottom-right, Q4 bottom-left:
     the patient's right is on the viewer's left) so the reader cannot flip sides.
     """
-    from PIL import Image, ImageDraw
-
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
-    scale = min(1.0, max_side / max(image.size))
-    if scale < 1.0:
-        image = image.resize((round(image.width * scale), round(image.height * scale)), Image.LANCZOS)
+    image, draw, stroke, font = _canvas(image_path, max_side)
     width, height = image.size
-    draw = ImageDraw.Draw(image)
-    stroke = max(2, round(min(width, height) / 250))
-    font = _font(max(14, round(min(width, height) / 32)))
 
     pixel_boxes = []
     for index, box in enumerate(boxes):
@@ -124,9 +140,7 @@ def draw_boxes(image_path: str | Path, boxes: list[dict], max_side: int = 2048, 
                            ("Q3", width - text_width - margin, height - text_height - margin)):
             _label(draw, text, x, y, "white", font)
 
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=90)
-    return buffer.getvalue(), width, height, pixel_boxes
+    return _jpeg(image), width, height, pixel_boxes
 
 
 def spotlight(image_path: str | Path, box: dict, margin: float = 0.06) -> bytes:
@@ -405,6 +419,281 @@ class LLMAdapter:
                     row["fallback_reason"] = error or "missing_box"
                     if self.failure_policy == "exclude":
                         row.update(regions=[], source="excluded")
+        return rows
+
+
+# ----------------------------------------------------------------------------
+# Area adapter: this image's own cell areas, then deterministic geometry per box
+# ----------------------------------------------------------------------------
+# The region schema: one anatomical definition per cell, in DentVLM's own words (CELL_DESCRIPTORS,
+# the same phrases the scorer matches) plus the anatomy and the image side that name means. The side
+# follows LEFT_IS_IMAGE_LEFT, so the convention cannot drift between the prompt and the windows, and
+# the flag is part of the adapter settings: flipping it is a different adapter, not a silent re-reading
+# of saved areas. Another named set of regions needs this builder and CELLS, not different code.
+def region_definitions(left_is_image_left: bool = dp.LEFT_IS_IMAGE_LEFT) -> dict[str, str]:
+    definitions = {}
+    for cell in dp.CELLS:
+        row, col = cell.split("-")
+        arch = "maxillary (upper)" if row == "upper" else "mandibular (lower)"
+        half = "TOP" if row == "upper" else "BOTTOM"
+        behind = ("the maxillary tuberosity behind the last upper molar" if row == "upper"
+                  else "the retromolar area, the angle and the ramus of the mandible")
+        if col == "anterior":
+            what = ("the central incisors, the lateral incisors and the canines on BOTH sides of the midline "
+                    "(FDI positions 1, 2 and 3)")
+            where = f"the MIDDLE of the {half} half of the image, and it crosses the midline"
+        else:
+            image_side = col if left_is_image_left else ("right" if col == "left" else "left")
+            patient_side = "RIGHT" if image_side == "left" else "LEFT"
+            what = (f"the premolars and molars on the patient's {patient_side} side, behind the canine "
+                    f"(FDI positions 4 to 8), and everything behind them ({behind})")
+            where = f"the {half}-{image_side.upper()} of the image"
+        definitions[cell] = f"{dp.CELL_DESCRIPTORS[cell]}: in the {arch} arch, {what}. It lies in {where}."
+    return definitions
+
+
+AREA_SYSTEM_PROMPT = (
+    "You are an expert oral and maxillofacial radiologist. You read a panoramic dental radiograph and report "
+    "where its dental-arch regions lie in that particular image. You reason about the anatomy that is actually "
+    "visible and you answer with JSON only, no prose."
+)
+
+AREA_PROMPT = """The image is a panoramic dental radiograph (orthopantomogram) in the standard display orientation: the patient's RIGHT side is on the LEFT side of the image and the patient's LEFT side is on the RIGHT side of the image; the maxilla (upper jaw) is at the top and the mandible (lower jaw) at the bottom. "Upper" means the maxillary arch and "lower" the mandibular arch; "anterior" means the incisors and canines around the midline and "posterior" the premolars, molars and everything behind them.
+
+Nothing is drawn on this radiograph. TASK: report where each of these regions lies in THIS image:
+
+{region_lines}
+
+Read the boundaries from the anatomy that is visible here: the midline between the central incisors, where the canines stand on each side, the occlusal plane where the two arches meet, and how far each arch reaches to the side. Patient positioning, the shape of the arch, the centring of the image, missing teeth and a tilted occlusal plane move those boundaries from radiograph to radiograph, so measure them in this image instead of answering with fixed fractions of the frame.
+
+Give each region as a normalized rectangle [x1, y1, x2, y2] that covers all of it: x runs from the left edge (0.0) to the right edge (1.0) and y from the top edge (0.0) to the bottom edge (1.0), with x1 < x2, y1 < y2 and every number between 0 and 1. The rectangle must contain the whole region including the teeth at its edges, and neighbouring regions may overlap where they meet (the anterior region overlaps the posterior ones around the canines). Report every region exactly once and no other name.
+
+Answer with JSON only, exactly in this shape and nothing else, with your four measured numbers in place of x1, y1, x2, y2:
+{{"regions": [{shape}]}}"""
+
+
+def area_prompt() -> str:
+    """The one prompt the adapter sends, built from the region schema."""
+    lines = "\n".join(f'- "{name}" = {text}' for name, text in region_definitions().items())
+    shape = ", ".join('{"region": "%s", "area": [x1, y1, x2, y2]}' % name for name in dp.CELLS)
+    return AREA_PROMPT.format(region_lines=lines, shape=shape)
+
+
+def parse_areas(text: str, regions: tuple[str, ...] = dp.CELLS) -> tuple[dict[str, list[float]], str | None]:
+    """{cell: [x1, y1, x2, y2]} in cell order, or ({}, reason) when the set is not complete and valid.
+
+    A reply is accepted only as a whole: every cell once, four numbers each, inside [0, 1] and with a
+    positive width and height. A missing, duplicated, unknown, malformed or out-of-range area rejects the
+    whole reply, because a partial set would place some boxes by model and the rest by something else
+    without saying so.
+    """
+    payload = _extract_json(text)
+    if payload is None:
+        return {}, "invalid_json"
+    entries = payload.get("regions")
+    if not isinstance(entries, list):
+        return {}, "regions_must_be_a_list"
+    areas: dict[str, list[float]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return {}, "invalid_region_entry"
+        name, area = entry.get("region"), entry.get("area")
+        if name not in regions:
+            return {}, "unknown_region"
+        if name in areas:
+            return {}, "duplicate_region"
+        if (not isinstance(area, list) or len(area) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in area)):
+            return {}, "invalid_area"
+        x1, y1, x2, y2 = (float(v) for v in area)
+        if not all(0.0 <= v <= 1.0 for v in (x1, y1, x2, y2)):
+            return {}, "area_out_of_range"
+        if x2 <= x1 or y2 <= y1:
+            return {}, "empty_area"
+        areas[name] = [x1, y1, x2, y2]
+    if any(name not in areas for name in regions):
+        return {}, "missing_region"
+    return {name: areas[name] for name in regions}, None
+
+
+def _corners(box: dict) -> tuple[float, float, float, float]:
+    return (box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2,
+            box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2)
+
+
+def covered_fraction(box: dict, area: list[float]) -> float:
+    """How much of the box lies inside the area, as a fraction of the box (where the finding mostly is)."""
+    x1, y1, x2, y2 = _corners(box)
+    ax1, ay1, ax2, ay2 = area
+    overlap = max(0.0, min(x2, ax2) - max(x1, ax1)) * max(0.0, min(y2, ay2) - max(y1, ay1))
+    return overlap / max((x2 - x1) * (y2 - y1), 1e-9)
+
+
+def gap_to(box: dict, area: list[float]) -> float:
+    """Distance between the box and the area, 0 when they touch or overlap."""
+    x1, y1, x2, y2 = _corners(box)
+    ax1, ay1, ax2, ay2 = area
+    dx, dy = max(ax1 - x2, x1 - ax2, 0.0), max(ay1 - y2, y1 - ay2, 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def place_box(box: dict, areas: dict[str, list[float]]) -> dict:
+    """The one cell of a box: the area covering most of it, or, when none touches it, the nearest area.
+
+    Equal scores fall to the first cell in CELLS order (max and min keep the first of equal values), so
+    the same box always lands in the same cell. The scores behind the decision are kept.
+    """
+    coverage = {name: round(covered_fraction(box, area), 6) for name, area in areas.items()}
+    best = max(areas, key=lambda name: coverage[name])
+    if coverage[best] > 0:
+        return {"region": best, "rule": "overlap", "coverage": coverage, "distance": None}
+    distance = {name: round(gap_to(box, area), 6) for name, area in areas.items()}
+    return {"region": min(areas, key=lambda name: distance[name]), "rule": "nearest",
+            "coverage": coverage, "distance": distance}
+
+
+def draw_areas(image_path: str | Path, areas: dict[str, list[float]], boxes: list[dict] = (),
+               max_side: int = 2048) -> bytes:
+    """Audit image: the proposed areas as labelled rectangles with the ground-truth boxes in white.
+
+    It is never sent to the model - the adapter asks about the untouched radiograph - and exists so the
+    proposed boundaries and the placements that follow from them can be inspected.
+    """
+    image, draw, stroke, font = _canvas(image_path, max_side)
+    width, height = image.size
+    for index, (name, (x1, y1, x2, y2)) in enumerate(areas.items()):
+        colour = PALETTE[index % len(PALETTE)]
+        left, top = round(x1 * width), round(y1 * height)
+        draw.rectangle((left, top, round(x2 * width) - 1, round(y2 * height) - 1), outline=colour, width=stroke)
+        _label(draw, name, left + stroke, top + stroke, colour, font)
+    for box in boxes:
+        x1, y1, x2, y2 = _corners(box)
+        draw.rectangle((round(x1 * width), round(y1 * height), round(x2 * width), round(y2 * height)),
+                       outline="white", width=max(1, stroke // 2))
+    return _jpeg(image)
+
+
+class AreaAdapter:
+    """This image's cell areas from a vision API, then every box placed by geometry in Python.
+
+    One call per image, on the untouched radiograph: the model never sees the ground-truth boxes, so it
+    cannot classify a finding - it only says where this patient's six cells lie, which is the part that
+    moves with positioning, arch shape, centring and missing teeth. Python then gives each box the area
+    covering most of it (or the nearest area when none touches it), so every annotated occurrence is
+    placed separately and identical boxes always land in the same cell. The reply is a short strict
+    object of numbers and is read by code alone: there is nothing in it for the parser service to
+    recover that a retry cannot. A reply that is not a complete valid set of areas is retried and then
+    follows failure_policy; the areas, the raw reply and the marked image are saved for audit.
+    from_api() and the request options are as in LLMAdapter.
+    """
+
+    kind = "areas"
+
+    def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
+                 max_output_tokens: int = 4096, temperature: float | None = None, max_side: int = 2048,
+                 timeout: float = 600.0, request_options: dict | None = None, parse_retries: int = 1,
+                 api_call_retries: int = 2, failure_policy: str = "geometry", call_log: str | None = None,
+                 client=None) -> None:
+        if token_param not in llm_api.TOKEN_PARAMS:
+            raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
+        llm_api.validate_parse_retries(parse_retries)
+        llm_api.validate_api_retries(api_call_retries)
+        if failure_policy not in ("geometry", "exclude", "error"):
+            raise ValueError("failure_policy must be 'geometry', 'exclude', or 'error'")
+        self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
+        self.base_url, self.model = base_url, model
+        self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
+        self.max_side = max_side
+        self.request_options = dict(request_options or {})
+        self.parse_retries, self.api_call_retries, self.failure_policy = parse_retries, api_call_retries, failure_policy
+        self.prompt = area_prompt()
+        self.call_log = mon.CallLog("location", call_log)
+
+    OPTIONS = ("token_param", "temperature", "max_output_tokens", "max_side", "request_options",
+               "parse_retries", "api_call_retries", "failure_policy")
+
+    @classmethod
+    def from_api(cls, spec: dict, timeout: float = 600.0, client=None) -> "AreaAdapter":
+        base_url, api_key = llm_api.resolve(spec)
+        options = {k: spec[k] for k in cls.OPTIONS if k in spec}
+        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
+
+    @property
+    def calls(self) -> int:
+        return self.call_log.calls
+
+    @property
+    def name(self) -> str:
+        return "areas-" + _slug(self.model)
+
+    def settings(self) -> dict:
+        return {"kind": self.kind, "model": self.model, "base_url": self.base_url, "token_param": self.token_param,
+                "max_output_tokens": self.max_output_tokens, "temperature": self.temperature,
+                "max_side": self.max_side, "request_options": self.request_options,
+                "parse_retries": self.parse_retries, "api_call_retries": self.api_call_retries,
+                "failure_policy": self.failure_policy, "regions": list(dp.CELLS),
+                "left_is_image_left": dp.LEFT_IS_IMAGE_LEFT,
+                "system_prompt": AREA_SYSTEM_PROMPT, "user_prompt": self.prompt}
+
+    def _ask(self, jpeg: bytes) -> dict:
+        request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": AREA_SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": self.prompt},
+                    {"type": "image_url", "image_url": {"url": dp.image_data_uri(jpeg, "image/jpeg")}},
+                ]},
+            ],
+            **llm_api.generation_fields(self.token_param, self.max_output_tokens, self.temperature),
+        }
+        request.update(self.request_options)
+        started = time.perf_counter()
+        normalized = llm_api.call_with_retries(
+            lambda: llm_api.chat_reply(self.client.chat.completions.create(**request)),
+            self.api_call_retries, f"location model={self.model}")
+        return self.call_log.live({**normalized, "latency_seconds": round(time.perf_counter() - started, 3)})
+
+    def areas_for(self, image_path: str | Path, image_id: str | None = None) -> tuple[dict, str | None, dict, list]:
+        """The image's areas, the error that remains, the last reply and every attempt."""
+        jpeg, _, _, _ = draw_boxes(image_path, [], self.max_side, numbered=False, corner_labels=False)
+        areas, error, reply, attempts = {}, None, {"text": ""}, []
+        for attempt in range(self.parse_retries + 1):
+            reply = self._ask(jpeg)
+            areas, error = parse_areas(reply["text"])
+            attempts.append({**reply, "error": error})
+            if not error:
+                if attempt:
+                    llm_api.monitor("LOCATION PARSE RECOVERED", f"image={image_id or Path(image_path).name}",
+                                    attempt=attempt + 1)
+                break
+            llm_api.monitor("LOCATION PARSE WARNING", f"image={image_id or Path(image_path).name}",
+                            attempt=f"{attempt + 1}/{self.parse_retries + 1}", reason=error)
+            llm_api.failure_details("SYSTEM:\n" + AREA_SYSTEM_PROMPT + "\n\nUSER:\n" + self.prompt, reply["text"])
+        return areas, error, reply, attempts
+
+    def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
+              drawn_dir: str | Path | None = None) -> list[dict]:
+        """One record per box: its cell, the areas it was placed against and how it was placed."""
+        areas, error, reply, attempts = self.areas_for(image_path, image_id)
+        if error and self.failure_policy == "error":
+            raise ValueError(f"region areas remained unparseable for {image_id or image_path}: {error}")
+        if error:
+            llm_api.monitor("LOCATION FALLBACK", f"image={image_id or Path(image_path).name}",
+                            policy=self.failure_policy, reason=error)
+        elif drawn_dir and image_id:
+            Path(drawn_dir).mkdir(parents=True, exist_ok=True)
+            Path(drawn_dir, f"{image_id}.jpg").write_bytes(draw_areas(image_path, areas, boxes, self.max_side))
+        rows = []
+        for box in boxes:
+            row = {"regions": None, "units": None, "teeth": [], "source": None, "raw": reply["text"],
+                   "attempts": attempts, "fallback_reason": error, "areas": areas or None, "assignment": None}
+            if areas:
+                assignment = place_box(box, areas)
+                row.update(regions=[assignment["region"]], source="areas", assignment=assignment)
+            elif self.failure_policy == "exclude":
+                row.update(regions=[], source="excluded")
+            rows.append(row)
         return rows
 
 

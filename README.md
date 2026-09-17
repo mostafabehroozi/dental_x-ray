@@ -163,7 +163,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell, side-convention check, CSV/JSON export |
 | `dental_analysis.py` | offline phrasing/vote and region comparisons, recovery, case breakdowns, paired saved-run comparisons |
 | `response_cache.py` | immutable, content-addressed reuse of exact local DentVLM responses across compatible experiments |
-| `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), experimental DentVLM spotlight adapter, resumable per-dataset run |
+| `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), per-image area adapter (the cell areas of that radiograph, then geometry), experimental DentVLM spotlight adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image (tasks, cells, multiplicity, extra tasks, not-assessed findings), report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment |
@@ -283,7 +283,8 @@ Secrets), and unused providers may have no key. The small `analyzer`,
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
 routing under `request_options` stay with the role. `VisionRunner.from_api`,
-`LLMAdapter.from_api`, `ReportWriter.from_api` and `ParserModel.from_api` build the
+`LLMAdapter.from_api`, `AreaAdapter.from_api`, `ReportWriter.from_api` and
+`ParserModel.from_api` build the
 clients; run manifests record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once.
@@ -486,6 +487,23 @@ Methods 4.2), and `location_truth` picks how this project does it:
   retries and the configured location failure policy. The model is the `adapter` role of the experiment (see "Hosted models");
   for reasoning models set `token_param` to `max_completion_tokens` and leave
   `temperature` at `None`.
+* `"areas"`: the same kind of hosted model, asked once per image about the
+  radiograph itself with nothing drawn on it: where do this patient's six cells
+  lie? It answers one normalized area `[x1, y1, x2, y2]` per cell, accepted only
+  as a complete valid set (every cell once, four numbers each, inside `[0, 1]`,
+  positive width and height), and ordinary geometry then places the boxes: each
+  one goes to the area covering the greatest fraction of it, or, when no area
+  touches it, to the nearest area. Equal scores fall to cell order, so the same
+  box always lands in the same cell, and every box records the rule that placed
+  it with the coverages or distances behind the decision. The model never sees a
+  finding box, so it cannot classify a finding; it only moves the boundaries that
+  positioning, arch shape, centring and missing teeth move. The cells are named
+  to it in DentVLM's own descriptors under the current `LEFT_IS_IMAGE_LEFT`
+  reading, and that flag is part of the adapter configuration, so flipping it
+  asks again rather than re-labelling saved areas. One call per image whatever
+  the number of boxes, read by code (no parser stage); the areas, the reply and a
+  marked copy of the image (cells labelled, true boxes in white) are saved. Same
+  `adapter` role and failure policy as `"llm"`.
 * `"fdm"` (experimental): DentVLM itself. It has no question about a marked
   region, so the task is split into one in-distribution question per box: a
   full-frame "spotlight" copy that shows only the box and a margin, the
@@ -499,9 +517,10 @@ Methods 4.2), and `location_truth` picks how this project does it:
 
 The adapter runs once per dataset and adapter (Cell 10), independently of the
 model run, and resumes: one JSON per image under
-`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
-cells, the windows' answer and the source that placed the box; the drawn or
-spotlighted images are kept under `.../drawn` for audit. DENTEX boxes carry FDI
+`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units (or the
+areas and the assignment behind each box), the cells, the windows' answer and the
+source that placed the box; the drawn, spotlighted or marked images are kept
+under `.../drawn` for audit. DENTEX boxes carry FDI
 tooth numbers, which give exact cells, so on a DENTEX dataset Cell 10 also
 prints the adapter's and the windows' agreement with that exact truth
 (`dental_eval.truth_agreement`): the check that the adapter is worth its calls.

@@ -218,7 +218,9 @@ def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, di
 
     Units (from the LLM adapter) and geometry fallbacks are re-mapped here, so flipping
     LEFT_IS_IMAGE_LEFT changes the truth without new adapter calls; cells named by the
-    local model itself (source "fdm") are already in its own convention and stay as saved.
+    local model itself (source "fdm") and cells the area adapter placed a box in ("areas")
+    are already in their own convention and stay as saved - the area adapter records the
+    flag it asked under, so a flipped flag is a different adapter configuration.
     """
     out = {}
     for image_id, entry in gt.items():
@@ -237,7 +239,7 @@ def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, di
                 continue
             if record["source"] == "llm" and record.get("units"):
                 box["regions"] = units_to_cells(record["units"])
-            elif record["source"] == "fdm":
+            elif record["source"] in ("fdm", "areas"):
                 box["regions"] = list(record["regions"])
             else:
                 box["regions"] = [c for c in CELLS if c in geometric_regions(box)]

@@ -36,6 +36,61 @@ class UnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dp.unit_cell("Q5-anterior")
 
+    def test_parse_areas(self):
+        areas = {c: [0.1, 0.1, 0.9, 0.9] for c in reversed(dp.CELLS)}
+        parsed, error = la.parse_areas(f"Here you go:\n```json\n{_areas_reply(areas)}\n```")
+        self.assertIsNone(error)
+        self.assertEqual(list(parsed), list(dp.CELLS))  # cell order, whatever the reply's order
+        self.assertEqual(parsed["upper-right"], [0.1, 0.1, 0.9, 0.9])
+        cases = {
+            "not json at all": "invalid_json",
+            json.dumps({"regions": {"upper-right": [0, 0, 1, 1]}}): "regions_must_be_a_list",
+            _areas_reply({k: v for k, v in areas.items() if k != "lower-left"}): "missing_region",
+            _areas_reply({**areas, "upper": [0.0, 0.0, 0.5, 0.5]}): "unknown_region",
+            _areas_reply({**areas, "upper-right": [0.0, 0.0, 1.2, 0.5]}): "area_out_of_range",
+            _areas_reply({**areas, "upper-right": [0.5, 0.0, 0.5, 0.5]}): "empty_area",
+            _areas_reply({**areas, "upper-right": [0.0, 0.0, 0.5]}): "invalid_area",
+            _areas_reply({**areas, "upper-right": "top right"}): "invalid_area",
+            json.dumps({"regions": [{"region": "upper-right", "area": [0, 0, 0.5, 0.5]}] * 2}): "duplicate_region",
+            json.dumps({"regions": ["upper-right"]}): "invalid_region_entry",
+        }
+        for reply, expected in cases.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(la.parse_areas(reply), ({}, expected))
+
+    def test_region_definitions_follow_the_side_convention(self):
+        # DentVLM's "left" is the patient's right, which is the left of the image (Table S6).
+        definitions = la.region_definitions()
+        self.assertIn("patient's RIGHT side", definitions["upper-left"])
+        self.assertIn("TOP-LEFT of the image", definitions["upper-left"])
+        self.assertIn("patient's LEFT side", definitions["lower-right"])
+        self.assertIn("BOTTOM-RIGHT of the image", definitions["lower-right"])
+        self.assertIn("crosses the midline", definitions["upper-anterior"])
+        flipped = la.region_definitions(left_is_image_left=False)
+        self.assertIn("TOP-RIGHT of the image", flipped["upper-left"])
+        self.assertEqual(set(definitions), set(dp.CELLS))
+
+    def test_place_box_by_overlap_then_by_distance(self):
+        areas = {"upper-right": [0.55, 0.0, 1.0, 0.5], "upper-anterior": [0.35, 0.0, 0.65, 0.5],
+                 "upper-left": [0.0, 0.0, 0.45, 0.5], "lower-right": [0.55, 0.5, 1.0, 1.0],
+                 "lower-anterior": [0.35, 0.5, 0.65, 1.0], "lower-left": [0.0, 0.5, 0.45, 1.0]}
+        inside = la.place_box({"xc": 0.2, "yc": 0.2, "w": 0.1, "h": 0.1}, areas)
+        self.assertEqual((inside["region"], inside["rule"], inside["coverage"]["upper-left"], inside["distance"]),
+                         ("upper-left", "overlap", 1.0, None))
+        # 60% of the box is behind the canine line: the greater covered fraction wins, not the centre.
+        canine = la.place_box({"xc": 0.42, "yc": 0.2, "w": 0.1, "h": 0.1}, areas)
+        self.assertEqual((canine["region"], canine["coverage"]["upper-left"]), ("upper-anterior", 0.8))
+        # Two areas covering the box equally: the first in cell order, always the same way.
+        self.assertEqual(la.place_box({"xc": 0.4, "yc": 0.2, "w": 0.1, "h": 0.1}, areas)["region"], "upper-anterior")
+
+        tight = {"upper-right": [0.6, 0.1, 0.9, 0.4], "upper-anterior": [0.4, 0.15, 0.6, 0.4],
+                 "upper-left": [0.1, 0.1, 0.4, 0.4], "lower-right": [0.6, 0.6, 0.9, 0.9],
+                 "lower-anterior": [0.4, 0.6, 0.6, 0.85], "lower-left": [0.1, 0.6, 0.4, 0.9]}
+        outside = la.place_box({"xc": 0.5, "yc": 0.05, "w": 0.04, "h": 0.04}, tight)
+        self.assertEqual((outside["region"], outside["rule"], outside["distance"]["upper-anterior"]),
+                         ("upper-anterior", "nearest", 0.08))
+        self.assertEqual(set(outside["coverage"].values()), {0.0})
+
     def test_parse_units(self):
         text = 'Sure:\n```json\n{"boxes": [{"id": 1, "units": ["Q1-posterior", "bogus"], "teeth": [16, "17"]},' \
                ' {"id": 2, "units": [], "teeth": []}, {"id": 9, "units": ["Q2-anterior"]}, "junk"]}\n```'
@@ -60,6 +115,17 @@ class FakeClient:
 
 def _reply(entries: list[tuple]) -> str:
     return json.dumps({"boxes": [{"id": i, "units": units, "teeth": teeth} for i, units, teeth in entries]})
+
+
+def _shifted_areas() -> dict:
+    """Cell areas of a patient sitting right of the fixed windows: the canine line moves with them."""
+    return {"upper-right": [0.70, 0.00, 1.00, 0.55], "upper-anterior": [0.26, 0.00, 0.72, 0.55],
+            "upper-left": [0.00, 0.00, 0.24, 0.55], "lower-right": [0.70, 0.45, 1.00, 1.00],
+            "lower-anterior": [0.26, 0.45, 0.72, 1.00], "lower-left": [0.00, 0.45, 0.24, 1.00]}
+
+
+def _areas_reply(areas: dict) -> str:
+    return json.dumps({"regions": [{"region": name, "area": area} for name, area in areas.items()]})
 
 
 @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow not installed")
@@ -188,6 +254,66 @@ class AdapterTests(unittest.TestCase):
         misaligned["img1"]["boxes"][0]["condition"] = "wrong"
         with self.assertRaisesRegex(ValueError, "order/content"):
             ev.apply_adapted(self.gt, misaligned)
+
+    def test_area_adapter_places_every_box_from_one_call(self):
+        # A patient whose midline and canine lines sit left of the fixed windows: box 2 becomes anterior.
+        areas = _shifted_areas()
+        client = FakeClient([_areas_reply(areas)])
+        adapter = la.AreaAdapter(base_url=None, api_key="x", model="fake/model-2", client=client)
+        self.assertEqual(adapter.name, "areas-fake-model-2")
+        rows = adapter.adapt(self.images["img1"], self.gt["img1"]["boxes"], "img1", self.root / "areas_drawn")
+        self.assertEqual(len(client.requests), 1)  # one call for the image, whatever the boxes
+        self.assertEqual([r["regions"] for r in rows], [["upper-left"], ["upper-anterior"], ["lower-right"]])
+        self.assertEqual([r["source"] for r in rows], ["areas"] * 3)
+        self.assertEqual([r["areas"] for r in rows], [areas] * 3)
+        self.assertEqual((rows[1]["assignment"]["rule"], rows[1]["assignment"]["coverage"]["upper-anterior"],
+                          rows[1]["assignment"]["coverage"]["upper-left"]), ("overlap", 1.0, 0.0))
+        text = client.requests[0]["messages"][1]["content"][0]["text"]
+        self.assertIn(UPPER_RIGHT, text)
+        self.assertIn(LOWER_LEFT, text)
+        self.assertNotIn("Dental filling", text)  # the model is never told what the boxes are
+        self.assertEqual(len(client.requests[0]["messages"][1]["content"]), 2)  # one image, no box list
+        self.assertTrue((self.root / "areas_drawn" / "img1.jpg").is_file())
+
+    def test_area_adapter_retries_then_follows_the_failure_policy(self):
+        complete = _shifted_areas()
+        partial = _areas_reply({k: v for k, v in complete.items() if k != "lower-left"})
+        recovered = la.AreaAdapter(None, "x", "fake", client=FakeClient([partial, _areas_reply(complete)]))
+        row = recovered.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"]), (["upper-left"], "areas"))
+        self.assertEqual([a["error"] for a in row["attempts"]], ["missing_region", None])
+
+        fallback = la.AreaAdapter(None, "x", "fake", parse_retries=0, client=FakeClient([partial]))
+        row = fallback.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"], row["areas"], row["fallback_reason"]),
+                         (None, None, None, "missing_region"))  # left to geometry in adapt_dataset
+        excluded = la.AreaAdapter(None, "x", "fake", parse_retries=0, failure_policy="exclude",
+                                  client=FakeClient(["not json"]))
+        row = excluded.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"], row["fallback_reason"]), ([], "excluded", "invalid_json"))
+        with self.assertRaisesRegex(ValueError, "region areas remained unparseable"):
+            la.AreaAdapter(None, "x", "fake", parse_retries=0, failure_policy="error",
+                           client=FakeClient(["not json"])).adapt(
+                               self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")
+
+    def test_area_adapter_dataset_and_evaluation(self):
+        client = FakeClient([_areas_reply(_shifted_areas())])
+        out = self.root / "truth_areas"
+        adapted = la.adapt_dataset(la.AreaAdapter(None, "x", "fake", client=client), self.gt, out)
+        self.assertEqual(len(client.requests), 1)  # img2 has no boxes: no call at all
+        records = adapted["img1"]["boxes"]
+        self.assertEqual([r["regions"] for r in records], [["upper-left"], ["upper-anterior"], ["lower-right"]])
+        self.assertEqual([r["geometry"] for r in records], [["upper-left"], ["upper-left"], ["lower-right"]])
+        self.assertEqual(la.summarize(adapted), {"images": 2, "boxes": 3, "by_source": {"areas": 3},
+                                                 "agreement_with_geometry": 0.6667, "multi_region_boxes": 0})
+        self.assertTrue((out / "drawn" / "img1.jpg").is_file())
+        manifest = json.loads((out / "manifest.json").read_text())["adapter"]
+        self.assertEqual((manifest["regions"], manifest["left_is_image_left"]), (list(dp.CELLS), True))
+        truth = ev.apply_adapted(self.gt, adapted)
+        self.assertEqual([b["regions"] for b in truth["img1"]["boxes"]],
+                         [["upper-left"], ["upper-anterior"], ["lower-right"]])
+        self.assertEqual({b["region_source"] for b in truth["img1"]["boxes"]}, {"areas"})
+        self.assertEqual(ev.location_truth_summary(truth), {"boxes": 3, "by_source": {"areas": 3}})
 
     def test_truth_agreement_on_fdi_boxes(self):
         gt = {"a": {"path": str(self.images["img1"]), "annotated": set(dp.CONDITIONS), "boxes": [

@@ -34,7 +34,7 @@ from response_cache import ResponseCache
 
 BACKENDS = ("api", "local")
 MODEL_SOURCES = ("convert", "local", "hf")
-LOCATION_TRUTHS = ("llm", "fdm", "geometry")
+LOCATION_TRUTHS = ("llm", "areas", "fdm", "geometry")
 
 DEFAULTS = {
     # Where runs are written. One directory per experiment: <output_root>/<name>/<dataset>/
@@ -61,7 +61,9 @@ DEFAULTS = {
 
     # Location truth: how ground-truth boxes reach the six cells.
     "evaluate_location": True,
-    "location_truth": "llm",           # "llm" (adapter spec) | "fdm" (local DentVLM) | "geometry" (fixed windows)
+    "location_truth": "llm",           # "llm" (units per box) | "areas" (this image's cell areas, then geometry)
+                                       # | "fdm" (local DentVLM) | "geometry" (fixed windows). "llm" and "areas"
+                                       # both use the adapter spec below.
     "adapter": {"provider": "openai", "model": "gpt-5",
                 "token_param": "max_completion_tokens", "temperature": None,
                 "max_output_tokens": 8192, "max_boxes_per_call": 12},
@@ -176,7 +178,7 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
         raise ValueError(f"{name}: location_failure_policy must be 'geometry', 'exclude' or 'error'")
     if cfg["backend"] == "api":
         _check_spec(cfg["analyzer"], "analyzer", name)
-    if cfg["evaluate_location"] and cfg["location_truth"] == "llm":
+    if cfg["evaluate_location"] and cfg["location_truth"] in ("llm", "areas"):
         _check_spec(cfg["adapter"], "adapter", name)
     _check_spec(cfg["reporter"], "reporter", name)
     if type(cfg["reporter"].get("vote_agreement", False)) is not bool:
@@ -276,9 +278,10 @@ def truth_dir(cfg: dict, dataset: str) -> Path:
     Keyed by the adapter configuration, not by the experiment, so every experiment using the same
     adapter reads the same translated boxes instead of paying for them again.
     """
-    if cfg["location_truth"] == "llm":
+    if cfg["location_truth"] in ("llm", "areas"):
         key = llm_api.public(cfg["adapter"])
-        name = "llm-" + re.sub(r"[^a-z0-9]+", "-", str(cfg["adapter"]["model"]).lower()).strip("-")
+        model = re.sub(r"[^a-z0-9]+", "-", str(cfg["adapter"]["model"]).lower()).strip("-")
+        name = f"{cfg['location_truth']}-{model}"
     else:
         key = {"model_file": cfg["model_filename"], "margin": cfg["adapter_fdm_margin"],
                "max_tokens": cfg["max_tokens"], "parse_retries": cfg["location_parse_retries"],
@@ -287,10 +290,10 @@ def truth_dir(cfg: dict, dataset: str) -> Path:
     # How the adapter's replies are read is part of what the adapted truth is, so two experiments
     # reading them differently get two directories instead of one they would refuse to share. The
     # key is read from the configuration, never from a built service: naming a directory must not
-    # need an API key.
+    # need an API key. The area adapter reads its own reply by code, so no parser belongs in its key.
     policy = lp.ParserPolicy(cfg["parser_mode"], cfg["parser_modes"])
     reader = ({"policy": policy.settings(), "model": llm_api.public(cfg["parser"]),
-               "prompts": lp.PROMPT_VERSION} if policy.uses_llm() else None)
+               "prompts": lp.PROMPT_VERSION} if policy.uses_llm() and cfg["location_truth"] != "areas" else None)
     key = {"adapter": key, **({"parser": reader} if reader else {})}
     return Path(cfg["output_root"], "location_truth", dataset, f"{name}-{_digest(key)}")
 
@@ -351,6 +354,9 @@ def location_adapter(cfg: dict, runner=None, parser=None):
         return None
     if cfg["location_truth"] == "llm":
         return la.LLMAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"], parser=parser)
+    if cfg["location_truth"] == "areas":
+        # No parser: the areas are a short strict object of numbers, read by code.
+        return la.AreaAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"])
     return la.FdmAdapter(runner, margin=cfg["adapter_fdm_margin"], parse_retries=cfg["location_parse_retries"],
                          failure_policy=cfg["location_failure_policy"], parser=parser)
 
