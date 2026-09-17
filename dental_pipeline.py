@@ -487,13 +487,22 @@ class Protocol:
 
 
 def vote(answers: list[dict], region_vote: str) -> dict:
-    """Presence by majority of the parsed answers; regions from the yes answers."""
+    """Presence by majority of the parsed answers; regions from the yes answers.
+
+    An answer whose location could not be read at all carries "regions_unresolved" (only an LLM
+    parser can set it) and is left out of the region vote. When every answer that reported the
+    finding is unresolved there is no location to report and regions stay None - unresolved, which
+    is not the same claim as the empty set "the model named no region".
+    """
     parsed = [a["answer"] for a in answers if a["answer"] is not None]
     yes, no = parsed.count("yes"), parsed.count("no")
     presence = "yes" if yes > no else "no" if no > yes else None
     if presence != "yes":
         return {"presence": presence, "regions": None}
-    positive = [set(a["regions"]) for a in answers if a["answer"] == "yes"]
+    positive = [set(a["regions"]) for a in answers
+                if a["answer"] == "yes" and not a.get("regions_unresolved")]
+    if not positive:
+        return {"presence": "yes", "regions": None}
     if region_vote == "union":
         cells = set().union(*positive)
     else:
@@ -514,13 +523,38 @@ def _any_yes(answers) -> str | None:
     return "no" if all(a == "no" for a in answers) else None
 
 
-def cell_answers(result: dict) -> dict[str, dict[str, str | None]]:
-    """{task: {cell: yes/no/None}} from the saved region calls (location "regions"): each region's answer."""
+def cell_answers(result: dict, parser=None) -> dict[str, dict[str, str | None]]:
+    """{task: {cell: yes/no/None}} from the saved region calls (location "regions"): each region's answer.
+
+    A call that carries its own parsed value is authoritative and is never read again: that value is
+    the decision the run accepted, whatever reads the text today. Only a call saved without one is
+    reconstructed from its text, and `parser` (a llm_parser.ParserService) may then be used for it -
+    but only when it is configured exactly as the run was. A replay under a different parser
+    configuration reads with code alone and says so, so an accepted result can never be quietly
+    reinterpreted into a different answer.
+    """
+    service = parser
+    if service is not None and service.policy.uses_llm():
+        saved = result.get("parser_fingerprint")
+        if saved != service.fingerprint():
+            mon.monitor("PARSER REPLAY GUARD", f"image={result.get('image_id', '?')}",
+                        saved=saved or "none", now=service.fingerprint(),
+                        action="reconstructing saved answers with code only")
+            service = None
     answers: dict[str, dict] = {}
     for call in result.get("calls") or []:
         if call.get("stage") == "region" and call.get("cell"):
             recovery = call.get("parse_recovery")
-            answer = recovery["value"] if recovery is not None else extract_answer(call["text"])
+            if recovery is not None:
+                answer = recovery["value"]
+            elif service is None:
+                answer = extract_answer(call["text"])
+            else:
+                answer = service.decision("saved_answer_reconstruction", call["text"],
+                                          call.get("question", ""),
+                                          truncated=bool(call.get("truncated")),
+                                          context=f"image={result.get('image_id', '?')} | "
+                                                  f"task={call.get('task')} | cell={call['cell']}").value
             answers.setdefault(call["task"], {})[call["cell"]] = answer
     return answers
 
@@ -533,45 +567,89 @@ def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
     presence = _any_yes(tasks[k]["presence"] for k in keys)
     regions = None
     if presence == "yes" and protocol.location != "none":
-        named = set()
+        named, unresolved = set(), False
         for k in keys:
             if tasks[k]["presence"] == "yes":
-                named.update(tasks[k]["regions"] or [])
-        regions = [c for c in CELLS if c in named]
+                if tasks[k]["regions"] is None:  # the task reported it but its location is unresolved
+                    unresolved = True
+                else:
+                    named.update(tasks[k]["regions"])
+        # A known region stays known even beside an unresolved task; only when nothing at all could be
+        # read do the regions stay None, which the evaluation already counts as unparseable location.
+        if named or not unresolved:
+            regions = [c for c in CELLS if c in named]
     return {"asked": True, "tasks": list(keys), "presence": presence,
             "whole_image": _any_yes(tasks[k]["whole_image"] for k in keys), "regions": regions,
             "region_count": len(regions) if regions is not None else None}
 
 
-def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol()) -> dict:
+def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(), parser=None) -> dict:
     """One yes/no question per task on the whole image; regions from the rationale, or from the same
     question asked once per region with the region named in it (the whole-image answers are then kept
-    under "whole_image"). The image sent is always the whole radiograph. Deterministic order."""
+    under "whole_image"). The image sent is always the whole radiograph. Deterministic order.
+
+    `parser` is an optional llm_parser.ParserService: the reader for every reply of this image. With
+    None (and with a service whose stages all resolve to "code") the strict readers below are used
+    exactly as before and the saved artifact is unchanged; otherwise every parse is recorded next to
+    the call it read, and an unresolved parse stays unresolved rather than becoming an answer.
+    """
     path = Path(image_path)
     calls: list[dict] = []
     tasks: dict[str, dict] = {}
     aggregation_warnings: list[dict] = []
+    usage_at_start = parser.usage_snapshot() if parser is not None else None
 
     def ask(stage, task, cell, image, question):
         hint = ("Start your reply with exactly Yes or No on the first line, choosing one. "
                 "Then give your brief rationale and location as requested.")
+        parse_stage = "whole_image_decision" if stage == "presence" else "region_decision"
+        context = f"image={path.name} | task={task} | stage={stage} | cell={cell or 'whole'}"
+        pending: list[dict] = []
 
         def parse(reply):
-            # A cut-off rationale can contain incomplete locations even if line 1 is readable.
-            value = None if reply.get("truncated") else extract_answer(reply["text"])
-            return value, None if value is not None else "missing_or_ambiguous_decision"
+            if parser is None:
+                # A cut-off rationale can contain incomplete locations even if line 1 is readable.
+                value = None if reply.get("truncated") else extract_answer(reply["text"])
+                return value, None if value is not None else "missing_or_ambiguous_decision"
+            outcome = parser.decision(parse_stage, reply["text"], question,
+                                      truncated=bool(reply.get("truncated")), context=context)
+            pending.append(outcome.record)
+            return outcome.value, outcome.error
+
+        def record(asked_question, reply):
+            _record(calls, stage, task, cell, asked_question,
+                    {**reply, **({"parsing": list(pending)} if pending else {})})
+            pending.clear()
 
         return llm_api.ask_parsed(
-            runner, image, question, parse=parse, retries=protocol.parse_retries,
-            context=f"image={path.name} | task={task} | stage={stage} | cell={cell or 'whole'}",
-            record=lambda q, r: _record(calls, stage, task, cell, q, r),
-            fallback=lambda _: question + "\n\n" + hint)
+            runner, image, question, parse=parse, retries=protocol.parse_retries, context=context,
+            record=record, fallback=lambda _: question + "\n\n" + hint)
+
+    def locate(task, question, answer, reply):
+        """The regions one whole-image answer names, and whether that location is unresolved.
+
+        Only an answer that reported the finding is put to the location parser: the regions of a No
+        answer are never used by the vote or by the report, so they keep the strict reader's reading
+        and cost nothing.
+        """
+        if answer is None:
+            return [], False, None
+        if parser is None or answer != "yes":
+            return extract_regions(reply["text"]), False, None
+        outcome = parser.location("rationale_location", reply["text"], question=question,
+                                  truncated=bool(reply.get("truncated")),
+                                  context=f"image={path.name} | task={task} | stage=rationale")
+        return list(outcome.value or []), not outcome.resolved, outcome.record
 
     for task in protocol.tasks():
         answers = []
         for question in questions_for(task)[:protocol.phrasings]:
             answer, reply = ask("presence", task, None, path, question)
-            answers.append({"answer": answer, "regions": extract_regions(reply["text"]) if answer is not None else [],
+            regions, unresolved, location_record = locate(task, question, answer, reply)
+            if location_record is not None:
+                calls[-1].setdefault("parsing", []).append(location_record)
+            answers.append({"answer": answer, "regions": regions,
+                            **({"regions_unresolved": True} if unresolved else {}),
                             "truncated": reply["truncated"]})
         tasks[task] = {"name": task_name(task), "answers": answers, **vote(answers, protocol.region_vote)}
         parsed_answers = [a["answer"] for a in answers if a["answer"] is not None]
@@ -623,11 +701,20 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
         "cache_hit_count": sum(call.get("cache_hit", False) for call in calls),
         "parse_recovery": llm_api.parse_recovery_summary(calls),
         "aggregation_warnings": aggregation_warnings,
+        **({"parser": parser.public(), "parser_fingerprint": parser.fingerprint(),
+            "parser_usage": parser.usage_since(usage_at_start)} if parser is not None else {}),
     }
 
 
-def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | None = None) -> dict:
-    """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts."""
+def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | None = None,
+               parser=None) -> dict:
+    """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts.
+
+    The parser configuration is part of the run whenever it can change how a reply is read, so
+    resuming a directory with a different parser model, prompt or mode is refused instead of
+    filling one result set with two readings. A service that reads with code alone is the absence
+    of a parser and is left out, which keeps every run written before this existed resumable.
+    """
     config = {
         "protocol": asdict(protocol),
         "questions": {task: questions_for(task)[:protocol.phrasings] for task in protocol.tasks()},
@@ -639,6 +726,8 @@ def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | Non
         "runner": runner_settings, "provenance": provenance or {},
         "parse_recovery_version": 1,
     }
+    if parser is not None and parser.policy.uses_llm():
+        config["parser"] = parser.settings()
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
 
@@ -664,7 +753,7 @@ def result_line(result: dict) -> str:
 
 def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, protocol: Protocol = Protocol(),
                 resume: bool = True, provenance: dict | None = None,
-                ledger: "mon.Ledger | None" = None, stop_after: int = 3) -> Path:
+                ledger: "mon.Ledger | None" = None, stop_after: int = 3, parser=None) -> Path:
     """Analyze every image, one JSON per image, skipping finished ones on resume.
 
     An image that fails (a rejected request, an unreadable file, a model that never
@@ -678,7 +767,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
     out = Path(out_dir)
     results_dir = out / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    config = run_config(protocol, runner.settings(), provenance)
+    config = run_config(protocol, runner.settings(), provenance, parser)
     manifest_path = out / "manifest.json"
     if manifest_path.is_file():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -697,7 +786,7 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
             progress.skip(image_id)
             continue
         with mon.guard(f"{out.name}/{image_id}", failures) as step:
-            result = analyze_image(runner, path, protocol=protocol)
+            result = analyze_image(runner, path, protocol=protocol, parser=parser)
             result["image_id"] = image_id
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -708,11 +797,21 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
                 break
             continue
         recovery = result["parse_recovery"]
+        parsed = result.get("parser_usage") or {}
         progress.item(image_id, result_line(result), calls=result["inference_call_count"],
                       cache=result["cache_hit_count"] or None, retries=recovery["retry_calls"] or None,
-                      unparsed=recovery["unresolved_checks"] or None)
+                      unparsed=recovery["unresolved_checks"] or None,
+                      parser_calls=sum(row.get("llm_calls", 0) for row in parsed.values()) or None,
+                      parser_fallbacks=sum(row.get("fallbacks", 0) for row in parsed.values()) or None,
+                      parser_unresolved=sum(row.get("unresolved", 0) for row in parsed.values()) or None)
     log = getattr(runner, "call_log", None)
-    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    # The parser is a second model with its own bill; its line is kept next to the analyzer's,
+    # never added into it, so "how many calls did the analyzer make" stays answerable.
+    parser_log = getattr(getattr(parser, "model", None), "call_log", None)
+    detail = log.line(counts=False) if isinstance(log, mon.CallLog) else ""
+    if isinstance(parser_log, mon.CallLog) and parser_log.requests:
+        detail = (detail + " | " if detail else "") + f"parser {parser_log.line()}"
+    progress.done(detail=detail)
     if failures:
         failures.report(path=out / "failures.json")
         if ledger is not None:  # the sweep's own ledger keeps every stage's failures together
@@ -760,6 +859,11 @@ def describe_cell(cell: str, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> s
     return f"patient's {row} {_FLIP[image_side]} posterior (image {image_side})"
 
 
+def protocol_level(result: dict) -> str:
+    """The location level a saved result was produced with."""
+    return result.get("location_level", LOCATION_LEVELS[0])
+
+
 def dentist_report(result: dict) -> str:
     """Deterministic plain-text summary of one image result for a dentist."""
     flag = result.get("left_is_image_left", LEFT_IS_IMAGE_LEFT)
@@ -776,6 +880,8 @@ def dentist_report(result: dict) -> str:
                              + ", ".join(describe_cell(c, flag) for c in finding["regions"]))
             elif finding["regions"] is not None:
                 parts.append("region not stated")
+            elif protocol_level(result) != "none":
+                parts.append("region could not be read")
             present.append(" - " + "; ".join(parts))
         elif finding["presence"] == "no":
             absent.append(label)

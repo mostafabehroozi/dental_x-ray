@@ -11,6 +11,7 @@ from pathlib import Path
 
 import dental_eval as ev
 import dental_pipeline as dp
+import llm_parser as lp
 
 
 def _outcome(truth, finding, field="presence"):
@@ -144,6 +145,20 @@ def call_usage(results):
             row["inference_" + field] = round(sum(inference_values), 4) if inference_values else None
         rows.append(row)
     return rows
+
+
+def parser_usage(results):
+    """One row per parser stage over a run: how often each reader answered, fell back or gave up.
+
+    Read from what the runs saved, so a run made with code alone simply has no rows and the table
+    disappears instead of showing zeros for a reader that was never configured.
+    """
+    totals = defaultdict(lambda: defaultdict(int))
+    for result in results.values():
+        for stage, row in (result.get("parser_usage") or {}).items():
+            for key, value in row.items():
+                totals[stage][key] += value
+    return lp.usage_rows({stage: dict(row) for stage, row in totals.items()})
 
 
 def recovery_rows(gt, results, evaluate_location):
@@ -283,8 +298,8 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
     changes += presence_changes(regional, results, results, "whole_image_to_regions", before_field="whole_image")
     return {"stage_changes": changes, "phrasing_votes": votes, "region_vote_comparison": region_votes,
             "parse_recovery": recovery_rows(gt, results, evaluate_location),
-            "call_usage": call_usage(results), "case_breakdown": rows,
-            "case_condition_breakdown": condition_rows}
+            "call_usage": call_usage(results), "parser_usage": parser_usage(results),
+            "case_breakdown": rows, "case_condition_breakdown": condition_rows}
 
 
 def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
@@ -363,7 +378,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
 def compact_views(ground_truth, reports):
     """Join DentVLM reports without losing task support, votes, region answers, or not-assessed states."""
     overview, findings, situations, situation_findings = [], [], [], []
-    stages, phrasings, vote_replays, recoveries, usage = [], [], [], [], []
+    stages, phrasings, vote_replays, recoveries, usage, parsers = [], [], [], [], [], []
     for (experiment, dataset), report in sorted(reports.items()):
         gt = ground_truth[dataset]
         summary, extra = report["summary"], metrics(gt, report)
@@ -397,11 +412,11 @@ def compact_views(ground_truth, reports):
                                   for row in report.get("case_condition_breakdown", []))
         for source, target in (("stage_changes", stages), ("phrasing_votes", phrasings),
                                ("region_vote_comparison", vote_replays), ("parse_recovery", recoveries),
-                               ("call_usage", usage)):
+                               ("call_usage", usage), ("parser_usage", parsers)):
             target.extend({"dataset": dataset, "experiment": experiment, **row}
                           for row in report.get(source, []))
     return {"experiment_overview": overview, "finding_comparison": findings,
             "situation_comparison": situations, "situation_finding_comparison": situation_findings,
             "stage_comparison": stages, "phrasing_comparison": phrasings,
             "vote_replay_comparison": vote_replays, "parse_recovery_comparison": recoveries,
-            "call_usage_comparison": usage}
+            "call_usage_comparison": usage, "parser_usage_comparison": parsers}

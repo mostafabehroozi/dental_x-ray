@@ -252,6 +252,11 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9.]+", "-", text).strip("-").lower() or "model"
 
 
+def _reads_with_llm(parser) -> bool:
+    """True when a parser service is present and at least one of its stages calls a model."""
+    return parser is not None and parser.policy.uses_llm()
+
+
 class LLMAdapter:
     """Numbered boxes on the image -> units per box, from an OpenAI-compatible vision API.
 
@@ -267,7 +272,8 @@ class LLMAdapter:
                  max_output_tokens: int = 4096, temperature: float | None = None, max_boxes_per_call: int = 12,
                  max_side: int = 2048, corner_labels: bool = True, timeout: float = 600.0,
                  request_options: dict | None = None, parse_retries: int = 1, api_call_retries: int = 2,
-                 failure_policy: str = "geometry", call_log: str | None = None, client=None) -> None:
+                 failure_policy: str = "geometry", call_log: str | None = None, client=None,
+                 parser=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         llm_api.validate_parse_retries(parse_retries)
@@ -280,18 +286,20 @@ class LLMAdapter:
         self.max_boxes_per_call, self.max_side, self.corner_labels = max_boxes_per_call, max_side, corner_labels
         self.request_options = dict(request_options or {})
         self.parse_retries, self.api_call_retries, self.failure_policy = parse_retries, api_call_retries, failure_policy
+        # The reader for this adapter's own replies (llm_parser.ParserService); None reads with code.
+        self.parser = parser
         self.call_log = mon.CallLog("location", call_log)
 
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "max_boxes_per_call", "max_side",
                "corner_labels", "request_options", "parse_retries", "api_call_retries", "failure_policy")
 
     @classmethod
-    def from_api(cls, spec: dict, timeout: float = 600.0, client=None) -> "LLMAdapter":
+    def from_api(cls, spec: dict, timeout: float = 600.0, client=None, parser=None) -> "LLMAdapter":
         """Adapter for a hosted model. spec = {"provider", "model", ...} as documented in llm_api,
         plus any of the constructor options named in OPTIONS."""
         base_url, api_key = llm_api.resolve(spec)
         options = {k: spec[k] for k in cls.OPTIONS if k in spec}
-        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
+        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, parser=parser, **options)
 
     @property
     def calls(self) -> int:
@@ -308,7 +316,8 @@ class LLMAdapter:
                 "corner_labels": self.corner_labels, "request_options": self.request_options,
                 "parse_retries": self.parse_retries, "api_call_retries": self.api_call_retries,
                 "failure_policy": self.failure_policy,
-                "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT}
+                "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT,
+                **({"parser": self.parser.settings()} if _reads_with_llm(self.parser) else {})}
 
     def _ask(self, jpeg: bytes, text: str) -> dict:
         request = {
@@ -329,6 +338,24 @@ class LLMAdapter:
             self.api_call_retries, f"location model={self.model}")
         return self.call_log.live({**normalized, "latency_seconds": round(time.perf_counter() - started, 3)})
 
+    def _read(self, reply: dict, n_boxes: int, image: str):
+        """The adapter's reply as {box id: units/teeth}: the schema check, and the parser when allowed.
+
+        The parser is given the reply, how many boxes were asked about and the valid unit names.
+        It is never given the boxes' ground-truth conditions or coordinates, so it cannot infer the
+        answer from the truth it is translating.
+        """
+        def code():
+            return parse_units_checked(reply["text"], n_boxes)
+
+        if self.parser is None:
+            parsed, error = code()
+            return parsed, error, None
+        outcome = self.parser.location_json(reply["text"], n_boxes, code=code,
+                                            truncated=bool(reply.get("truncated")),
+                                            context=f"image={image}")
+        return (outcome.value or {}), outcome.error, outcome.record
+
     def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
               drawn_dir: str | Path | None = None) -> list[dict]:
         """One record per box: regions (cells) from the units, or regions=None when the reply lacked the box."""
@@ -343,11 +370,13 @@ class LLMAdapter:
                 Path(drawn_dir, f"{image_id}{part}.jpg").write_bytes(jpeg)
             lines = [f"{i + 1}. {dp.LABELS[box['condition']]} - {pixel}" for i, (box, pixel) in enumerate(zip(chunk, pixels))]
             prompt = USER_PROMPT.format(width=width, height=height, box_lines="\n".join(lines))
-            parsed, reply, attempts = {}, {"text": ""}, []
+            parsed, reply, attempts, parsing = {}, {"text": ""}, [], []
             for attempt in range(self.parse_retries + 1):
                 reply = self._ask(jpeg, prompt)
-                parsed, error = parse_units_checked(reply["text"], len(chunk))
-                attempts.append({**reply, "error": error})
+                parsed, error, record = self._read(reply, len(chunk), image_id or Path(image_path).name)
+                attempts.append({**reply, "error": error, **({"parsing": record} if record else {})})
+                if record:
+                    parsing.append(record)
                 if not error:
                     if attempt:
                         llm_api.monitor("LOCATION PARSE RECOVERED", f"image={image_id or Path(image_path).name}",
@@ -365,6 +394,8 @@ class LLMAdapter:
                 entry = parsed.get(i + 1)
                 row = rows[start + i]
                 row["raw"], row["attempts"] = reply["text"], attempts
+                if parsing:
+                    row["parsing"] = parsing
                 if entry and entry["units"]:
                     row.update(regions=dp.units_to_cells(entry["units"]), units=entry["units"], teeth=entry["teeth"],
                                source="llm")
@@ -392,13 +423,34 @@ class FdmAdapter:
     kind = "fdm"
 
     def __init__(self, runner, margin: float = 0.06, parse_retries: int = 0,
-                 failure_policy: str = "geometry") -> None:
+                 failure_policy: str = "geometry", parser=None) -> None:
         llm_api.validate_parse_retries(parse_retries)
         if failure_policy not in ("geometry", "exclude", "error"):
             raise ValueError("failure_policy must be 'geometry', 'exclude', or 'error'")
         self.runner, self.margin = runner, margin
         self.parse_retries, self.failure_policy = parse_retries, failure_policy
+        self.parser = parser
         self.calls = 0
+
+    def _read(self, reply: dict, question: str, context: str):
+        """The decision and the location of one spotlight reply, each through its own parser stage.
+
+        A location is only read when the reply reported the finding: a "No" places no box, so its
+        words are never turned into a region. An unresolved location stays unresolved and the box
+        falls back to the fixed windows, exactly as an unreadable descriptor always has.
+        """
+        if self.parser is None:
+            return dp.extract_answer(reply["text"]), dp.extract_regions(reply["text"]), None
+        records = []
+        decision = self.parser.decision("spotlight_decision", reply["text"], question,
+                                        truncated=bool(reply.get("truncated")), context=context)
+        records.append(decision.record)
+        if decision.value != "yes":
+            return decision.value, [], records
+        located = self.parser.location("spotlight_location", reply["text"], question=question,
+                                       truncated=bool(reply.get("truncated")), context=context)
+        records.append(located.record)
+        return decision.value, list(located.value or []), records
 
     @property
     def name(self) -> str:
@@ -408,7 +460,8 @@ class FdmAdapter:
         return {"kind": self.kind, "method": "spotlight", "margin": self.margin,
                 "parse_retries": self.parse_retries, "failure_policy": self.failure_policy,
                 "runner": self.runner.settings(),
-                "questions": {task: dp.questions_for(task)[0] for task in dp.TASKS}}
+                "questions": {task: dp.questions_for(task)[0] for task in dp.TASKS},
+                **({"parser": self.parser.settings()} if _reads_with_llm(self.parser) else {})}
 
     def adapt(self, image_path: str | Path, boxes: list[dict], image_id: str | None = None,
               drawn_dir: str | Path | None = None) -> list[dict]:
@@ -430,9 +483,11 @@ class FdmAdapter:
                         effective = question if attempt == 0 else question + "\n\nStart with exactly Yes or No, then state the location."
                         reply = self.runner.ask(png, effective)
                         self.calls += 1
-                        answer, cells = dp.extract_answer(reply["text"]), dp.extract_regions(reply["text"])
-                        error = "missing_or_ambiguous_decision" if answer is None else "missing_location" if answer == "yes" and not cells else None
-                        row["attempts"].append({"task": task, "question": effective, **reply, "error": error})
+                        answer, cells, records = self._read(reply, effective, f"{image_id} box={index + 1}")
+                        error = ("missing_or_ambiguous_decision" if answer is None
+                                 else "missing_location" if answer == "yes" and not cells else None)
+                        row["attempts"].append({"task": task, "question": effective, **reply, "error": error,
+                                                **({"parsing": records} if records else {})})
                         replies.append(f"[{task}] {reply['text']}")
                         if not error:
                             if attempt:
@@ -481,6 +536,8 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
         manifest_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     todo = sorted(gt.items())
+    parser = getattr(adapter, "parser", None)
+    usage_at_start = parser.usage_snapshot() if parser is not None else None
     failures = mon.Ledger(f"location {out.name}")
     progress = mon.Progress(len(todo), label=f"location truth {out.name}", unit="image")
     for image_id, entry in todo:
@@ -503,6 +560,12 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
                     record["regions"], record["source"] = geometry, "geometry"
                 records.append(record)
             payload = {"image_id": image_id, "image": entry["path"], "adapter": adapter.name, "boxes": records}
+            parser = getattr(adapter, "parser", None)
+            if parser is not None:
+                payload["parser"] = parser.public()
+                payload["parser_fingerprint"] = parser.fingerprint()
+                payload["parser_usage"] = parser.usage_since(usage_at_start)
+                usage_at_start = parser.usage_snapshot()
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
             tmp.replace(target)
@@ -518,7 +581,10 @@ def adapt_dataset(adapter, gt: dict[str, dict], out_dir: str | Path, resume: boo
                                             if sources else "")
         progress.item(image_id, detail, fallbacks=sum(bool(r.get("fallback_reason")) for r in records) or None)
     log = getattr(adapter, "call_log", None)
-    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    detail = log.line(counts=False) if isinstance(log, mon.CallLog) else ""
+    if parser is not None and parser.model is not None and parser.model.call_log.requests:
+        detail = (detail + " | " if detail else "") + f"parser {parser.model.call_log.line()}"
+    progress.done(detail=detail)
     if failures:
         failures.report(path=out / "failures.json")
         if ledger is not None:

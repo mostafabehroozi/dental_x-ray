@@ -167,10 +167,11 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `llama_runtime.py` | llama.cpp build, one-time GGUF conversion of the Hugging Face checkpoint, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image (tasks, cells, multiplicity, extra tasks, not-assessed findings), report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment |
-| `llm_api.py` | hosted-model access shared by the runner, the adapter and the report writer: provider registry, key lookup (environment variable or Kaggle secret), client construction, visible API and parse retries |
+| `llm_api.py` | hosted-model access shared by the runner, the adapter, the report writer and the parser: provider registry, key lookup (environment variable or Kaggle secret), client construction, visible API and parse retries |
+| `llm_parser.py` | reading what the models wrote: the strict readers, the optional parser LLM behind them, one mode per stage plus a global override, the prompts, and the record of every parse |
 | `run_monitor.py` | the console and failure side of a run: dense per-item progress with ETA, call counters with a print policy, the failure ledger and the guard that keeps a loop alive |
 | `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 11 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_experiments.py`, `test_response_cache.py`, `test_run_monitor.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_llm_parser.py`, `test_experiments.py`, `test_response_cache.py`, `test_run_monitor.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Small evaluation comparisons (Cells 11 and 12)
 
@@ -278,12 +279,12 @@ are separate tasks). Optional knobs in `dental_pipeline.Protocol`:
 Cell 3 has one `PROVIDERS` registry containing each provider's base URL and API
 key. The keys come from environment variables or Kaggle Secrets (Add-ons >
 Secrets), and unused providers may have no key. The small `analyzer`,
-`adapter` and `reporter` role dictionaries of an experiment then select any provider and exact model, e.g.
+`adapter`, `reporter` and `parser` role dictionaries of an experiment then select any provider and exact model, e.g.
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
 routing under `request_options` stay with the role. `VisionRunner.from_api`,
-`LLMAdapter.from_api` and `ReportWriter.from_api` build the clients; run manifests
-record the public role configuration, never the provider key. Transport
+`LLMAdapter.from_api`, `ReportWriter.from_api` and `ParserModel.from_api` build the
+clients; run manifests record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once.
 
@@ -369,6 +370,82 @@ manifest that hashes the writer settings, the prompts and the language.
 or fell back. Reports are for reading and are not scored: Cell 11 stays the
 measure of the analyzer. The language is not verified; read one report before
 trusting a batch.
+
+## Reading what the models wrote
+
+Every number this project produces comes from reading text a model wrote. The
+readers are strict: `\byes\b` / `\bno\b` on line 1, the nine location
+descriptors matched verbatim, `json.loads` on the adapter's boxes and on the
+report, `(\d+)/(\d+)` for a quoted vote. Strict readers fail in two directions.
+They reject a reply a dentist would understand at once ("Caries is evident in
+the lower left quadrant" names no descriptor, so the scorer sees no region at
+all), and they accept text whose meaning is not the matched string (a rationale
+that names a region only to rule it out).
+
+`llm_parser.py` puts a second reader behind them: a text LLM (the `parser` role)
+whose only job is to say what an existing reply means. It never sees a
+radiograph, never sees ground truth, and never decides anything clinical.
+
+**Ten stages, each with its own mode.**
+
+| stage | default in manual mode | why |
+| --- | --- | --- |
+| `whole_image_decision` | `code_then_llm` | line 1 is reliable when it reads at all |
+| `region_decision` | `code_then_llm` | the same reader on the same replies |
+| `rationale_location` | `llm` | a paraphrase looks to the strict reader exactly like "no region named" |
+| `saved_answer_reconstruction` | `code_then_llm` | only the replies the run could not read are re-read |
+| `spotlight_decision` | `code_then_llm` | the same line-1 reader |
+| `spotlight_location` | `llm` | a missed descriptor silently moves a box to the fixed windows |
+| `location_json` | `code_then_llm` | valid JSON that passes the schema check is exactly right |
+| `report_json` | `code_then_llm` | a reply that loads is the report; the model repairs the rest |
+| `report_fidelity` | `llm` | a report can pass every structural check and still say more than the data does |
+| `vote_fraction` | `code_then_llm` | "2/3" reads exactly; "2 out of 3" is an explicit failure the model can read |
+
+`"code_then_llm"` is the default wherever the strict reader is right whenever it
+succeeds, so a model is only paid for after an explicit failure: an ambiguous or
+missing decision, invalid or incomplete JSON, a schema mismatch, a missing entry,
+truncation. `"llm"` is the default wherever the strict reader can succeed while
+losing the meaning, because consulting it first would hide the very thing the
+second reader is there to catch.
+
+**One switch over all ten.** `parser_mode` in Cell 3:
+
+| value | effect |
+| --- | --- |
+| `"code"` | strict readers only. The shipped default: no parser key, no extra call, and byte-identical decisions to every run made before this existed |
+| `"llm"` | the parser model reads every stage |
+| `"code_then_llm"` | the strict reader everywhere, the model only after a real failure |
+| `None` | manual: every stage follows its own mode in `parser_modes` |
+
+The global setting overrides every stage whenever it is not `None`. The resolved
+modes are printed with the experiment table, saved in `experiment.json`, and
+hashed into the run manifest, so resuming a directory with a different parser
+model, prompt or mode is refused rather than filling one result set with two
+readings of the same replies. Reconstructing a saved answer is guarded the same
+way: an accepted value is never read again, and a replay whose parser
+configuration does not match the run's reads with code alone and says so.
+
+**Nothing unreadable becomes a finding.** When both readers fail, the result is
+the unresolved state the strict reader would have left: an unreadable decision
+stays unresolved (never "No"), an unreadable location stays unresolved (never
+the empty set, which would claim the model named no region), and an unresolved
+fidelity check adds no problem and hides none. The evaluation already counts an
+unresolved location as `region_unparseable` and excludes it; the report says
+"the location could not be read" rather than listing six regions as not named.
+
+**What is not routed through a model.** OpenAI response envelopes, YOLO and
+DENTEX annotations, run manifests, response-cache artifacts, configuration
+dictionaries and saved-artifact integrity checks. Those are machine formats with
+one correct reading, and a model could only make them less reliable.
+
+**What is recorded.** Per parse: the original text, the parser's input and reply,
+the parsed value, the selected and the resolved mode, whether the strict reader
+succeeded or caused the fallback, the model, latency, tokens, retries, cache
+status and the final failure reason. Parser calls are counted under their own
+role (`CallLog("parser")`), never mixed into the analyzer, adapter or reporter
+totals, and Cells 11 and 12 show one row per stage: how often each reader
+answered, how often it fell back, and what stayed unresolved. Identical parser
+requests are reused from `<output_root>/_parser_cache`.
 
 ## Datasets
 

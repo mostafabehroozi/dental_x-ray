@@ -66,6 +66,8 @@ PATHOLOGY = ("carious_lesion", "periapical_lesion", "periodontal_bone_loss", "ca
              "impacted_tooth", "insufficient_eruption_space", "root_fragment", "residual_crown", "root_resorption")
 TREATMENT = tuple(c for c in IDENTIFIERS if c not in PATHOLOGY)
 
+# The top-level keys of the report object, in reading order; the verification requires every one.
+REPORT_KEYS = ("title", "headings", "sections", "impression", "not_assessable", "limitations")
 STATUSES = ("present", "absent", "unparseable", "not_assessed")
 GLYPHS = {"present": "●", "absent": "○", "unparseable": "?", "not_assessed": "–"}
 
@@ -95,6 +97,8 @@ LIMITATIONS = (
 )
 RATIONALE_LIMITATION = ("Locations are the regions the model named in its rationale: a region it did not name is not "
                         "evidence of absence there, and the number of regions is a lower bound on the number of occurrences.")
+UNRESOLVED_LOCATION = ("the finding is present but the location in the model's rationale could not be read at all; this "
+                       "is not evidence about any region, and no region may be reported for this finding")
 
 
 # ----------------------------------------------------------------------------
@@ -428,6 +432,11 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
                 region_map[patient_cell(cell, flag)] = "absent"
             else:
                 region_map[patient_cell(cell, flag)] = "unparseable"
+    elif status == "present" and regions is None:
+        # Present, but the reader could not say where. "not_named" would claim the model named no
+        # region, which is a different and stronger statement than "we could not read it".
+        region_source = "rationale"
+        region_map = {patient_cell(c, flag): "unresolved" for c in cells}
     else:
         region_source = "rationale"
         named = set(regions or []) if status == "present" else set()
@@ -441,7 +450,8 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
     elif located_in:
         location_status = "located"
     elif region_source == "rationale":
-        location_status = "not_stated: the model's rationale named no region"
+        location_status = ("unresolved: the location in the model's rationale could not be read"
+                           if regions is None else "not_stated: the model's rationale named no region")
     elif "unparseable" in region_map.values():
         location_status = "unresolved: a cell answer was unparseable"
     else:
@@ -463,7 +473,7 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
 
 
 def structured_findings(result: dict, analyzer: str | None = None, include_rationale: bool = False,
-                       vote_agreement: bool = False) -> dict:
+                       vote_agreement: bool = False, parser=None) -> dict:
     """One dense JSON for the report model: every finding, task and cell with an explicit status.
 
     vote_agreement adds one "agreement" block per finding and per task, and its legend; with it off
@@ -471,7 +481,9 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
     """
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
-    cell_answers = dp.cell_answers(result) if level == "regions" else {}  # the evaluator reads the same answers
+    # The evaluator reads the same answers, through the same reader, so the report and the score can
+    # never disagree about what a region call said.
+    cell_answers = dp.cell_answers(result, parser) if level == "regions" else {}
     findings = [_entry(i, result, cell_answers, flag, include_rationale, vote_agreement) for i in IDENTIFIERS]
     status = {f["finding"]: f["status"] for f in findings}
     order = PATHOLOGY + TREATMENT
@@ -484,6 +496,8 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
         limitations.append(AGREEMENT_LIMITATION)
     region_legend = (LEGEND["regions (location from region questions)"] if level == "regions"
                      else LEGEND["regions (location from the rationale)"])
+    if any("unresolved" in f["regions"].values() for f in findings):
+        region_legend = {**region_legend, "unresolved": UNRESOLVED_LOCATION}
     phrasings = int(result["protocol"].get("phrasings", 1) or 1)
     agreement = {"wordings_per_task": phrasings, "measured": phrasings > 1,
                  "region_vote_policy": result["protocol"].get("region_vote", "union"),
@@ -634,6 +648,8 @@ def extract_json(text: str) -> dict | None:
 
 _DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 _FRACTION = re.compile(r"(\d+)\s*/\s*(\d+)")
+_ODD_SLASH = re.compile(r"\d\s*[\u2044\u2215\uff0f]\s*\d")
+_SPELLED_PAIR = re.compile(r"(\d+)([^\d]{1,12}?)(\d+)")
 
 
 def quoted_votes(text: str, limit: int) -> set[tuple[int, int]]:
@@ -643,6 +659,51 @@ def quoted_votes(text: str, limit: int) -> set[tuple[int, int]]:
     left alone rather than turned into a false failure.
     """
     return {(int(v), int(n)) for v, n in _FRACTION.findall(str(text).translate(_DIGITS)) if 1 <= int(n) <= limit}
+
+
+def quoted_votes_checked(text: str, limit: int) -> tuple[set[tuple[int, int]], str | None]:
+    """The counts this reader can read, plus an explicit failure when a vote claim is out of its reach.
+
+    The strict reader only understands "<votes>/<out_of>". A report is written in the dentist's
+    language, so the same vote can arrive as "2 out of 3" or with a fraction slash this reader does
+    not know. Those are the cases where it cannot say it read the sentence, so it says so instead:
+    two numbers that could be a vote separated by words rather than a slash, or a fraction written
+    with a slash character it does not accept. Anything else - tooth numbers, dates, list positions -
+    is left alone rather than turned into a failure.
+
+    A vote written entirely in words ("two of the three wordings") carries no digits and is
+    therefore invisible to any code reader, this one included. That is the case the "llm" mode of
+    this stage exists for: it reads every statement rather than waiting to be told it failed.
+    """
+    votes = quoted_votes(text, limit)
+    if limit < 1:
+        return votes, None
+    flat = str(text).translate(_DIGITS)
+    if _ODD_SLASH.search(flat):
+        return votes, "unreadable_vote_claim"
+    for left, gap, right in _SPELLED_PAIR.findall(flat):
+        if "/" in gap or not any(character.isalpha() for character in gap):
+            continue  # a strict fraction this reader already has, or two plain numbers in a list
+        if 1 <= int(right) <= limit and int(left) <= int(right):
+            return votes, "unreadable_vote_claim"
+    return votes, None
+
+
+def read_report_json(text: str, parser=None, *, context: str = ""):
+    """The report object in a reply, and the parser record behind it.
+
+    The strict loader is the reader; a parser service may repair a reply it rejects, and may never
+    write a value the reply does not contain (its prompt forbids it, and a repair that returns
+    nothing usable leaves the report missing, which the verification then reports).
+    """
+    def code():
+        payload = extract_json(text)
+        return payload, None if payload is not None else "invalid_report_json"
+
+    if parser is None or not parser.enabled("report_json"):
+        return code()[0], None
+    outcome = parser.report_json(text, code=code, keys=REPORT_KEYS, context=context)
+    return outcome.value, outcome.record
 
 
 def entry_votes(entry: dict) -> set[tuple[int, int]]:
@@ -662,16 +723,29 @@ def _strings(value, minimum: int = 0, maximum: int | None = None) -> bool:
             and len(value) >= minimum and (maximum is None or len(value) <= maximum))
 
 
-def verify_report(report: dict | None, structured: dict) -> list[str]:
+def verify_report(report: dict | None, structured: dict, parser=None) -> list[str]:
     """Problems with a reply, empty when it is a faithful report of the structured findings."""
+    return verify_report_detailed(report, structured, parser)[0]
+
+
+def verify_report_detailed(report: dict | None, structured: dict, parser=None,
+                           *, context: str = "") -> tuple[list[str], list[dict]]:
+    """(problems, the parser records behind them).
+
+    Every structural check below is code and stays code: they count findings, compare statuses and
+    categories, and read quoted vote fractions, all of which have one correct answer. A parser
+    service adds two readings that code cannot do: a vote claim written in words rather than as a
+    fraction, and the semantic fidelity check. A reading that stays unresolved is recorded as
+    unresolved - it never invents a problem and never silences one the structural checks found.
+    """
     if not isinstance(report, dict):
-        return ["the reply is not a JSON object"]
-    problems = []
-    for key in ("title", "headings", "sections", "impression", "not_assessable", "limitations"):
+        return ["the reply is not a JSON object"], []
+    problems, records = [], []
+    for key in REPORT_KEYS:
         if key not in report:
             problems.append(f"missing key {key!r}")
     if problems:
-        return problems
+        return problems, records
     if not isinstance(report["title"], str) or not report["title"].strip():
         problems.append("'title' must be a non-empty string")
     headings = report["headings"]
@@ -685,6 +759,15 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
     limit = max(1, int(agreement["wordings_per_task"])) if agreement else 0
     votes = {c: entry_votes(f) for c, f in expected.items()} if limit else {}
     seen: dict[str, int] = {}
+
+    def quoted(text: str, where: str) -> set[tuple[int, int]] | None:
+        """The counts one sentence quotes, or None when neither reader could read its vote claim."""
+        if parser is None or not parser.enabled("vote_fraction"):
+            return quoted_votes(text, limit)
+        outcome = parser.vote_fraction(text, limit, code=lambda: quoted_votes_checked(text, limit),
+                                       context=f"{context} | {where}".strip(" |"))
+        records.append(outcome.record)
+        return set(outcome.value or ()) if outcome.resolved else None
     if not isinstance(report["sections"], list):
         problems.append("'sections' must be a list")
     else:
@@ -707,7 +790,8 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
                 if not isinstance(entry.get("statement"), str) or not entry["statement"].strip():
                     problems.append(f"{finding}: 'statement' must be a non-empty string")
                 elif limit:
-                    invented = quoted_votes(entry["statement"], limit) - votes[finding]
+                    quotes = quoted(entry["statement"], f"finding={finding}")
+                    invented = (quotes - votes[finding]) if quotes is not None else set()
                     if invented:
                         problems.append(f"{finding}: the statement quotes vote counts the data does not hold: "
                                         + ", ".join(f"{a}/{b}" for a, b in sorted(invented))
@@ -734,11 +818,22 @@ def verify_report(report: dict | None, structured: dict) -> list[str]:
         for key in ("impression", "not_assessable", "limitations"):
             if not _strings(report[key]):
                 continue
-            invented = set().union(*(quoted_votes(t, limit) for t in report[key])) - known if report[key] else set()
+            read = [quoted(text, key) for text in report[key]]
+            invented = set().union(*(q for q in read if q is not None)) - known if read else set()
             if invented:
                 problems.append(f"{key}: quotes vote counts the data does not hold: "
                                 + ", ".join(f"{a}/{b}" for a, b in sorted(invented)))
-    return problems
+    # Meaning, once the structure holds: a report can pass every count above and still say something
+    # the data does not support. The check only ever adds what it can point to; unresolved adds nothing.
+    if parser is not None and parser.enabled("report_fidelity"):
+        outcome = parser.report_fidelity(report, structured, context=context)
+        records.append(outcome.record)
+        if outcome.resolved and not outcome.value["faithful"]:
+            problems.extend(outcome.value["problems"])
+        elif not outcome.resolved:
+            llm_api.monitor("REPORT FIDELITY UNRESOLVED", context or "report",
+                            reason=outcome.error, policy="structural verdict stands")
+    return problems, records
 
 
 # ----------------------------------------------------------------------------
@@ -836,7 +931,7 @@ class ReportWriter:
                  max_output_tokens: int = 4096, temperature: float | None = 0.0, language: str = "English",
                  repairs: int = 1, include_rationale: bool = False, vote_agreement: bool = False,
                  timeout: float = 600.0, request_options: dict | None = None, api_call_retries: int = 2,
-                 call_log: str | None = None, client=None) -> None:
+                 call_log: str | None = None, client=None, parser=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         if not isinstance(language, str) or not language.strip():
@@ -850,17 +945,20 @@ class ReportWriter:
         self._noted_single_wording = False
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
+        # The reader for this writer's own replies (llm_parser.ParserService); None reads with code.
+        self.parser = parser
         self.call_log = mon.CallLog("report", call_log)
 
     @classmethod
-    def from_api(cls, spec: dict, language: str | None = None, timeout: float = 600.0, client=None) -> "ReportWriter":
+    def from_api(cls, spec: dict, language: str | None = None, timeout: float = 600.0, client=None,
+                 parser=None) -> "ReportWriter":
         """Writer for a hosted model. spec = {"provider", "model", ...} as documented in llm_api, plus any
         of the constructor options named in OPTIONS; a language argument wins over the spec's."""
         base_url, api_key = llm_api.resolve(spec)
         options = {k: spec[k] for k in cls.OPTIONS if k in spec}
         if language is not None:
             options["language"] = language
-        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, **options)
+        return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, parser=parser, **options)
 
     @property
     def calls(self) -> int:
@@ -885,7 +983,9 @@ class ReportWriter:
                 "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT, "output_schema": OUTPUT_SCHEMA,
                 "repair_prompt": REPAIR_PROMPT,
                 **({"agreement_prompt": [AGREEMENT_DATA, AGREEMENT_RULE], "agreement_bands": AGREEMENT_BANDS}
-                   if self.vote_agreement else {})}
+                   if self.vote_agreement else {}),
+                **({"parser": self.parser.settings()}
+                   if self.parser is not None and self.parser.policy.uses_llm() else {})}
 
     def public(self) -> dict:
         """The settings without the prompt texts, for printouts."""
@@ -905,21 +1005,26 @@ class ReportWriter:
 
     def write(self, result: dict, analyzer: str | None = None) -> dict:
         """One image result -> {"structured", "report", "verified", "problems", "markdown", "attempts", ...}."""
-        structured = structured_findings(result, analyzer, self.include_rationale, self.vote_agreement)
+        usage_at_start = self.parser.usage_snapshot() if self.parser is not None else None
+        structured = structured_findings(result, analyzer, self.include_rationale, self.vote_agreement,
+                                         self.parser)
         if self.vote_agreement and not structured["analysis"]["vote_agreement"]["measured"] and not self._noted_single_wording:
             self._noted_single_wording = True
             llm_api.monitor("REPORT NOTE", "vote_agreement is on but this run asked one wording per task",
                             action="every finding will say agreement was not measured")
         prompt = user_prompt(structured, self.language)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-        attempts, report, problems = [], None, ["no reply"]
+        attempts, report, problems, parsing = [], None, ["no reply"], []
+        context = f"image={structured['image']['id']}"
         for _attempt in range(1 + self.repairs):
             reply = self._ask(messages)
-            report = extract_json(reply["text"])
-            problems = verify_report(report, structured)
+            report, extraction = read_report_json(reply["text"], self.parser, context=context)
+            problems, checks = verify_report_detailed(report, structured, self.parser, context=context)
             if reply["truncated"] and problems:
                 problems.append("the reply was cut off by max_output_tokens")
-            attempts.append({**reply, "problems": problems})
+            records = ([extraction] if extraction else []) + checks
+            parsing.append(records)
+            attempts.append({**reply, "problems": problems, **({"parsing": records} if records else {})})
             if not problems:
                 break
             llm_api.monitor("REPORT VERIFY WARNING", f"image={structured['image']['id']}",
@@ -939,6 +1044,10 @@ class ReportWriter:
             "report": report if verified else None, "verified": verified, "problems": problems,
             "markdown": render_markdown(report, structured, self.model) if verified else fallback_markdown(result, problems),
             "attempts": attempts,
+            **({"parser": self.parser.public(), "parser_fingerprint": self.parser.fingerprint(),
+                "parser_usage": self.parser.usage_since(usage_at_start),
+                "parsing": [row for rows in parsing for row in rows]}
+               if self.parser is not None else {}),
         }
 
 
@@ -994,7 +1103,11 @@ def report_dataset(writer: ReportWriter, results: dict[str, dict], out_dir: str 
         progress.item(image_id, detail, repairs=len(payload["attempts"]) - 1 or None,
                       fallback=0 if payload["verified"] else 1)
     log = getattr(writer, "call_log", None)
-    progress.done(detail=log.line(counts=False) if isinstance(log, mon.CallLog) else "")
+    parser_log = getattr(getattr(writer, "parser", None), "model", None)
+    detail = log.line(counts=False) if isinstance(log, mon.CallLog) else ""
+    if parser_log is not None and parser_log.call_log.requests:
+        detail = (detail + " | " if detail else "") + f"parser {parser_log.call_log.line()}"
+    progress.done(detail=detail)
     if failures:
         failures.report(path=out / "failures.json")
         if ledger is not None:
@@ -1030,7 +1143,13 @@ def summarize_reports(reports: dict[str, dict]) -> dict:
     """How many reports verified at once, after a repair, or fell back to the deterministic summary."""
     verified = [r for r in reports.values() if r["verified"]]
     tokens = [a["completion_tokens"] for r in reports.values() for a in r["attempts"] if a.get("completion_tokens")]
+    parsed: dict[str, int] = {}
+    for report in reports.values():
+        for stage, row in (report.get("parser_usage") or {}).items():
+            for key, value in row.items():
+                parsed[key] = parsed.get(key, 0) + value
     return {"images": len(reports), "verified": len(verified),
             "repaired": sum(len(r["attempts"]) > 1 for r in verified),
             "fallback": len(reports) - len(verified),
-            "mean_completion_tokens": round(sum(tokens) / len(tokens)) if tokens else None}
+            "mean_completion_tokens": round(sum(tokens) / len(tokens)) if tokens else None,
+            **({"parser": parsed} if parsed else {})}

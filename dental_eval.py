@@ -282,7 +282,7 @@ def truth_agreement(gt: dict[str, dict], adapted: dict[str, dict]) -> dict:
 # ----------------------------------------------------------------------------
 # Reading saved results
 # ----------------------------------------------------------------------------
-def predicted_cells(result: dict, condition: str) -> dict[str, bool | None] | None:
+def predicted_cells(result: dict, condition: str, parser=None) -> dict[str, bool | None] | None:
     """{cell: True | False | None (unparseable)} for one finding, or None when no location was asked, the
     finding was not asked, or (rationale) its whole-image answer was unparseable.
 
@@ -296,7 +296,7 @@ def predicted_cells(result: dict, condition: str) -> dict[str, bool | None] | No
     if not finding["asked"] or level == "none":
         return None
     if level == "regions":
-        answers, tasks = cell_answers(result), finding.get("tasks") or []
+        answers, tasks = cell_answers(result, parser), finding.get("tasks") or []
         if tasks and all(task in answers for task in tasks):
             cells = {}
             for cell in CELLS:
@@ -304,6 +304,11 @@ def predicted_cells(result: dict, condition: str) -> dict[str, bool | None] | No
                 cells[cell] = True if "yes" in votes else False if all(v == "no" for v in votes) else None
             return cells
     if finding["presence"] is None:
+        return None
+    # Present, but the location itself could not be read (only an LLM parser produces this): that is
+    # unresolved, not "the model named no cell", so the image is excluded rather than scored as six
+    # negatives. Runs read with code alone never reach this.
+    if finding["presence"] == "yes" and finding["regions"] is None:
         return None
     named = set(finding["regions"] or [])
     return {cell: cell in named for cell in CELLS}
@@ -585,11 +590,12 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     for name in RETIRED_TABLES:
         (out / f"{name}.csv").unlink(missing_ok=True)
     for name in ("presence", "whole_image", "region_presence", "regions", "per_image", "stage_changes",
-                 "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage",
+                 "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage", "parser_usage",
                  "case_breakdown", "case_condition_breakdown", "run_comparison", "run_changes",
                  "experiment_overview", "finding_comparison", "situation_comparison",
                  "situation_finding_comparison", "stage_comparison", "phrasing_comparison",
-                 "vote_replay_comparison", "parse_recovery_comparison", "call_usage_comparison"):
+                 "vote_replay_comparison", "parse_recovery_comparison", "call_usage_comparison",
+                 "parser_usage_comparison"):
         rows = report.get(name) or []
         if not rows:
             (out / f"{name}.csv").unlink(missing_ok=True)

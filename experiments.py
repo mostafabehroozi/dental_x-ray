@@ -27,6 +27,7 @@ from pathlib import Path
 
 import dental_pipeline as dp
 import llm_api
+import llm_parser as lp
 import location_adapter as la
 import report_writer as rw
 from response_cache import ResponseCache
@@ -79,6 +80,24 @@ DEFAULTS = {
                  "vote_agreement": False},
     "report_language": "English",
     "report_images": None,             # None = every image with a result; N = only the first N
+
+    # Parser: the model that reads what the other models wrote, when the strict readers cannot.
+    # "parser_mode" is the one switch over every stage: "code" reads with code only (this default
+    # is exactly the behaviour of every run written before the parser existed), "llm" reads every
+    # stage with the parser model, "code_then_llm" tries the strict reader first everywhere, and
+    # None hands each stage back to its own setting in "parser_modes" below.
+    "parser_mode": "code",
+    # Manual mode ("parser_mode": None): one mode per stage. The defaults are
+    # llm_parser.DEFAULT_MODES - "code_then_llm" where the strict reader is right whenever it
+    # succeeds, "llm" where it can succeed while losing the meaning (see llm_parser.STAGES for the
+    # reason behind each one). A dictionary knob merges key by key, so naming one stage here keeps
+    # the rest at their defaults.
+    "parser_modes": dict(lp.DEFAULT_MODES),
+    "parser": {"provider": "openai", "model": "gpt-5",
+               "token_param": "max_completion_tokens", "temperature": None,
+               "max_output_tokens": 2048},
+    "parser_parse_retries": 1,         # extra attempts when the parser's own reply is malformed
+    "reuse_parser_responses": True,    # exact shared cache under output_root for parser requests
 
     # Local DentVLM files and llama.cpp runtime (backend="local"). Where they are built, converted and
     # cached is a machine setting and stays in the notebook; these change what the model is and sees.
@@ -143,8 +162,16 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
         raise ValueError(f"{name}: smoke_images must be a non-negative integer")
     if cfg["report_images"] is not None and (type(cfg["report_images"]) is not int or cfg["report_images"] <= 0):
         raise ValueError(f"{name}: report_images must be None or a positive integer")
-    if type(cfg["reuse_local_responses"]) is not bool:
-        raise ValueError(f"{name}: reuse_local_responses must be True or False")
+    for knob in ("reuse_local_responses", "reuse_parser_responses"):
+        if type(cfg[knob]) is not bool:
+            raise ValueError(f"{name}: {knob} must be True or False")
+    llm_api.validate_parse_retries(cfg["parser_parse_retries"])
+    lp.validate_mode(cfg["parser_mode"], allow_none=True, where=f"{name}: parser_mode")
+    if not isinstance(cfg["parser_modes"], dict):
+        raise ValueError(f"{name}: parser_modes must be a dictionary of stage -> mode")
+    policy = lp.ParserPolicy(cfg["parser_mode"], cfg["parser_modes"])  # rejects unknown stages and modes
+    if policy.uses_llm():
+        _check_spec(cfg["parser"], "parser", name)
     if cfg["location_failure_policy"] not in ("geometry", "exclude", "error"):
         raise ValueError(f"{name}: location_failure_policy must be 'geometry', 'exclude' or 'error'")
     if cfg["backend"] == "api":
@@ -161,6 +188,8 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
     cfg["adapter"] = {"api_call_retries": cfg["api_call_retries"], "parse_retries": cfg["location_parse_retries"],
                       "failure_policy": cfg["location_failure_policy"], **cfg["adapter"]}
     cfg["reporter"] = {"api_call_retries": cfg["api_call_retries"], **cfg["reporter"]}
+    cfg["parser"] = {"api_call_retries": cfg["api_call_retries"],
+                     "parse_retries": cfg["parser_parse_retries"], **cfg["parser"]}
     return cfg
 
 
@@ -205,16 +234,25 @@ def provenance(cfg: dict, **extra) -> dict:
             "image_max_tokens": cfg["image_max_tokens"], "image_min_tokens": cfg["image_min_tokens"], **extra}
 
 
+ROLE_KEYS = ("analyzer", "adapter", "reporter", "parser")
+
+
 def public(cfg: dict) -> dict:
     """The configuration without any API key, for printing and for experiment.json."""
-    return {k: llm_api.public(v) if k in ("analyzer", "adapter", "reporter") else v for k, v in cfg.items()}
+    return {k: llm_api.public(v) if k in ROLE_KEYS else v for k, v in cfg.items()}
 
 
 def record(cfg: dict) -> Path:
-    """Save the resolved configuration next to the experiment's runs."""
+    """Save the resolved configuration next to the experiment's runs.
+
+    The parser modes are saved twice on purpose: as the knobs that were set, and as the modes those
+    knobs resolve to after the global override, because the second is what the run actually did.
+    """
     path = Path(cfg["output_root"], cfg["name"], "experiment.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(public(cfg), indent=1, default=str), encoding="utf-8")
+    saved = {**public(cfg),
+             "parser_resolved_modes": lp.ParserPolicy(cfg["parser_mode"], cfg["parser_modes"]).resolved()}
+    path.write_text(json.dumps(saved, indent=1, default=str), encoding="utf-8")
     return path
 
 
@@ -246,6 +284,14 @@ def truth_dir(cfg: dict, dataset: str) -> Path:
                "max_tokens": cfg["max_tokens"], "parse_retries": cfg["location_parse_retries"],
                "policy": cfg["location_failure_policy"]}
         name = "fdm-spotlight"
+    # How the adapter's replies are read is part of what the adapted truth is, so two experiments
+    # reading them differently get two directories instead of one they would refuse to share. The
+    # key is read from the configuration, never from a built service: naming a directory must not
+    # need an API key.
+    policy = lp.ParserPolicy(cfg["parser_mode"], cfg["parser_modes"])
+    reader = ({"policy": policy.settings(), "model": llm_api.public(cfg["parser"]),
+               "prompts": lp.PROMPT_VERSION} if policy.uses_llm() else None)
+    key = {"adapter": key, **({"parser": reader} if reader else {})}
     return Path(cfg["output_root"], "location_truth", dataset, f"{name}-{_digest(key)}")
 
 
@@ -288,27 +334,42 @@ def runner(cfg: dict, server=None) -> dp.VisionRunner:
                            response_cache=local_response_cache(cfg, server))
 
 
-def location_adapter(cfg: dict, runner=None):
+def parser(cfg: dict) -> lp.ParserService:
+    """The one reader of this experiment, shared by the analyzer run, the adapter and the reporter.
+
+    One service per experiment, so every parser call is counted once, its records sit next to the
+    text they read, and one fingerprint describes how the whole experiment read its replies.
+    """
+    root = Path(cfg["output_root"]) if cfg["reuse_parser_responses"] else None
+    return lp.build(cfg["parser"], cfg["parser_mode"], cfg["parser_modes"],
+                    timeout=cfg["request_timeout_seconds"], cache_root=root)
+
+
+def location_adapter(cfg: dict, runner=None, parser=None):
     """The location-truth adapter, or None when the fixed windows are used (or location is not scored)."""
     if not cfg["evaluate_location"] or cfg["location_truth"] == "geometry":
         return None
     if cfg["location_truth"] == "llm":
-        return la.LLMAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"])
+        return la.LLMAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"], parser=parser)
     return la.FdmAdapter(runner, margin=cfg["adapter_fdm_margin"], parse_retries=cfg["location_parse_retries"],
-                         failure_policy=cfg["location_failure_policy"])
+                         failure_policy=cfg["location_failure_policy"], parser=parser)
 
 
-def report_writer(cfg: dict) -> rw.ReportWriter:
+def report_writer(cfg: dict, parser=None) -> rw.ReportWriter:
     return rw.ReportWriter.from_api(cfg["reporter"], language=cfg["report_language"],
-                                    timeout=cfg["request_timeout_seconds"])
+                                    timeout=cfg["request_timeout_seconds"], parser=parser)
 
 
 # ----------------------------------------------------------------------------
 # Printing the table
 # ----------------------------------------------------------------------------
-def _cell(value) -> str:
+def _cell(value, knob: str | None = None) -> str:
     if isinstance(value, dict) and value.get("model"):
         return f"{value.get('provider', 'custom')}/{value['model']}"
+    if knob == "parser_mode" and value is None:
+        return "manual"  # None is manual mode, not "unset"; the stage table below spells it out
+    if isinstance(value, dict) and knob == "parser_modes":
+        return ", ".join(f"{k}={v}" for k, v in sorted(value.items()) if v != lp.DEFAULT_MODES.get(k)) or "defaults"
     return "-" if value is None else str(value)
 
 
@@ -317,10 +378,26 @@ def table(configs: list[dict]) -> list[dict]:
     varying = [k for k in DEFAULTS if len({_digest(public(c)[k]) for c in configs}) > 1]
     if not varying:
         varying = ["backend", "analyzer", "phrasings", "location", "ask_untrained"]
-    return [{"name": c["name"], **{k: _cell(public(c)[k]) for k in varying}} for c in configs]
+    return [{"name": c["name"], **{k: _cell(public(c)[k], k) for k in varying}} for c in configs]
 
 
-def show(configs: list[dict]) -> None:
+def parser_summary(cfg: dict) -> list[str]:
+    """How this experiment reads model text: the parser model, and the mode of every stage.
+
+    Printed with the table and saved in experiment.json, because a mode is as much a part of what a
+    run measured as the protocol is: the same replies read two ways are two different results.
+    """
+    policy = lp.ParserPolicy(cfg["parser_mode"], cfg["parser_modes"])
+    spec = llm_api.public(cfg["parser"])
+    head = (f"parser model: {spec.get('provider', 'custom')}/{spec.get('model')} "
+            f"(max_output_tokens={spec.get('max_output_tokens')}, temperature={spec.get('temperature')}, "
+            f"parse_retries={spec.get('parse_retries')}, api_call_retries={spec.get('api_call_retries')}, "
+            f"cache={cfg['reuse_parser_responses']})"
+            if policy.uses_llm() else "parser model: none (every stage reads with code)")
+    return [head] + policy.summary_lines()
+
+
+def show(configs: list[dict], parsers: bool = True) -> None:
     rows = table(configs)
     columns = list(rows[0])
     widths = {c: max(len(c), *(len(str(r[c])) for r in rows)) for c in columns}
@@ -329,3 +406,15 @@ def show(configs: list[dict]) -> None:
     print("  ".join(c.ljust(widths[c]) for c in columns))
     for row in rows:
         print("  ".join(str(row[c]).ljust(widths[c]) for c in columns))
+    if not parsers:
+        return
+    shown = set()
+    for cfg in configs:
+        lines = parser_summary(cfg)
+        key = "\n".join(lines)
+        if key in shown:  # identical for every experiment: print it once
+            continue
+        shown.add(key)
+        label = cfg["name"] if len(configs) > 1 else ""
+        print(f"\nhow model text is read{' (' + label + ' and every experiment like it)' if label else ''}:")
+        print("\n".join("  " + line for line in lines))
