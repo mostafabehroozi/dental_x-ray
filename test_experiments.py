@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import experiments as xp
 
@@ -93,6 +94,15 @@ class PathAndRoleTests(unittest.TestCase):
         self.assertEqual(xp.truth_dir(same, "d"), xp.truth_dir(other, "d"))
         self.assertNotEqual(xp.truth_dir(same, "d"), xp.truth_dir(changed, "d"))
         self.assertNotEqual(xp.truth_dir(same, "d"), xp.truth_dir(same, "other_dataset"))
+        # The two hosted methods share the adapter spec but never the directory or the adapter class.
+        areas, = xp.build([{"name": "areas", "location_truth": "areas",
+                            "adapter": {"base_url": "http://local/v1", "api_key": "k"}}], SHARED)
+        self.assertTrue(xp.truth_dir(areas, "d").name.startswith("areas-"))
+        self.assertNotEqual(xp.truth_dir(areas, "d").name, xp.truth_dir({**areas, "location_truth": "llm"}, "d").name)
+        with patch.object(xp.llm_api, "connect", return_value=object()):
+            self.assertEqual(xp.location_adapter(areas).kind, "areas")
+            self.assertEqual(xp.location_adapter({**areas, "location_truth": "llm"}).kind, "llm")
+            self.assertIsNone(xp.location_adapter({**areas, "location_truth": "geometry"}))
 
     def test_provenance_and_public_never_carry_the_key(self):
         api, local = xp.build([{"name": "api"}, {"name": "local", "backend": "local"}], SHARED)

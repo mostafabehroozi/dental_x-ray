@@ -33,7 +33,7 @@ import report_writer as rw
 from response_cache import ResponseCache
 
 BACKENDS = ("api", "local")
-LOCATION_TRUTHS = ("llm", "fdm", "geometry")
+LOCATION_TRUTHS = ("llm", "areas", "fdm", "geometry")
 QUESTION_FORMS = ("auto",) + dp.QUESTION_FORMS
 MODES = ("auto",) + dp.MODES
 
@@ -63,7 +63,9 @@ DEFAULTS = {
 
     # Location truth: how ground-truth boxes reach the region windows.
     "evaluate_location": True,
-    "location_truth": "llm",           # "llm" (ADAPTER spec) | "fdm" (local DentalGPT) | "geometry" (fixed windows)
+    "location_truth": "llm",           # "llm" (units per box) | "areas" (this image's quadrant areas, then geometry)
+                                       # | "fdm" (local DentalGPT) | "geometry" (fixed windows). "llm" and "areas"
+                                       # both use the ADAPTER spec below.
     "adapter": {"provider": "nvidia", "model": "google/gemma-4-31b-it",
                 "token_param": "max_completion_tokens", "temperature": None,
                 "max_output_tokens": 8192, "max_boxes_per_call": 12},
@@ -146,7 +148,7 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
         raise ValueError(f"{name}: location_failure_policy must be 'geometry', 'exclude' or 'error'")
     if cfg["backend"] == "api":
         _check_spec(cfg["analyzer"], "analyzer", name)
-    if cfg["evaluate_location"] and cfg["location_truth"] == "llm":
+    if cfg["evaluate_location"] and cfg["location_truth"] in ("llm", "areas"):
         _check_spec(cfg["adapter"], "adapter", name)
     _check_spec(cfg["reporter"], "reporter", name)
     protocol(cfg)  # the Protocol validates its own knobs
@@ -234,9 +236,10 @@ def truth_dir(cfg: dict, dataset: str, mode: str | None = None) -> Path:
     Keyed by the adapter configuration, not by the experiment, so every experiment using the same
     adapter reads the same translated boxes instead of paying for them again.
     """
-    if cfg["location_truth"] == "llm":
+    if cfg["location_truth"] in ("llm", "areas"):
         key = llm_api.public(cfg["adapter"])
-        name = "llm-" + re.sub(r"[^a-z0-9]+", "-", str(cfg["adapter"]["model"]).lower()).strip("-")
+        model = re.sub(r"[^a-z0-9]+", "-", str(cfg["adapter"]["model"]).lower()).strip("-")
+        name = f"{cfg['location_truth']}-{model}"
     else:
         key = {"model_file": cfg["model_filename"], "mode": mode or cfg["mode"], "max_tokens": cfg["max_tokens"],
                "parse_retries": cfg["location_parse_retries"], "policy": cfg["location_failure_policy"]}
@@ -288,6 +291,8 @@ def location_adapter(cfg: dict, runner=None, mode: str = "plain"):
         return None
     if cfg["location_truth"] == "llm":
         return la.LLMAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"])
+    if cfg["location_truth"] == "areas":
+        return la.AreaAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"])
     return la.FdmAdapter(runner, mode=mode, parse_retries=cfg["location_parse_retries"],
                          failure_policy=cfg["location_failure_policy"])
 

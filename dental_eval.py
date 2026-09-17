@@ -220,8 +220,9 @@ def straddling(box: dict, level: str) -> bool:
 def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, dict]:
     """Copy of gt whose boxes carry the adapter's quadrants as box['regions'] (+ 'region_source').
 
-    Units from the LLM adapter and geometry fallbacks are re-mapped here; quadrants named by the
-    local model itself (source "fdm") stay as saved.
+    Units from the LLM adapter and geometry fallbacks are re-mapped here; quadrants the area
+    adapter placed a box in ("areas") and quadrants named by the local model itself ("fdm") stay
+    as saved.
     """
     out = {}
     for image_id, entry in gt.items():
@@ -240,7 +241,7 @@ def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, di
                 continue
             if record["source"] == "llm" and record.get("units"):
                 box["regions"] = units_to_regions(record["units"])
-            elif record["source"] == "fdm":
+            elif record["source"] in ("fdm", "areas"):
                 box["regions"] = list(record["regions"])
             else:
                 box["regions"] = quadrants_to_regions(geometric_regions(box, "quadrant"))

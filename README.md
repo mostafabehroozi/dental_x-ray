@@ -252,7 +252,7 @@ directory.
 | `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI labels), location truth (adapted, FDI, or fixed windows), metrics incl. presence per region, per-region counts and the side check, CSV/JSON export |
 | `dental_analysis.py` | offline regional changes, parse recovery, case breakdowns, and paired saved-run comparisons |
 | `response_cache.py` | immutable, content-addressed reuse of exact local model responses across compatible experiments |
-| `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
+| `location_adapter.py` | translates ground-truth boxes into the region windows: vision-LLM adapter (numbered boxes drawn on the image), per-image area adapter (the quadrant areas of that radiograph, then geometry), experimental DentalGPT multiple-choice adapter, resumable per-dataset run |
 | `llama_runtime.py` | llama.cpp build, GGUF download, server process (with image-token flags) |
 | `report_writer.py` | dentist report: dense structured findings per image, report-writer prompts, verification of the reply against the input, one repair turn, Markdown rendering, resumable run |
 | `experiments.py` | the experiment table: DEFAULTS, merging and validation of each configuration, per-experiment paths, the runner/adapter/report-writer of one experiment, the probe decision |
@@ -289,7 +289,8 @@ Secrets), and unused providers may have no key. The small `analyzer`,
 `{"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"}`.
 Model-specific options such as `token_param`, `temperature`, and OpenRouter
 routing under `request_options` stay with the role. `VisionRunner.from_api`,
-`LLMAdapter.from_api` and `ReportWriter.from_api` build the clients; run manifests
+`LLMAdapter.from_api`, `AreaAdapter.from_api` and `ReportWriter.from_api` build the
+clients; run manifests
 record the public role configuration, never the provider key. Transport
 errors, rate limits and 5xx replies are retried by the client with backoff; a
 bad request or key fails at once. With the API backend `mode="auto"` resolves
@@ -385,6 +386,20 @@ shape of the arch. `location_truth` in Cell 3 picks how it is done:
   back, with bounded retries and the configured location failure policy. The model is the `adapter` role in Cell 3
   (see "Hosted models"); for reasoning models set `token_param` to
   `max_completion_tokens` and leave `temperature` at `None`.
+* `"areas"`: the same kind of hosted model, asked once per image about the
+  radiograph itself with nothing drawn on it: where do this patient's four
+  quadrants lie? It answers one normalized area `[x1, y1, x2, y2]` per quadrant,
+  accepted only as a complete valid set (every quadrant once, four numbers each,
+  inside `[0, 1]`, positive width and height), and ordinary geometry then places
+  the boxes: each one goes to the area covering the greatest fraction of it, or,
+  when no area touches it, to the nearest area. Equal scores fall to window
+  order, so the same box always lands in the same quadrant, and every box
+  records the rule that placed it with the coverages or distances behind the
+  decision. The model never sees a finding box, so it cannot classify a finding;
+  it only moves the boundaries that positioning, arch shape, centring and
+  missing teeth move. One call per image whatever the number of boxes; the areas,
+  the reply and a marked copy of the image (areas labelled, true boxes in white)
+  are saved. Same `adapter` role and failure policy as `"llm"`.
 * `"fdm"` (experimental): DentalGPT itself. It was trained with reinforcement
   learning on multiple-choice questions, so the task is split into two short
   questions per box in the Figure 7 shape, on a copy of the image with only
@@ -399,9 +414,10 @@ shape of the arch. `location_truth` in Cell 3 picks how it is done:
 
 The adapter runs once per dataset and adapter (Cell 9), independently of the
 model run, and resumes: one JSON per image under
-`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units, the
-quadrants, the windows' answer and the source that placed the box; the drawn
-images are kept under `.../drawn` for audit. DENTEX boxes carry FDI quadrant
+`<dataset>/location_truth/<adapter>/boxes` with the raw reply, the units (or the
+areas and the assignment behind each box), the quadrants, the windows' answer
+and the source that placed the box; the drawn or marked images are kept under
+`.../drawn` for audit. DENTEX boxes carry FDI quadrant
 labels, which are exact, so on a DENTEX dataset Cell 9 also prints the
 adapter's and the windows' agreement with that truth
 (`dental_eval.truth_agreement`): the check that the adapter is worth its calls.

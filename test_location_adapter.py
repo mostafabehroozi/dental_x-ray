@@ -44,6 +44,53 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(la.parse_units("no json here", 3), {})
         self.assertEqual(la.parse_units('{"boxes": "nope"}', 3), {})
 
+    def test_parse_areas(self):
+        areas = {"LL": [0.4, 0.5, 1.0, 1.0], "UR": [0.0, 0.0, 0.45, 0.55],
+                 "UL": [0.4, 0.0, 1.0, 0.5], "LR": [0.0, 0.5, 0.45, 1.0]}
+        parsed, error = la.parse_areas(f"Here you go:\n```json\n{_areas_reply(areas)}\n```")
+        self.assertIsNone(error)
+        self.assertEqual(list(parsed), ["UR", "UL", "LL", "LR"])  # window order, whatever the reply's order
+        self.assertEqual(parsed["UR"], [0.0, 0.0, 0.45, 0.55])
+        complete = dict(areas)
+        cases = {
+            "not json at all": "invalid_json",
+            json.dumps({"regions": {"UR": [0, 0, 1, 1]}}): "regions_must_be_a_list",
+            _areas_reply({k: v for k, v in complete.items() if k != "LR"}): "missing_region",
+            _areas_reply({**complete, "UPPER": [0.0, 0.0, 0.5, 0.5]}): "unknown_region",
+            _areas_reply({**complete, "UR": [0.0, 0.0, 1.2, 0.5]}): "area_out_of_range",
+            _areas_reply({**complete, "UR": [0.5, 0.0, 0.5, 0.5]}): "empty_area",
+            _areas_reply({**complete, "UR": [0.0, 0.0, 0.5]}): "invalid_area",
+            _areas_reply({**complete, "UR": "top left"}): "invalid_area",
+            json.dumps({"regions": [{"region": "UR", "area": [0, 0, 0.5, 0.5]}] * 2}): "duplicate_region",
+            json.dumps({"regions": ["UR"]}): "invalid_region_entry",
+        }
+        for reply, expected in cases.items():
+            with self.subTest(expected=expected):
+                parsed, error = la.parse_areas(reply)
+                self.assertEqual((parsed, error), ({}, expected))
+
+    def test_place_box_by_overlap_then_by_distance(self):
+        areas = {"UR": [0.0, 0.0, 0.5, 0.5], "UL": [0.5, 0.0, 1.0, 0.5],
+                 "LL": [0.5, 0.5, 1.0, 1.0], "LR": [0.0, 0.5, 0.5, 1.0]}
+        inside = la.place_box({"xc": 0.2, "yc": 0.2, "w": 0.1, "h": 0.1}, areas)
+        self.assertEqual((inside["region"], inside["rule"], inside["coverage"]["UR"], inside["distance"]),
+                         ("UR", "overlap", 1.0, None))
+        # 60% of the box is right of the midline: the greater covered fraction wins, not the centre.
+        mostly_left = la.place_box({"xc": 0.52, "yc": 0.2, "w": 0.2, "h": 0.1}, areas)
+        self.assertEqual((mostly_left["region"], mostly_left["coverage"]["UL"], mostly_left["coverage"]["UR"]),
+                         ("UL", 0.6, 0.4))
+        # An exact half-and-half box falls to the first region in window order, always the same way.
+        self.assertEqual(la.place_box({"xc": 0.5, "yc": 0.2, "w": 0.2, "h": 0.1}, areas)["region"], "UR")
+
+        tight = {"UR": [0.1, 0.1, 0.4, 0.4], "UL": [0.6, 0.1, 0.9, 0.4],
+                 "LL": [0.6, 0.6, 0.9, 0.9], "LR": [0.1, 0.6, 0.4, 0.9]}
+        outside = la.place_box({"xc": 0.55, "yc": 0.05, "w": 0.04, "h": 0.04}, tight)
+        self.assertEqual((outside["region"], outside["rule"]), ("UL", "nearest"))
+        self.assertEqual(set(outside["coverage"].values()), {0.0})
+        self.assertEqual(outside["distance"]["UL"], round((0.03 ** 2 + 0.03 ** 2) ** 0.5, 6))
+        # Equidistant from the two upper areas: window order decides, and the box is still placed.
+        self.assertEqual(la.place_box({"xc": 0.5, "yc": 0.05, "w": 0.04, "h": 0.04}, tight)["region"], "UR")
+
     def test_extract_option(self):
         cases = {
             "<think>...</think><answer>A</answer>": "A",
@@ -80,6 +127,10 @@ class FakeClient:
 
 def _reply(entries: list[tuple]) -> str:
     return json.dumps({"boxes": [{"id": i, "units": units, "teeth": teeth} for i, units, teeth in entries]})
+
+
+def _areas_reply(areas: dict) -> str:
+    return json.dumps({"regions": [{"region": name, "area": area} for name, area in areas.items()]})
 
 
 @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow not installed")
@@ -211,6 +262,69 @@ class AdapterTests(unittest.TestCase):
         misaligned["img1"]["boxes"][0]["condition"] = "wrong"
         with self.assertRaisesRegex(ValueError, "order/content"):
             ev.apply_adapted(self.gt, misaligned)
+
+    def test_area_adapter_places_every_box_from_one_call(self):
+        # A patient whose midline sits well right of centre: geometry puts box 3 in LL, the areas in LR.
+        areas = {"UR": [0.0, 0.0, 0.85, 0.5], "UL": [0.85, 0.0, 1.0, 0.5],
+                 "LL": [0.85, 0.5, 1.0, 1.0], "LR": [0.0, 0.5, 0.85, 1.0]}
+        client = FakeClient([_areas_reply(areas)])
+        adapter = la.AreaAdapter(base_url=None, api_key="x", model="fake/model-2", client=client)
+        self.assertEqual(adapter.name, "areas-fake-model-2")
+        rows = adapter.adapt(self.images["img1"], self.gt["img1"]["boxes"], "img1", self.root / "areas_drawn")
+        self.assertEqual(len(client.requests), 1)  # one call for the image, whatever the boxes
+        self.assertEqual([r["regions"] for r in rows], [["UR"], ["UR"], ["LR"]])
+        self.assertEqual([r["source"] for r in rows], ["areas"] * 3)
+        self.assertEqual([r["areas"] for r in rows], [areas] * 3)
+        self.assertEqual((rows[2]["assignment"]["rule"], rows[2]["assignment"]["coverage"]["LR"],
+                          rows[2]["assignment"]["coverage"]["LL"]), ("overlap", 1.0, 0.0))
+        text = client.requests[0]["messages"][1]["content"][0]["text"]
+        self.assertIn('"UR" = the patient', text)
+        self.assertNotIn("Dental filling", text)  # the model is never told what the boxes are
+        self.assertEqual(len(client.requests[0]["messages"][1]["content"]), 2)  # one image, no box list
+        self.assertTrue((self.root / "areas_drawn" / "img1.jpg").is_file())
+
+    def test_area_adapter_retries_then_follows_the_failure_policy(self):
+        complete = {"UR": [0.0, 0.0, 0.5, 0.5], "UL": [0.5, 0.0, 1.0, 0.5],
+                    "LL": [0.5, 0.5, 1.0, 1.0], "LR": [0.0, 0.5, 0.5, 1.0]}
+        partial = _areas_reply({k: v for k, v in complete.items() if k != "LR"})
+        recovered = la.AreaAdapter(None, "x", "fake", client=FakeClient([partial, _areas_reply(complete)]))
+        row = recovered.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"]), (["UR"], "areas"))
+        self.assertEqual([a["error"] for a in row["attempts"]], ["missing_region", None])
+
+        fallback = la.AreaAdapter(None, "x", "fake", parse_retries=0, client=FakeClient([partial]))
+        row = fallback.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"], row["areas"], row["fallback_reason"]),
+                         (None, None, None, "missing_region"))  # left to geometry in adapt_dataset
+        excluded = la.AreaAdapter(None, "x", "fake", parse_retries=0, failure_policy="exclude",
+                                  client=FakeClient(["not json"]))
+        row = excluded.adapt(self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")[0]
+        self.assertEqual((row["regions"], row["source"], row["fallback_reason"]), ([], "excluded", "invalid_json"))
+        with self.assertRaisesRegex(ValueError, "region areas remained unparseable"):
+            la.AreaAdapter(None, "x", "fake", parse_retries=0, failure_policy="error",
+                           client=FakeClient(["not json"])).adapt(
+                               self.images["img1"], self.gt["img1"]["boxes"][:1], "img1")
+
+    def test_area_adapter_dataset_and_evaluation(self):
+        areas = {"UR": [0.0, 0.0, 0.85, 0.5], "UL": [0.85, 0.0, 1.0, 0.5],
+                 "LL": [0.85, 0.5, 1.0, 1.0], "LR": [0.0, 0.5, 0.85, 1.0]}
+        client = FakeClient([_areas_reply(areas)])
+        out = self.root / "truth_areas"
+        adapted = la.adapt_dataset(la.AreaAdapter(None, "x", "fake", client=client), self.gt, out)
+        self.assertEqual(len(client.requests), 1)  # img2 has no boxes: no call at all
+        records = adapted["img1"]["boxes"]
+        self.assertEqual([r["regions"] for r in records], [["UR"], ["UR"], ["LR"]])
+        self.assertEqual([r["geometry"] for r in records], [["UR"], ["UR"], ["LL"]])
+        self.assertEqual(la.summarize(adapted), {"images": 2, "boxes": 3, "by_source": {"areas": 3},
+                                                 "agreement_with_geometry": 0.6667, "multi_region_boxes": 0})
+        self.assertTrue((out / "drawn" / "img1.jpg").is_file())
+        self.assertEqual(json.loads((out / "manifest.json").read_text())["adapter"]["regions"],
+                         ["UR", "UL", "LL", "LR"])
+        truth = ev.apply_adapted(self.gt, adapted)
+        self.assertEqual([b["regions"] for b in truth["img1"]["boxes"]], [["UR"], ["UR"], ["LR"]])
+        self.assertEqual({b["region_source"] for b in truth["img1"]["boxes"]}, {"areas"})
+        self.assertEqual(ev.box_regions(truth["img1"]["boxes"][2], "arch"), {"lower"})
+        self.assertEqual(ev.location_truth_summary(truth), {"boxes": 3, "by_source": {"areas": 3}})
 
     def test_truth_agreement_on_fdi_boxes(self):
         gt = {"a": {"path": str(self.images["img1"]), "annotated": set(dp.CONDITIONS), "boxes": [
