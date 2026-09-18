@@ -27,6 +27,11 @@ With vote_agreement switched on, the vote behind each answer reaches the report 
 of the question's wordings reported the finding, and how many of them named each region, as counts
 the report quotes rather than turns into a confidence. It is off by default, and while it is off
 the structured input, the prompt, the report and the rendering are exactly what they were.
+
+The multiplicity is the occupied-region count of dental_pipeline.count_block: the number of distinct
+regions the model reported a finding in, said as "reported in two regions" and never as two lesions
+or two teeth, with words instead of a number when it is partial, not stated or unresolved. With
+counting switched off it leaves the structured input, the legend and the prompt altogether.
 """
 from __future__ import annotations
 
@@ -87,7 +92,10 @@ LEGEND = {
         "present": "Yes when the question named this region", "absent": "No when the question named this region",
         "unparseable": "the answer for this region could not be read", "not_asked": "no question named this region",
     },
-    "multiplicity": "the number of distinct regions the model named (0 to 6); a lower bound on the number of occurrences, not a tooth count",
+    "multiplicity": "the number of distinct regions the model reported the finding in (0 to 6): regions, never lesions or "
+                    "teeth, and a lower bound on the number of occurrences. Words instead of a number say why it is not "
+                    "available: 'at least N' when some regions could not be read, 'not_stated' when the model named no "
+                    "region, 'unresolved' when its location could not be read",
     "trained": "false when the analyzer was never trained on this question (zero-shot; the paper reports 52-64% accuracy on such diseases)",
     "detection": "whether the whole-image answer and the region answers agree; a region-only detection is a weaker signal",
 }
@@ -375,7 +383,7 @@ def _task_entry(key: str, task: dict, flag: bool, model_text: str | None,
 
 
 def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, include_rationale: bool,
-           vote_agreement: bool = False) -> dict:
+           vote_agreement: bool = False, counting: bool = True) -> dict:
     """One dense entry for a benchmark finding or an extra DentVLM task."""
     level = result.get("location_level", "rationale")
     tasks_out = result.get("tasks") or {}
@@ -384,15 +392,15 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         finding = result["findings"][identifier]
         keys = list(finding["tasks"]) if finding["asked"] else []
         presence, whole_image = finding["presence"], finding.get("whole_image")
-        regions, region_count = finding.get("regions"), finding.get("region_count")
+        regions = finding.get("regions")
         benchmark_class = True
         trained = identifier in dp.TRAINED
     else:
+        finding = None
         task = tasks_out.get(identifier)
         keys = [identifier] if task else []
         presence, whole_image = (task["presence"], task.get("whole_image")) if task else (None, None)
         regions = task.get("regions") if task else None
-        region_count = len(regions) if regions is not None else None
         benchmark_class, trained = False, True
     asked = bool(keys)
 
@@ -456,7 +464,6 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         location_status = "unresolved: a cell answer was unparseable"
     else:
         location_status = "not_localized: present on the whole image, no cell answered Yes"
-    multiplicity = len(located_in) if status == "present" and region_source != "none" else "not_applicable"
 
     entry = {
         "finding": identifier, "label": LABELS[identifier], "category": FINDING_CATEGORY[identifier],
@@ -465,26 +472,51 @@ def _entry(identifier: str, result: dict, cell_answers: dict, flag: bool, includ
         "detection": "not_assessed" if not asked else detection_note(status, whole, regional),
         "tasks": tasks,
         "regions": region_map, "region_source": region_source, "located_in": located_in,
-        "location_status": location_status, "multiplicity": multiplicity,
+        "location_status": location_status,
     }
+    if counting:
+        # The occupied-region count: the same block the evaluation scores, said in words when it is not
+        # a number, so the report can never turn a partial or unlocated finding into a total.
+        unresolved = [c for c in cells if region_map.get(patient_cell(c, flag)) == "unparseable"]
+        if finding is not None:
+            block = dp.finding_count(finding, level, unresolved)
+        else:
+            block = dp.count_block(presence, regions, unresolved, level)
+        entry["multiplicity"] = multiplicity_text(block, len(located_in), unresolved, flag) if status == "present" \
+            and region_source != "none" else "not_applicable"
     if vote_agreement:
         entry["agreement"] = finding_agreement(blocks)
     return entry
 
 
+def multiplicity_text(block: dict, confirmed: int, unresolved: list[str], flag: bool):
+    """The multiplicity of a present finding: the resolved count, or the words that say why there is none."""
+    status = block["count_status"]
+    if status == "resolved":
+        return block["region_count"]
+    if status == "partial":
+        names = ", ".join(patient_cell(c, flag) for c in unresolved)
+        return (f"at least {confirmed}: reported in {confirmed} region(s), and the answer for {len(unresolved)} "
+                f"region(s) could not be read ({names})")
+    if status == "unlocated":
+        return "not_stated: the model reported the finding but named no region, so the number of regions is unknown"
+    return "unresolved: the location in the model's rationale could not be read, so the number of regions is unknown"
+
+
 def structured_findings(result: dict, analyzer: str | None = None, include_rationale: bool = False,
-                       vote_agreement: bool = False, parser=None) -> dict:
+                       vote_agreement: bool = False, parser=None, counting: bool = True) -> dict:
     """One dense JSON for the report model: every finding, task and cell with an explicit status.
 
     vote_agreement adds one "agreement" block per finding and per task, and its legend; with it off
-    the JSON is byte for byte the one the report writer has always been given.
+    the JSON is byte for byte the one the report writer has always been given. counting off leaves
+    the multiplicity out of every finding, the legend and the prompt.
     """
     flag = result.get("left_is_image_left", dp.LEFT_IS_IMAGE_LEFT)
     level = result.get("location_level", "rationale")
     # The evaluator reads the same answers, through the same reader, so the report and the score can
     # never disagree about what a region call said.
     cell_answers = dp.cell_answers(result, parser) if level == "regions" else {}
-    findings = [_entry(i, result, cell_answers, flag, include_rationale, vote_agreement) for i in IDENTIFIERS]
+    findings = [_entry(i, result, cell_answers, flag, include_rationale, vote_agreement, counting) for i in IDENTIFIERS]
     status = {f["finding"]: f["status"] for f in findings}
     order = PATHOLOGY + TREATMENT
     limitations = list(LIMITATIONS)
@@ -516,7 +548,8 @@ def structured_findings(result: dict, analyzer: str | None = None, include_ratio
             "limitations": limitations,
             **({"vote_agreement": agreement} if vote_agreement else {}),
         },
-        "legend": {"status": LEGEND["status"], "regions": region_legend, "multiplicity": LEGEND["multiplicity"],
+        "legend": {"status": LEGEND["status"], "regions": region_legend,
+                   **({"multiplicity": LEGEND["multiplicity"]} if counting else {}),
                    "trained": LEGEND["trained"], "detection": LEGEND["detection"],
                    **({"agreement": AGREEMENT_LEGEND} if vote_agreement else {})},
         "categories": [{"key": key, "label": label, "findings": list(conditions)}
@@ -570,13 +603,13 @@ OUTPUT_SCHEMA = """{
 USER_PROMPT = """Write the dentist's report for the automated analysis below.
 
 WHAT THE DATA IS
-An automated analyzer ({analyzer}) was asked {method}. The JSON lists the 14 findings of the benchmark vocabulary and the analyzer's extra tasks, each with an explicit status, the task(s) that decided it with their verbatim question and answer, every dental-arch region with an explicit value, and the multiplicity (number of regions the model named). Region names are on the PATIENT's side ("analysis.regions" spells them out). "unparseable" means an answer could not be read as Yes or No, so that finding is neither confirmed nor excluded; "not_assessed" means the analyzer has no question for that finding and was never asked. Every value is spelled out; there are no implicit defaults.
+An automated analyzer ({analyzer}) was asked {method}. The JSON lists the 14 findings of the benchmark vocabulary and the analyzer's extra tasks, each with an explicit status, the task(s) that decided it with their verbatim question and answer{multiplicity_data}, and every dental-arch region with an explicit value. Region names are on the PATIENT's side ("analysis.regions" spells them out). "unparseable" means an answer could not be read as Yes or No, so that finding is neither confirmed nor excluded; "not_assessed" means the analyzer has no question for that finding and was never asked. Every value is spelled out; there are no implicit defaults.
 
 {findings_json}
 
 HOW TO WRITE
 1. Language: write every human-readable value (title, headings, statements, impression, not_assessable, limitations) in {language}, with the dental terminology a dentist reading that language expects. Keep the JSON keys and every "finding" and "category" identifier exactly as given, in English.
-2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State regions and multiplicity exactly as given; never estimate a number of teeth, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "not_stated" or "unparseable", say so in words. A finding with status "not_assessed" gets one sentence saying the analyzer does not assess it.
+2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State regions{multiplicity_rule} exactly as given; never estimate a number of teeth, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "not_stated" or "unparseable", say so in words. A finding with status "not_assessed" gets one sentence saying the analyzer does not assess it.
 3. Wording: as a radiologist reports to a colleague. Short declarative sentences, present tense, attributed to the automated analysis ("The analysis flags ..."). Locate findings on the patient's side ("upper right posterior region"); never say image left or image right. A region the model did not name is never reported as free of the finding. An absent finding gets one short pertinent-negative sentence. When a finding was decided by several tasks (for example a prosthetic crown and a prosthetic bridge), say which task answered Yes. No diagnosis, no differential, no severity, no treatment advice.
 4. Confidence: say when a finding comes from a question the analyzer was not trained on ("trained": false) and when "detection" says it was flagged by region questions only.
 5. Impression: 1 to 6 short bullets. Pathology first (caries, periapical lesions, periodontal disease, calculus, furcation involvement, impacted teeth, insufficient eruption space, residual roots and crowns, root resorption), then existing treatment (fillings, crowns or bridges, root canal treatments, implants, appliances, surgical hardware), then what could not be assessed. Absent and not-assessed findings stay out of the impression, unless every assessed finding is absent: then say so in one bullet.
@@ -599,6 +632,12 @@ These counts measure agreement between rewordings of one question, put to one mo
 
 AGREEMENT_RULE = """7. Agreement between wordings: report the agreement of each finding next to that finding, from its "agreement" block. Give the counts exactly as they stand (presence as "<votes>/<out_of>", each region as "<region> <votes>/<out_of>") and the fixed phrase from "wording", in {language}. Never invent a percentage, a probability, a confidence, a certainty or any confidence word the block does not give you; never re-derive, round, average or add up the counts; never quote a count that is not in the block, and in particular never report a vote out of the wordings asked when fewer answers than that were readable. Keep every region separate with its own count, so a region named by every reporting answer and a region named by one of them are never presented as equally supported. Say in words when answers were unreadable, when the wordings tied, and when fewer answers were readable than wordings asked. Where the counts and the recorded result differ, because the run's region_vote policy kept a region a minority named or dropped one, report the recorded finding and its regions first and the counts as the evidence behind them. When "measured" is false, give the reason from its "wording" and say nothing further about agreement for that finding. Say once, in the limitations, that these counts measure agreement between rewordings of the same question and are not a probability, medical certainty or diagnostic confidence.
 """
+
+# The multiplicity passages, present exactly when the structured input carries a multiplicity (counting on).
+MULTIPLICITY_DATA = (", the multiplicity (the number of distinct regions the model reported the finding in - regions, "
+                     "never teeth or lesions - or the words saying why that number is not available)")
+MULTIPLICITY_RULE = (' and multiplicity (say "reported in two regions", never "two lesions" or "two teeth"; a '
+                     'multiplicity given as words - "at least", "not_stated", "unresolved" - is said in those words)')
 
 REPAIR_PROMPT = """Your reply failed these checks against the data:
 {problems}
@@ -623,7 +662,10 @@ def user_prompt(structured: dict, language: str) -> str:
     prompt can never describe data the model was not given."""
     analysis = structured["analysis"]
     template = with_agreement(USER_PROMPT) if "agreement" in structured["legend"] else USER_PROMPT
+    counting = "multiplicity" in structured["legend"]
     return (template.replace("{analyzer}", str(analysis["analyzer"])).replace("{method}", analysis["method"])
+            .replace("{multiplicity_data}", MULTIPLICITY_DATA if counting else "")
+            .replace("{multiplicity_rule}", MULTIPLICITY_RULE if counting else "")
             .replace("{findings_json}", json.dumps(structured, indent=1, ensure_ascii=False))
             .replace("{language}", language).replace("{output_schema}", OUTPUT_SCHEMA))
 
@@ -897,11 +939,11 @@ def render_markdown(report: dict, structured: dict, writer_model: str | None = N
     return "\n".join(lines)
 
 
-def fallback_markdown(result: dict, problems: list[str]) -> str:
+def fallback_markdown(result: dict, problems: list[str], counting: bool = True) -> str:
     """The deterministic summary, used when the report model's reply could not be verified."""
     lines = ["# Automatic summary (the report model's reply failed verification)", ""]
     lines += [f"- {p}" for p in problems]
-    lines += ["", "```", dp.dentist_report(result), "```", ""]
+    lines += ["", "```", dp.dentist_report(result, counting), "```", ""]
     return "\n".join(lines)
 
 
@@ -919,19 +961,20 @@ class ReportWriter:
     None for OpenAI reasoning models; other request fields (reasoning_effort, response_format, ...)
     go through request_options. include_rationale adds DentVLM's own reply text per task to the
     input (off by default: the report then rests on the parsed answers alone). vote_agreement adds
-    the vote counts behind those answers (off by default; see AGREEMENT_LEGEND). One repair turn is
-    allowed: the reply's problems are sent back and the corrected JSON re-verified.
+    the vote counts behind those answers (off by default; see AGREEMENT_LEGEND). counting (on by
+    default) gives the report each finding's multiplicity, the number of regions it was reported in.
+    One repair turn is allowed: the reply's problems are sent back and the corrected JSON re-verified.
     """
 
     kind = "report"
     OPTIONS = ("token_param", "temperature", "max_output_tokens", "request_options", "language", "repairs",
-               "include_rationale", "vote_agreement", "api_call_retries")
+               "include_rationale", "vote_agreement", "counting", "api_call_retries")
 
     def __init__(self, base_url: str | None, api_key: str, model: str, token_param: str = "max_tokens",
                  max_output_tokens: int = 4096, temperature: float | None = 0.0, language: str = "English",
                  repairs: int = 1, include_rationale: bool = False, vote_agreement: bool = False,
-                 timeout: float = 600.0, request_options: dict | None = None, api_call_retries: int = 2,
-                 call_log: str | None = None, client=None, parser=None) -> None:
+                 counting: bool = True, timeout: float = 600.0, request_options: dict | None = None,
+                 api_call_retries: int = 2, call_log: str | None = None, client=None, parser=None) -> None:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         if not isinstance(language, str) or not language.strip():
@@ -941,7 +984,7 @@ class ReportWriter:
         self.base_url, self.model = base_url, model
         self.token_param, self.max_output_tokens, self.temperature = token_param, max_output_tokens, temperature
         self.language, self.repairs, self.include_rationale = language.strip(), max(0, int(repairs)), bool(include_rationale)
-        self.vote_agreement = bool(vote_agreement)
+        self.vote_agreement, self.counting = bool(vote_agreement), bool(counting)
         self._noted_single_wording = False
         self.request_options = dict(request_options or {})
         self.api_call_retries = api_call_retries
@@ -950,14 +993,16 @@ class ReportWriter:
         self.call_log = mon.CallLog("report", call_log)
 
     @classmethod
-    def from_api(cls, spec: dict, language: str | None = None, timeout: float = 600.0, client=None,
-                 parser=None) -> "ReportWriter":
+    def from_api(cls, spec: dict, language: str | None = None, counting: bool | None = None,
+                 timeout: float = 600.0, client=None, parser=None) -> "ReportWriter":
         """Writer for a hosted model. spec = {"provider", "model", ...} as documented in llm_api, plus any
-        of the constructor options named in OPTIONS; a language argument wins over the spec's."""
+        of the constructor options named in OPTIONS; a language or counting argument wins over the spec's."""
         base_url, api_key = llm_api.resolve(spec)
         options = {k: spec[k] for k in cls.OPTIONS if k in spec}
         if language is not None:
             options["language"] = language
+        if counting is not None:
+            options["counting"] = counting
         return cls(base_url, api_key, spec["model"], timeout=timeout, client=client, parser=parser, **options)
 
     @property
@@ -978,7 +1023,8 @@ class ReportWriter:
         return {"kind": self.kind, "model": self.model, "base_url": self.base_url, "token_param": self.token_param,
                 "max_output_tokens": self.max_output_tokens, "temperature": self.temperature, "language": self.language,
                 "repairs": self.repairs, "include_rationale": self.include_rationale,
-                "vote_agreement": self.vote_agreement, "api_call_retries": self.api_call_retries,
+                "vote_agreement": self.vote_agreement, "counting": self.counting,
+                "api_call_retries": self.api_call_retries,
                 "request_options": self.request_options, "schema": SCHEMA,
                 "system_prompt": SYSTEM_PROMPT, "user_prompt": USER_PROMPT, "output_schema": OUTPUT_SCHEMA,
                 "repair_prompt": REPAIR_PROMPT,
@@ -1007,7 +1053,7 @@ class ReportWriter:
         """One image result -> {"structured", "report", "verified", "problems", "markdown", "attempts", ...}."""
         usage_at_start = self.parser.usage_snapshot() if self.parser is not None else None
         structured = structured_findings(result, analyzer, self.include_rationale, self.vote_agreement,
-                                         self.parser)
+                                         self.parser, self.counting)
         if self.vote_agreement and not structured["analysis"]["vote_agreement"]["measured"] and not self._noted_single_wording:
             self._noted_single_wording = True
             llm_api.monitor("REPORT NOTE", "vote_agreement is on but this run asked one wording per task",
@@ -1042,7 +1088,8 @@ class ReportWriter:
             "language": self.language, "writer": self.public(), "analyzer": structured["analysis"]["analyzer"],
             "structured": structured, "prompt": prompt,
             "report": report if verified else None, "verified": verified, "problems": problems,
-            "markdown": render_markdown(report, structured, self.model) if verified else fallback_markdown(result, problems),
+            "markdown": (render_markdown(report, structured, self.model) if verified
+                         else fallback_markdown(result, problems, self.counting)),
             "attempts": attempts,
             **({"parser": self.parser.public(), "parser_fingerprint": self.parser.fingerprint(),
                 "parser_usage": self.parser.usage_since(usage_at_start),

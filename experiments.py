@@ -59,8 +59,14 @@ DEFAULTS = {
     "extra_tasks": True,               # residual crown, eruption space, calculus: reported, not scored
     "parse_retries": 1,                # extra attempts per unparseable question
 
-    # Location truth: how ground-truth boxes reach the six cells.
-    "evaluate_location": True,
+    # Location truth: how ground-truth boxes reach the six cells, and which of the two families that
+    # need it are scored. Neither switch changes a question or a saved answer: both are evaluation and
+    # report settings, so a saved run can be scored with either setting without new inference.
+    "evaluate_location": True,         # per-cell location tables (region_presence, regions)
+    "counting": True,                  # occupied-region counts: the number of distinct regions a finding is
+                                       # reported in against the regions its true boxes occupy (never a tooth
+                                       # count, never a question). Also puts the multiplicity in the dentist
+                                       # report. Needs region evidence, so location "none" rejects it.
     "location_truth": "llm",           # "llm" (units per box) | "areas" (this image's cell areas, then geometry)
                                        # | "fdm" (local DentVLM) | "geometry" (fixed windows). "llm" and "areas"
                                        # both use the adapter spec below.
@@ -164,9 +170,12 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
         raise ValueError(f"{name}: smoke_images must be a non-negative integer")
     if cfg["report_images"] is not None and (type(cfg["report_images"]) is not int or cfg["report_images"] <= 0):
         raise ValueError(f"{name}: report_images must be None or a positive integer")
-    for knob in ("reuse_local_responses", "reuse_parser_responses"):
+    for knob in ("reuse_local_responses", "reuse_parser_responses", "evaluate_location", "counting"):
         if type(cfg[knob]) is not bool:
             raise ValueError(f"{name}: {knob} must be True or False")
+    if cfg["counting"] and cfg["location"] == "none":
+        raise ValueError(f"{name}: counting needs region evidence, and location 'none' asks presence only; "
+                         "set location to 'rationale' or 'regions', or counting to False")
     llm_api.validate_parse_retries(cfg["parser_parse_retries"])
     lp.validate_mode(cfg["parser_mode"], allow_none=True, where=f"{name}: parser_mode")
     if not isinstance(cfg["parser_modes"], dict):
@@ -178,7 +187,7 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
         raise ValueError(f"{name}: location_failure_policy must be 'geometry', 'exclude' or 'error'")
     if cfg["backend"] == "api":
         _check_spec(cfg["analyzer"], "analyzer", name)
-    if cfg["evaluate_location"] and cfg["location_truth"] in ("llm", "areas"):
+    if uses_location_truth(cfg) and cfg["location_truth"] in ("llm", "areas"):
         _check_spec(cfg["adapter"], "adapter", name)
     _check_spec(cfg["reporter"], "reporter", name)
     if type(cfg["reporter"].get("vote_agreement", False)) is not bool:
@@ -213,6 +222,12 @@ def build(experiments: list[dict], shared: dict | None = None) -> list[dict]:
 # ----------------------------------------------------------------------------
 def is_local(cfg: dict) -> bool:
     return cfg["backend"] == "local"
+
+
+def uses_location_truth(cfg: dict) -> bool:
+    """True when the evaluation needs the true boxes placed in cells: for the location tables, for the
+    occupied-region counts, or both. With both off no adapter runs and no box is ever placed."""
+    return bool(cfg["evaluate_location"] or cfg["counting"])
 
 
 def protocol(cfg: dict) -> dp.Protocol:
@@ -349,8 +364,9 @@ def parser(cfg: dict) -> lp.ParserService:
 
 
 def location_adapter(cfg: dict, runner=None, parser=None):
-    """The location-truth adapter, or None when the fixed windows are used (or location is not scored)."""
-    if not cfg["evaluate_location"] or cfg["location_truth"] == "geometry":
+    """The location-truth adapter, or None when the fixed windows are used or nothing needs the truth
+    (neither location nor counts are scored)."""
+    if not uses_location_truth(cfg) or cfg["location_truth"] == "geometry":
         return None
     if cfg["location_truth"] == "llm":
         return la.LLMAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"], parser=parser)
@@ -362,7 +378,7 @@ def location_adapter(cfg: dict, runner=None, parser=None):
 
 
 def report_writer(cfg: dict, parser=None) -> rw.ReportWriter:
-    return rw.ReportWriter.from_api(cfg["reporter"], language=cfg["report_language"],
+    return rw.ReportWriter.from_api(cfg["reporter"], language=cfg["report_language"], counting=cfg["counting"],
                                     timeout=cfg["request_timeout_seconds"], parser=parser)
 
 

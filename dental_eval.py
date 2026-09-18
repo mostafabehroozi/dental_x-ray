@@ -6,14 +6,20 @@ for the whole-image answers alone in the region comparison, to show what the
 region questions recovered and what they cost), presence per cell (every cell of every
 image, present or absent, against the cells the true boxes occupy, so a finding
 class is scored once per cell rather than counted), cell-level TP/FP/TN/FN for
-the localized true positives, and two per-image numbers a dentist cares about
-(complete-case rate, false alarms).
+the localized true positives, occupied-region counts (the size of the
+deduplicated region set the model reported a finding in against the number of
+distinct regions its true boxes occupy, one region per box; `counting` switches
+this family on and off independently of `evaluate_location`), and two per-image
+numbers a dentist cares about (complete-case rate, false alarms).
 
 Findings the model was not asked about are listed as not assessed and skipped.
 Unparseable answers are excluded from the per-finding confusion tables and
 reported as counts. Both per-image metrics also exclude unresolved results: a
 true finding whose answer was unparseable is excluded from recall. Complete-case
 rate excludes images with unresolved findings. Neither metric gives them credit.
+A count is scored only when both sides are resolved; every other case is
+reported under its reason (unresolved, partial, unlocated, incomplete truth) and
+never becomes a zero.
 
 Location truth (which cells a true box occupies) comes, in this order, from
 regions attached to the box by location_adapter (apply_adapted), from DENTEX
@@ -28,7 +34,7 @@ from pathlib import Path
 
 import run_monitor as mon
 from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, LEFT_IS_IMAGE_LEFT, TRAINED, cell_answers,
-                             fdi_unit, unit_cell, units_to_cells)
+                             count_block, fdi_unit, finding_count, unit_cell, units_to_cells)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -169,18 +175,19 @@ def fdi_cell(quadrant: int, tooth: int, left_is_image_left: bool = LEFT_IS_IMAGE
     return unit_cell(fdi_unit(quadrant, tooth), left_is_image_left)
 
 
+def _window_share(box: dict, window: tuple[float, float, float, float]) -> float:
+    """The fraction of the box's area that lies inside a window."""
+    left, top = box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2
+    right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
+    wl, wt, wr, wb = window
+    overlap = max(0.0, min(right, wr) - max(left, wl)) * max(0.0, min(bottom, wb) - max(top, wt))
+    return overlap / max(box["w"] * box["h"], 1e-9)
+
+
 def geometric_regions(box: dict, windows: dict | None = None) -> set[str]:
     """Cells whose fixed window holds >= 25% of the box area (the model-free fallback)."""
     windows = windows or CELL_WINDOWS
-    left, top = box["xc"] - box["w"] / 2, box["yc"] - box["h"] / 2
-    right, bottom = box["xc"] + box["w"] / 2, box["yc"] + box["h"] / 2
-    area = max(box["w"] * box["h"], 1e-9)
-    hits = set()
-    for name, (wl, wt, wr, wb) in windows.items():
-        overlap = max(0.0, min(right, wr) - max(left, wl)) * max(0.0, min(bottom, wb) - max(top, wt))
-        if overlap / area >= OVERLAP_FRACTION:
-            hits.add(name)
-    return hits
+    return {name for name, window in windows.items() if _window_share(box, window) >= OVERLAP_FRACTION}
 
 
 def box_regions(box: dict, windows: dict | None = None) -> set[str]:
@@ -208,6 +215,33 @@ def gt_regions(boxes: list[dict]) -> set[str]:
 
 def straddling(box: dict) -> bool:
     return len(box_regions(box)) > 1
+
+
+def box_primary_region(box: dict) -> str | None:
+    """The one cell a box is counted in for the occupied-region target, so no box occupies two.
+
+    The adapted, FDI or fixed-window cell when there is exactly one (the area adapter always gives
+    one). When several cells hold the box - an LLM adapter naming two units, a descriptor covering
+    both arches, the overlapping fixed windows on the canine line or the occlusal plane - it is the
+    cell holding the largest share of the box under the fixed windows, ties to cell order, so the same
+    box always lands in the same cell. None for a box the adapter excluded: its truth is incomplete,
+    which is not a smaller count. The location tables keep every cell such a box touches; only the
+    count target reduces it to one, and `straddling_truth_boxes` says how often that happened.
+    """
+    if box.get("location_excluded"):
+        return None
+    regions = box_regions(box)
+    if len(regions) == 1:
+        return next(iter(regions))
+    candidates = [c for c in CELLS if c in regions] or list(CELLS)
+    return max(candidates, key=lambda c: (round(_window_share(box, CELL_WINDOWS[c]), 9), -CELLS.index(c)))
+
+
+def truth_count(boxes: list[dict]) -> int | None:
+    """Distinct regions the true boxes of one finding occupy, one region per box, deduplicated; 0 for
+    an absent finding, None when any box could not be placed (incomplete truth, not a smaller count)."""
+    regions = {box_primary_region(b) for b in boxes}
+    return None if None in regions else len(regions)
 
 
 # ----------------------------------------------------------------------------
@@ -343,17 +377,83 @@ def _tally(table: dict, truth: bool, answer: str | None) -> bool:
     return True
 
 
+COUNT_TARGET = "distinct_primary_regions"  # one region per true box (box_primary_region), deduplicated
+COUNT_EXCLUSIONS = ("unresolved", "partial", "unlocated", "truth_incomplete")
+
+
+def _count_table() -> dict:
+    return {"expected": 0, "scored": 0, "truth_positive": 0, "exact": 0, "over": 0, "under": 0,
+            "abs_error": 0, "straddling": 0, **{k: 0 for k in COUNT_EXCLUSIONS}}
+
+
+def _tally_count(table: dict, boxes: list[dict], block: dict) -> None:
+    """Add one image/finding to an occupied-region count table.
+
+    Scored only when the prediction is a resolved count and every true box could be placed; an
+    absent finding predicted absent is an exact 0, a false alarm an overcount, a missed finding an
+    undercount. Anything else is excluded under its reason, so unresolved predictions never vanish
+    into a better score and incomplete truth never becomes a smaller count.
+    """
+    table["expected"] += 1
+    truth = truth_count(boxes)
+    if truth is None:
+        table["truth_incomplete"] += 1
+        return
+    if block["count_status"] != "resolved":
+        table[block["count_status"]] += 1
+        return
+    predicted = block["region_count"]
+    table["scored"] += 1
+    table["truth_positive"] += truth > 0
+    table["exact"] += predicted == truth
+    table["over"] += predicted > truth
+    table["under"] += predicted < truth
+    table["abs_error"] += abs(predicted - truth)
+    table["straddling"] += sum(straddling(b) for b in boxes)
+
+
+def _count_metrics(t: dict) -> dict:
+    """The metrics of one count table. `exact_rate_of_expected` is the end-to-end success over every
+    expected check, so an unresolved prediction counts against the run instead of disappearing."""
+    return {"target": COUNT_TARGET,
+            "expected_count_checks": t["expected"], "scored_count_checks": t["scored"],
+            "excluded_count_checks": t["expected"] - t["scored"],
+            **{"excluded_" + k: t[k] for k in COUNT_EXCLUSIONS},
+            "truth_positive_cases": t["truth_positive"],
+            "exact_rate": _ratio(t["exact"], t["scored"]), "mae": _ratio(t["abs_error"], t["scored"]),
+            "overcount_rate": _ratio(t["over"], t["scored"]), "undercount_rate": _ratio(t["under"], t["scored"]),
+            "exact_rate_of_expected": _ratio(t["exact"], t["expected"]),
+            "straddling_truth_boxes": t["straddling"]}
+
+
+def _sum_tables(tables: list[dict]) -> dict:
+    total = _count_table()
+    for table in tables:
+        for key in total:
+            total[key] += table[key]
+    return total
+
+
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
-             out_dir: str | Path | None = None, *, evaluate_location: bool = True,
+             out_dir: str | Path | None = None, *, evaluate_location: bool = True, counting: bool = True,
              include_analysis: bool = True) -> dict:
-    """Score saved results against ground truth. Images missing from either side are skipped."""
+    """Score saved results against ground truth. Images missing from either side are skipped.
+
+    `evaluate_location` switches the per-cell tables (region_presence, regions) on; `counting` the
+    occupied-region count table. Either one needs the location truth (adapted or fixed windows); with
+    both off no true box is ever placed.
+    """
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
-    presence, whole_image, region_presence, regions, per_image, not_assessed = [], [], [], [], [], []
+    presence, whole_image, region_presence, regions, counts, per_image, not_assessed = [], [], [], [], [], [], []
     protocol = results[ids[0]].get("protocol") if ids else None
     level = next((results[i]["location_level"] for i in ids), "none")
     # The whole-image answers are a separate result only in the region comparison.
     whole_image_kept = level == "regions" and "whole_image" in results[ids[0]]["findings"][CONDITIONS[0]]
+    count_kept = counting and level != "none"
+    # The whole-image stage's own count, when the region comparison kept its regions (findings_version 2).
+    whole_count_kept = count_kept and whole_image_kept and "whole_image_regions" in results[ids[0]]["findings"][CONDITIONS[0]]
+    count_tables = []
 
     for condition in CONDITIONS:
         annotated = [i for i in ids if condition in gt[i]["annotated"]]
@@ -371,6 +471,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         jaccard_sum = 0.0
         rp = {name: {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0, "positives": 0} for name in CELLS}
         rp_excluded = 0
+        oc, ow = _count_table(), _count_table()
         for image_id in asked:
             boxes = [b for b in gt[image_id]["boxes"] if b["condition"] == condition]
             truth = len(boxes) > 0
@@ -378,6 +479,16 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             finding = results[image_id]["findings"][condition]
             if whole_image_kept:
                 _tally(whole, truth, finding["whole_image"])
+            if count_kept:
+                legacy_unresolved = ()
+                if "count_status" not in finding and level == "regions":
+                    # A result written before the block existed: the regions the region questions left
+                    # unresolved are only in its saved calls, and a partial set must not score as a total.
+                    pred_map = predicted_cells(results[image_id], condition) or {}
+                    legacy_unresolved = [c for c, v in pred_map.items() if v is None]
+                _tally_count(oc, boxes, finding_count(finding, level, legacy_unresolved))
+                if whole_count_kept:
+                    _tally_count(ow, boxes, count_block(finding["whole_image"], finding["whole_image_regions"]))
             if evaluate_location and level != "none":
                 # Presence per cell: every cell of every image, whatever the whole image said, against the cells
                 # the true boxes occupy (none when the finding is absent). One cell per image, so several boxes in
@@ -449,6 +560,15 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 "excluded_location_checks": region_unparseable + location_truth_excluded,
                 "location_truth_excluded": location_truth_excluded,
             })
+        if count_kept:
+            # "presence" is the run's authoritative answer (the region questions when they were asked);
+            # "whole_image" the rationale stage alone, so the two counts can be read side by side.
+            count_tables.append(oc)
+            counts.append({"dataset": dataset, "condition": condition, "level": level, "stage": "presence",
+                           **_count_metrics(oc)})
+            if whole_count_kept:
+                counts.append({"dataset": dataset, "condition": condition, "level": level, "stage": "whole_image",
+                               **_count_metrics(ow)})
 
     for image_id in ids:
         findings = results[image_id]["findings"]
@@ -479,8 +599,9 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "protocol": protocol,
         "location_level": level, "not_assessed": not_assessed,
-        "evaluate_location": evaluate_location,
-        "location_truth": location_truth_summary({i: gt[i] for i in ids}) if evaluate_location else None,
+        "evaluate_location": evaluate_location, "counting": counting,
+        "location_truth": (location_truth_summary({i: gt[i] for i in ids})
+                           if evaluate_location or count_kept else None),
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
         "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
@@ -514,21 +635,25 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                                       "unparseable": sum(r["unparseable"] for r in region_presence)}
     if evaluate_location and level != "none":
         summary["side_agreement"] = side_agreement({i: gt[i] for i in ids}, results)
+    if count_tables:
+        summary["occupied_regions"] = _count_metrics(_sum_tables(count_tables))
     report = {"summary": summary, "presence": presence, "whole_image": whole_image,
-              "region_presence": region_presence, "regions": regions, "per_image": per_image,
-              "missing_results": missing}
+              "region_presence": region_presence, "regions": regions, "occupied_regions": counts,
+              "per_image": per_image, "missing_results": missing}
     if include_analysis:
         from dental_analysis import analyze
         report.update(analyze({i: gt[i] for i in ids}, results, dataset=dataset,
-                              evaluate_location=evaluate_location))
+                              evaluate_location=evaluate_location, counting=counting))
     if out_dir:
         write_report(report, out_dir)
     summary = report["summary"]
+    occupied = summary.get("occupied_regions") or {}
     mon.monitor("SCORED", dataset, images=len(ids), missing_results=len(missing) or None,
                 checks=summary["scored_finding_checks"],
                 unparseable=summary["excluded_unparseable_checks"] or None,
                 not_assessed=len(summary["not_assessed"]) or None,
-                f1=summary["f1"], sens=summary["sensitivity"], spec=summary["specificity"])
+                f1=summary["f1"], sens=summary["sensitivity"], spec=summary["specificity"],
+                count_exact=occupied.get("exact_rate"), count_excluded=occupied.get("excluded_count_checks") or None)
     if not summary["finding_check_invariant_ok"]:
         # Every expected check must end up scored or explicitly excluded; anything else is a bug here.
         mon.monitor("EVAL INVARIANT BROKEN", dataset, expected=summary["expected_finding_checks"],
@@ -591,7 +716,7 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
     for name in RETIRED_TABLES:
         (out / f"{name}.csv").unlink(missing_ok=True)
-    for name in ("presence", "whole_image", "region_presence", "regions", "per_image", "stage_changes",
+    for name in ("presence", "whole_image", "region_presence", "regions", "occupied_regions", "per_image", "stage_changes",
                  "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage", "parser_usage",
                  "case_breakdown", "case_condition_breakdown", "run_comparison", "run_changes",
                  "experiment_overview", "finding_comparison", "situation_comparison",

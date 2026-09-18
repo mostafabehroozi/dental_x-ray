@@ -163,16 +163,20 @@ class RunAndEvaluateTests(unittest.TestCase):
         self.assertEqual(set(results), {"img1", "img2"})
         f = results["img1"]["findings"]
         self.assertEqual(f["dental_filling"], {"asked": True, "tasks": ["fillings"], "presence": "yes", "whole_image": "yes",
-                                               "regions": ["upper-left"], "region_count": 1})
-        self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right", "lower-left"])
+                                               "whole_image_regions": ["upper-left"], "regions": ["upper-left"],
+                                               "unresolved_regions": [], "region_count": 1, "count_status": "resolved"})
+        self.assertEqual((f["impacted_tooth"]["regions"], f["impacted_tooth"]["region_count"]), (["lower-right", "lower-left"], 2))
         self.assertEqual(f["prosthetic_restoration"]["tasks"], ["prosthetic_crown", "prosthetic_bridge"])
         self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]),
                          ("yes", ["upper-anterior"]))
-        self.assertEqual(f["carious_lesion"]["regions"], [])
-        self.assertIsNone(f["dental_implant"]["presence"])
-        self.assertEqual(f["surgical_device"]["asked"], False)
+        # Reported without a region: the count is unavailable, not zero.
+        self.assertEqual((f["carious_lesion"]["regions"], f["carious_lesion"]["region_count"], f["carious_lesion"]["count_status"]),
+                         ([], None, "unlocated"))
+        self.assertEqual((f["dental_implant"]["presence"], f["dental_implant"]["count_status"]), (None, "unresolved"))
+        self.assertEqual((f["surgical_device"]["asked"], f["surgical_device"]["count_status"]), (False, "not_assessed"))
         self.assertEqual(f["root_fragment"], {"asked": True, "tasks": ["residual_root"], "presence": "no", "whole_image": "no",
-                                             "regions": None, "region_count": None})
+                                             "whole_image_regions": None, "regions": None, "unresolved_regions": [],
+                                             "region_count": 0, "count_status": "resolved"})
         self.assertEqual(results["img1"]["tasks"]["residual_crown"]["presence"], "yes")
         self.assertEqual(results["img1"]["call_count"], 13)
         self.assertEqual(results["img2"]["call_count"], 13)

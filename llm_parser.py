@@ -54,7 +54,10 @@ import run_monitor as mon
 from response_cache import ResponseCache
 
 MODES = ("code", "llm", "code_then_llm")
-PROMPT_VERSION = 1
+# 2: the location prompt maps FDI tooth numbers through dental_pipeline.unit_cell (the reply's "left"
+# is FDI quadrants 1 and 4, which version 1 told the parser the other way round) and refuses to expand
+# a broad site into several regions.
+PROMPT_VERSION = 2
 
 # ----------------------------------------------------------------------------
 # The eligible stages, their default manual-mode mode, and why it is that one
@@ -209,9 +212,10 @@ The model was trained to write its locations with these fixed phrases; they map 
 RULES
 1. "left" and "right" are the reply's own words and the identifiers above use the same convention. Copy the side the reply states; never flip it, never convert it to the patient's side, never reason about how a radiograph is displayed.
 2. List every region the reply places THIS finding in, in any wording. A reply may name a region with the fixed phrases above, with a paraphrase ("the lower left back teeth", "the upper front region", "both posterior segments of the mandible"), with a quadrant name, with tooth numbers, or by describing the site in a sentence. Read the meaning and map it onto the identifiers.
-3. Several regions are normal. A phrase naming two regions at once ("the right posterior region of both the upper and lower dentition") is two identifiers. "Both posterior regions of the lower dentition" is lower-right and lower-left. A finding stated in several places is every one of them. Never collapse several regions into one and never add a region the reply does not place the finding in.
+3. Several regions are normal. A phrase naming two regions at once ("the right posterior region of both the upper and lower dentition") is two identifiers. "Both posterior regions of the lower dentition" is lower-right and lower-left. A finding stated in several places is every one of them. The same region named twice is one identifier. Never collapse several regions into one and never add a region the reply does not place the finding in: a site too broad to map ("the posterior teeth", "the lower jaw", "at the back", with no side or no arch) is not several regions and must not be expanded into them - when it is the only site given, the location is unresolved (rule 7).
 4. Only regions where the reply places THIS finding count. A region the reply mentions in order to rule the finding out, or to describe some other structure or some other finding, is NOT a region for this finding.
-5. Tooth numbers, when the reply gives them, use the FDI system: quadrant 1 = upper right, 2 = upper left, 3 = lower left, 4 = lower right (the reply's own left and right); positions 1-3 of a quadrant are its anterior region and positions 4-8 its posterior region. The upper-anterior identifier covers quadrants 1 and 2 anterior, and lower-anterior covers quadrants 3 and 4 anterior.
+5. Tooth numbers, when the reply gives them, use the FDI system (two digits: quadrant, then position 1-8 from the midline). Map them with this table and nothing else - it already applies the model's own left/right convention, which is not the patient's side, so never re-derive a side from a quadrant's name:
+{fdi_lines}
 6. An empty list is a real answer and the right one when the reply states the finding but never says where. Do NOT use "unresolved" for that.
 7. Use "unresolved": true only when the reply does place the finding somewhere but you cannot tell where - the wording is contradictory, the site is named in a way that does not map onto these six regions, or the text is cut off in the middle of the location.
 8. TRUNCATION: {truncation}. Regions that are complete before the cut still count; if the cut interrupts a location, mark the answer unresolved.
@@ -379,6 +383,16 @@ def _cell_lines() -> str:
 
 def _descriptor_lines() -> str:
     return "\n".join(f'- "{text}" -> {", ".join(cells)}' for text, cells in dp.DESCRIPTORS.items())
+
+
+def _fdi_lines() -> str:
+    """FDI quadrant -> identifier, from the same unit_cell mapping the scorer and the adapters use, so the
+    parser can never read a tooth number onto a different side than the code does."""
+    names = {1: "upper right", 2: "upper left", 3: "lower left", 4: "lower right"}
+    return "\n".join(
+        f"- quadrant {q} (the patient's {names[q]}, teeth {q}1-{q}8): positions 1-3 -> "
+        f"{dp.unit_cell(f'Q{q}-anterior')}, positions 4-8 -> {dp.unit_cell(f'Q{q}-posterior')}"
+        for q in (1, 2, 3, 4))
 
 
 # ----------------------------------------------------------------------------
@@ -755,8 +769,10 @@ class ParserService:
 
     # -- configuration -------------------------------------------------------
     def settings(self) -> dict:
-        """What every manifest records, so a resumed run cannot read saved text a second way."""
+        """What every manifest records, so a resumed run cannot read saved text a second way. The side
+        convention is part of it: the location prompt's tooth-number table is built from it."""
         return {"policy": self.policy.settings(), "model": self.model.settings() if self.model else None,
+                "left_is_image_left": dp.LEFT_IS_IMAGE_LEFT,
                 "stages": {stage: {k: spec[k] for k in ("default_mode", "what", "why", "input")}
                            for stage, spec in STAGES.items()}}
 
@@ -923,6 +939,7 @@ class ParserService:
             block = f"THE QUESTION IT WAS ASKED\n{question}\n\n" if question else ""
             return LOCATION_SYSTEM, _fill(LOCATION_USER, question_block=block, text=text,
                                           cell_lines=_cell_lines(), descriptor_lines=_descriptor_lines(),
+                                          fdi_lines=_fdi_lines(),
                                           truncation=TRUNCATED_NOTE if truncated else COMPLETE_NOTE)
 
         return self._run(stage, code=code, prompt=prompt, read=_read_location,

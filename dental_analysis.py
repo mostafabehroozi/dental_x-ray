@@ -1,6 +1,6 @@
 """Offline DentVLM diagnostics. Reuses the branch's scorer and vote/OR rules.
 
-Unasked findings are not unresolved; named-cell multiplicity is not a tooth count.
+Unasked findings are not unresolved; an occupied-region count is a number of regions, not of teeth.
 Saved phrasings include any parse repairs, so replay is not a retries-OFF run.
 """
 from __future__ import annotations
@@ -39,8 +39,12 @@ def presence_changes(gt, before, after, comparison, before_field="presence", aft
             for (condition, transition), ids in sorted(groups.items())]
 
 
-def _score(gt, results, evaluate_location):
-    return ev.evaluate(gt, results, evaluate_location=evaluate_location, include_analysis=False)
+def _score(gt, results, evaluate_location, counting=True):
+    return ev.evaluate(gt, results, evaluate_location=evaluate_location, counting=counting, include_analysis=False)
+
+
+COUNT_METRICS = ("expected_count_checks", "scored_count_checks", "excluded_count_checks", "exact_rate", "mae",
+                 "overcount_rate", "undercount_rate", "exact_rate_of_expected")
 
 
 def metrics(gt, report):
@@ -50,6 +54,9 @@ def metrics(gt, report):
     row["annotated_checks"] = sum(len(e["annotated"]) for e in gt.values())
     row["not_assessed_checks"] = row["annotated_checks"] - row["expected_finding_checks"]
     row["coverage"] = ev._ratio(row["scored_finding_checks"], row["expected_finding_checks"])
+    # Occupied-region counts: None (not zeros) when counting was off or the run asked presence only.
+    occupied = summary.get("occupied_regions") or {}
+    row.update({"count_" + k: occupied.get(k) for k in COUNT_METRICS})
     rows = report["regions"]
     row["regions_scored"] = sum(r["n_localized_cases"] for r in rows)
     for metric in ("exact_set_match_rate", "mean_jaccard"):
@@ -74,6 +81,7 @@ def finding_rows(gt, report):
     presence = {r["condition"]: r for r in report.get("presence", [])}
     whole = {r["condition"]: r for r in report.get("whole_image", [])}
     regions = {r["condition"]: r for r in report.get("regions", [])}
+    counts = {r["condition"]: r for r in report.get("occupied_regions", []) if r["stage"] == "presence"}
     region_presence = defaultdict(list)
     for row in report.get("region_presence", []):
         region_presence[row["condition"]].append(row)
@@ -92,7 +100,7 @@ def finding_rows(gt, report):
                     **{k: None for k in ("TP", "TN", "FP", "FN")}, "unparseable": 0,
                     **{k: None for k in ("sensitivity", "specificity", "ppv", "f1")}}
         scored = sum(base[k] or 0 for k in ("TP", "TN", "FP", "FN"))
-        before, location = whole.get(condition, {}), regions.get(condition, {})
+        before, location, count = whole.get(condition, {}), regions.get(condition, {}), counts.get(condition, {})
         regional = region_presence.get(condition, [])
         regional_cells = {k: sum(r.get(k, 0) for r in regional) for k in ("TP", "TN", "FP", "FN")}
         regional_scores = (ev._prf(regional_cells["TP"], regional_cells["FP"],
@@ -121,6 +129,7 @@ def finding_rows(gt, report):
             "location_f1": location.get("f1"),
             "region_exact_rate": location.get("exact_set_match_rate"),
             "region_jaccard": location.get("mean_jaccard"),
+            **{"count_" + k: count.get(k) for k in COUNT_METRICS},
         })
     return rows
 
@@ -200,7 +209,7 @@ def recovery_rows(gt, results, evaluate_location):
             for (stage, task, status), items in sorted(groups.items())]
 
 
-def phrasing_analysis(gt, results, evaluate_location):
+def phrasing_analysis(gt, results, evaluate_location, counting=True):
     first_results, eligible, votes = {}, {}, defaultdict(list)
     for image_id, entry in gt.items():
         result = results[image_id]
@@ -234,27 +243,30 @@ def phrasing_analysis(gt, results, evaluate_location):
     region_rows = []
     # Rationale regions only: region questions overwrite task regions and do not use region_vote.
     subset = {i: e for i, e in eligible.items() if results[i]["location_level"] == "rationale"}
-    if evaluate_location and subset:
+    if (evaluate_location or counting) and subset:
         for mode in ("union", "majority"):
             replay = {}
             for image_id, entry in subset.items():
                 result = results[image_id]
+                protocol = dp.Protocol(**result["protocol"])
                 findings = dict(result["findings"])
                 for condition in entry["annotated"]:
-                    finding = findings[condition]
-                    decisions = [dp.vote(result["tasks"][k]["answers"], mode) for k in finding["tasks"]]
-                    presence = dp._any_yes(d["presence"] for d in decisions)
-                    regions = sorted({r for d in decisions if d["presence"] == "yes" for r in (d["regions"] or [])})
-                    findings[condition] = {**finding, "presence": presence,
-                                           "regions": regions if presence == "yes" else None,
-                                           "region_count": len(regions) if presence == "yes" else None}
+                    # The same aggregation the run used (any-yes over the tasks, regions merged, then
+                    # counted), with only the region vote replaced; a count is never summed over votes.
+                    tasks = {}
+                    for k in findings[condition]["tasks"]:
+                        decision = dp.vote(result["tasks"][k]["answers"], mode)
+                        tasks[k] = {**decision, "whole_image": decision["presence"],
+                                    "whole_image_regions": decision["regions"]}
+                    findings[condition] = dp._finding(condition, tasks, protocol)
                 replay[image_id] = {**result, "findings": findings}
-            region_rows.append({"region_vote": mode, **metrics(subset, _score(subset, replay, True)),
+            region_rows.append({"region_vote": mode,
+                                **metrics(subset, _score(subset, replay, evaluate_location, counting)),
                                 "image_ids": sorted(subset)})
     return changes, vote_rows, region_rows
 
 
-def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
+def analyze(gt, results, *, dataset="dataset", evaluate_location=True, counting=True):
     results = {i: results[i] for i in gt}
     buckets = defaultdict(lambda: defaultdict(set))
     for image_id, entry in gt.items():
@@ -268,6 +280,8 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
                 labels.append(("finding_types_in_image", "0" if not present else "1-2" if len(present) <= 2 else "3+"))
                 labels.append(("instances_of_finding", "1" if len(boxes) == 1 else "2+") if boxes else
                               ("absent_finding_context", "other_findings_present" if present else "no_annotated_findings"))
+                if counting and result["location_level"] != "none":
+                    labels.append(("count_status", dp.finding_count(finding, result["location_level"])["count_status"]))
                 if evaluate_location and result["location_level"] != "none":
                     if finding["presence"] == "yes":
                         named = finding["regions"]
@@ -286,7 +300,7 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
     for (situation, group), members in sorted(buckets.items()):
         subset = {i: {**gt[i], "annotated": conditions} for i, conditions in members.items()}
         report = ev.evaluate(subset, results, dataset=dataset, evaluate_location=evaluate_location,
-                             include_analysis=False)
+                             counting=counting, include_analysis=False)
         rows.append({"dataset": dataset, "situation": situation, "group": group,
                      **metrics(subset, report), "image_ids": sorted(members)})
         for row in finding_rows(subset, report):
@@ -294,7 +308,7 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
                                    "image_ids": sorted(i for i, conditions in members.items()
                                                        if row["condition"] in conditions)})
     regional = {i: e for i, e in gt.items() if results[i]["location_level"] == "regions"}
-    changes, votes, region_votes = phrasing_analysis(gt, results, evaluate_location)
+    changes, votes, region_votes = phrasing_analysis(gt, results, evaluate_location, counting)
     changes += presence_changes(regional, results, results, "whole_image_to_regions", before_field="whole_image")
     return {"stage_changes": changes, "phrasing_votes": votes, "region_vote_comparison": region_votes,
             "parse_recovery": recovery_rows(gt, results, evaluate_location),
@@ -302,11 +316,12 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True):
             "case_breakdown": rows, "case_condition_breakdown": condition_rows}
 
 
-def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
+def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True, counting=True):
     """First named dataset directory is the reference; rescore selected images on one truth.
 
     Pair only findings asked and resolved in both runs. Additional assessed classes
-    are reported separately, especially when ask_untrained changes.
+    are reported separately, especially when ask_untrained changes. Location and counts both
+    need the location truth, so the notebook leaves both out of the paired table.
     """
     if len(run_dirs) < 2 or not gt:
         raise ValueError("comparison needs at least two runs and non-empty ground truth")
@@ -333,19 +348,20 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True):
                     raise ValueError(f"{name}/{image_id}: cell-side conventions differ")
         if reference is None:
             reference, reference_name = results, name
-        report = _score(gt, results, evaluate_location)
+        report = _score(gt, results, evaluate_location, counting)
         transitions = presence_changes(gt, reference, results, "reference_to_run")
         changes.extend({"run": name, "reference": reference_name, **r} for r in transitions)
         totals = {r["transition"]: r["checks"] for r in transitions if r["condition"] == "ALL"}
         paired = {i: {**e, "annotated": {c for c in e["annotated"]
                   if all(run[i]["findings"][c]["asked"] and run[i]["findings"][c]["presence"] in ("yes", "no")
                          for run in (reference, results))}} for i, e in gt.items()}
-        old, new = _score(paired, reference, False)["summary"], _score(paired, results, False)["summary"]
+        old, new = _score(paired, reference, False, False)["summary"], _score(paired, results, False, False)["summary"]
         row = {"run": name, "reference": reference_name, "dataset": dataset, "config_hash": manifest.get("hash"),
                "model": manifest.get("runner", {}).get("model"), "runner_settings": manifest.get("runner", {}),
                **{k: manifest["protocol"].get(k) for k in ("phrasings", "region_vote", "location",
                                                          "ask_untrained", "extra_tasks", "parse_retries")},
-               "evaluate_location": evaluate_location, "location_truth": report["summary"]["location_truth"],
+               "evaluate_location": evaluate_location, "counting": counting,
+               "location_truth": report["summary"]["location_truth"],
                **metrics(gt, report), "paired_checks": new["scored_finding_checks"],
                "paired_reference_f1": old["f1"], "paired_run_f1": new["f1"],
                "paired_f1_delta": round(new["f1"] - old["f1"], 4) if None not in (old["f1"], new["f1"]) else None,
@@ -387,7 +403,7 @@ def compact_views(ground_truth, reports):
             "dataset": dataset, "experiment": experiment,
             **{k: protocol.get(k) for k in ("phrasings", "region_vote", "location",
                                              "ask_untrained", "extra_tasks", "parse_retries")},
-            "evaluate_location": summary.get("evaluate_location"),
+            "evaluate_location": summary.get("evaluate_location"), "counting": summary.get("counting"),
             "images": summary["images_scored"], "annotated_checks": extra["annotated_checks"],
             "not_assessed_checks": extra["not_assessed_checks"],
             "expected_checks": summary["expected_finding_checks"],
@@ -405,6 +421,7 @@ def compact_views(ground_truth, reports):
                for k in ("TP", "TN", "FP", "FN")},
             "region_presence_f1": extra["region_presence_f1"],
             "side_agreement_rate": extra["side_agreement_rate"], "location_excluded": extra["regions_excluded"],
+            **{"count_" + k: extra["count_" + k] for k in COUNT_METRICS},
         })
         findings.extend({"experiment": experiment, **row} for row in finding_rows(gt, report))
         situations.extend({"experiment": experiment, **row} for row in report.get("case_breakdown", []))

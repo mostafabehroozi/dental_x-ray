@@ -10,9 +10,11 @@ Communications 2026; arXiv 2509.23344) was trained and evaluated on:
   the location with one of nine fixed descriptors ("the left posterior region
   of the upper dentition", ...). Location is read from that rationale exactly
   as the authors' scorer does; nothing about location is ever asked in words.
-* Multiplicity is the number of distinct regions the model names (0-6). The
-  model is never asked to count teeth: it only decides presence, and a finding
-  is scored per image and per cell as present or absent.
+* Multiplicity is the number of distinct regions the model reports a finding in
+  (0-6): the size of the deduplicated region set, never the number of boxes,
+  teeth, mentions or Yes answers. The model is never asked to count: it only
+  decides presence, and the count is derived from the regions with an explicit
+  status (count_block), so "no region named" and "nothing found" stay apart.
 * The region comparison asks every task once per dental-arch region, on the
   whole uncropped image, by naming the region inside the task's own question
   with the model's own words: "... has caries in the left posterior region of
@@ -559,28 +561,99 @@ def cell_answers(result: dict, parser=None) -> dict[str, dict[str, str | None]]:
     return answers
 
 
-def _finding(condition: str, tasks: dict, protocol: Protocol) -> dict:
+COUNT_STATUSES = ("resolved", "partial", "unlocated", "unresolved", "no_location", "not_assessed")
+
+
+def count_block(presence: str | None, regions: list[str] | None, unresolved=(), location: str = "rationale") -> dict:
+    """The occupied-region count of one finding and the status that says what it rests on.
+
+    The count is the size of the deduplicated region set, so several boxes, teeth or mentions in one
+    region are one; it is never a tooth or lesion count. "region_count" is an integer only when the
+    status is "resolved":
+
+    * "resolved"    - an accepted No is 0 regions; a Yes with every region read is the number named.
+    * "partial"     - region questions: some regions answered Yes and at least one stayed unresolved,
+                      so `regions` is a confirmed lower bound and the unresolved ones the upper bound.
+    * "unlocated"   - the finding was reported but no region was named (a rationale that says
+                      nothing about where): the total is unavailable, not a reliable zero.
+    * "unresolved"  - the decision, or the location of a reported finding, could not be read.
+    * "no_location" - the protocol asked presence only, so there is no region evidence to count.
+    """
+    if location == "none":
+        return {"region_count": None, "count_status": "no_location"}
+    if presence is None or (presence == "yes" and regions is None):
+        return {"region_count": None, "count_status": "unresolved"}
+    if presence == "no":
+        return {"region_count": 0, "count_status": "resolved"}
+    if unresolved:
+        return {"region_count": None, "count_status": "partial"}
+    if not regions:
+        return {"region_count": None, "count_status": "unlocated"}
+    return {"region_count": len(regions), "count_status": "resolved"}
+
+
+def finding_count(finding: dict, location: str, unresolved=()) -> dict:
+    """The count block a saved finding carries, or the one its presence and regions imply.
+
+    A result written before the block existed does not record which regions the region questions
+    left unresolved; a caller that reconstructed them from the saved calls passes them as `unresolved`
+    so a partial region set is not read as a total.
+    """
+    if "count_status" in finding:
+        return {"region_count": finding["region_count"], "count_status": finding["count_status"]}
+    if not finding.get("asked"):
+        return {"region_count": None, "count_status": "not_assessed"}
+    return count_block(finding["presence"], finding.get("regions"), finding.get("unresolved_regions") or unresolved,
+                       location)
+
+
+def _merge_regions(keys, tasks: dict, presence_field: str, regions_field: str) -> list[str] | None:
+    """The deduplicated regions of a finding from the tasks that reported it under `presence_field`.
+
+    A known region stays known even beside a task whose location is unresolved; only when no reporting
+    task's location could be read at all do the regions stay None (unresolved, not the empty set).
+    """
+    named, unresolved, reported = set(), False, False
+    for k in keys:
+        if tasks[k][presence_field] == "yes":
+            reported = True
+            cells = tasks[k].get(regions_field)
+            if cells is None:  # the task reported it but its location is unresolved
+                unresolved = True
+            else:
+                named.update(cells)
+    if not reported or (unresolved and not named):
+        return None
+    return [c for c in CELLS if c in named]
+
+
+def _finding(condition: str, tasks: dict, protocol: Protocol, cells: dict | None = None) -> dict:
+    """One benchmark finding from its tasks: presence, the deduplicated region set, and its count.
+
+    `cells` ({task: {cell: yes/no/None}}, region questions only) lets the finding record the regions
+    no task answered Yes for and at least one left unresolved, which makes its count partial rather
+    than a total. The whole-image stage is kept next to the authoritative one (presence and regions
+    from the rationales; in rationale mode both stages are the same answers).
+    """
     keys = condition_tasks(condition, protocol.ask_untrained)
     if not keys or any(k not in tasks for k in keys):
-        return {"asked": False, "tasks": [], "presence": None, "whole_image": None, "regions": None,
-                "region_count": None}
+        return {"asked": False, "tasks": [], "presence": None, "whole_image": None, "whole_image_regions": None,
+                "regions": None, "unresolved_regions": [], "region_count": None, "count_status": "not_assessed"}
     presence = _any_yes(tasks[k]["presence"] for k in keys)
-    regions = None
-    if presence == "yes" and protocol.location != "none":
-        named, unresolved = set(), False
-        for k in keys:
-            if tasks[k]["presence"] == "yes":
-                if tasks[k]["regions"] is None:  # the task reported it but its location is unresolved
-                    unresolved = True
-                else:
-                    named.update(tasks[k]["regions"])
-        # A known region stays known even beside an unresolved task; only when nothing at all could be
-        # read do the regions stay None, which the evaluation already counts as unparseable location.
-        if named or not unresolved:
-            regions = [c for c in CELLS if c in named]
+    regions = _merge_regions(keys, tasks, "presence", "regions") if protocol.location != "none" else None
+    unresolved = []
+    if cells is not None and presence == "yes":
+        for cell in CELLS:
+            votes = [cells[k].get(cell) for k in keys]
+            if "yes" not in votes and None in votes:
+                unresolved.append(cell)
+    whole_image = _any_yes(tasks[k]["whole_image"] for k in keys)
+    whole_regions = (_merge_regions(keys, tasks, "whole_image", "whole_image_regions")
+                     if protocol.location == "regions" else regions)
     return {"asked": True, "tasks": list(keys), "presence": presence,
-            "whole_image": _any_yes(tasks[k]["whole_image"] for k in keys), "regions": regions,
-            "region_count": len(regions) if regions is not None else None}
+            "whole_image": whole_image, "whole_image_regions": whole_regions,
+            "regions": regions, "unresolved_regions": unresolved,
+            **count_block(presence, regions, unresolved, protocol.location)}
 
 
 def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(), parser=None) -> dict:
@@ -657,27 +730,30 @@ def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(
             warning = {"kind": "phrasing_tie", "task": task, "answers": parsed_answers, "policy": "neutral"}
             aggregation_warnings.append(warning)
             llm_api.monitor("AGGREGATION WARNING", f"task={task}", reason="phrasing tie", policy="neutral")
+        # The whole-image stage, kept whatever the region questions decide below.
         tasks[task]["whole_image"] = tasks[task]["presence"]
+        tasks[task]["whole_image_regions"] = tasks[task]["regions"] if protocol.location != "none" else None
 
+    region_cells = None
     if protocol.location == "regions":
         # The same whole image, one question per region: the task's own sentence with one of the model's
         # nine location descriptors inside it. Every region is asked every task, whatever the whole image
         # answered, so a task missed with the model's attention spread over the whole image can be
         # recovered in a region: it is present when any region says yes, absent when every region says no.
         # Task-major (each finding walked region by region); every call shares the same image prefix.
-        cell_answers = {task: {} for task in tasks}
+        region_cells = {task: {} for task in tasks}
         for task in tasks:
             for cell in CELLS:
                 answer, _ = ask("region", task, cell, path, region_question(task, cell))
-                cell_answers[task][cell] = answer
-        for task, answers in cell_answers.items():
+                region_cells[task][cell] = answer
+        for task, answers in region_cells.items():
             presence = tasks[task]["presence"] = _any_yes(answers.values())
             tasks[task]["regions"] = [c for c in CELLS if answers[c] == "yes"] if presence == "yes" else None
     elif protocol.location == "none":
         for task in tasks:
             tasks[task]["regions"] = None
 
-    findings = {c: _finding(c, tasks, protocol) for c in CONDITIONS}
+    findings = {c: _finding(c, tasks, protocol, region_cells) for c in CONDITIONS}
     for condition, finding in findings.items():
         decisions = [tasks[k]["presence"] for k in finding["tasks"] if tasks[k]["presence"] is not None]
         if "yes" in decisions and "no" in decisions:
@@ -725,6 +801,10 @@ def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | Non
                               for task in protocol.tasks()} if protocol.location == "regions" else None),
         "runner": runner_settings, "provenance": provenance or {},
         "parse_recovery_version": 1,
+        # 2: every finding carries its occupied-region count with a status, the regions left unresolved
+        # by the region questions, and the whole-image stage's regions next to the authoritative ones.
+        # A directory written under version 1 is refused rather than filled with two finding schemas.
+        "findings_version": 2,
     }
     if parser is not None and parser.policy.uses_llm():
         config["parser"] = parser.settings()
@@ -864,8 +944,13 @@ def protocol_level(result: dict) -> str:
     return result.get("location_level", LOCATION_LEVELS[0])
 
 
-def dentist_report(result: dict) -> str:
-    """Deterministic plain-text summary of one image result for a dentist."""
+def dentist_report(result: dict, counting: bool = True) -> str:
+    """Deterministic plain-text summary of one image result for a dentist.
+
+    With counting on, a present finding says in how many regions it was reported (regions, never
+    teeth), and a partial region set is called at least that many; with counting off the regions are
+    listed without a number.
+    """
     flag = result.get("left_is_image_left", LEFT_IS_IMAGE_LEFT)
     present, absent, unclear, not_assessed = [], [], [], []
     for condition in CONDITIONS:
@@ -876,8 +961,15 @@ def dentist_report(result: dict) -> str:
         elif finding["presence"] == "yes":
             parts = [label]
             if finding["regions"]:
-                parts.append(f"in {len(finding['regions'])} region(s): "
-                             + ", ".join(describe_cell(c, flag) for c in finding["regions"]))
+                where = ", ".join(describe_cell(c, flag) for c in finding["regions"])
+                unresolved = finding.get("unresolved_regions") or []
+                if not counting:
+                    parts.append(f"regions: {where}")
+                elif unresolved:
+                    parts.append(f"in at least {len(finding['regions'])} region(s) ({len(unresolved)} region(s) "
+                                 f"could not be read): {where}")
+                else:
+                    parts.append(f"in {len(finding['regions'])} region(s): {where}")
             elif finding["regions"] is not None:
                 parts.append("region not stated")
             elif protocol_level(result) != "none":

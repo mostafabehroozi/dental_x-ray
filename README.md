@@ -1,9 +1,10 @@
 # DentVLM panoramic findings pipeline
 
-A small wrapper that gets findings, their regions, and a multiplicity signal out
+A small wrapper that gets findings, their regions, and an occupied-region count
+(in how many distinct regions a finding is reported, never how many teeth) out
 of DentVLM (a 7B dental vision-language model) on panoramic radiographs, while
 sending it only questions it was trained and evaluated on. Everything else
-(task decomposition, aggregation, scoring) happens in Python.
+(task decomposition, aggregation, counting, scoring) happens in Python.
 
 ## Experiments
 
@@ -97,11 +98,21 @@ cropped-panoramic training, and no JSON or tag format. So:
   onto six dental-arch cells (upper/lower x left/anterior/right). `location="regions"`
   asks instead, region by region, using those same descriptor strings inside the
   task's own question and never cropping the image.
-* **Multiplicity** is the number of cells named (0 to 6), reported as
-  "in N region(s)". DentVLM is never asked to count teeth: it has no count
-  task, so the model is asked presence only and the evaluation scores each
+* **Multiplicity** is the number of distinct cells a finding is reported in
+  (0 to 6): the size of the deduplicated region set, never the number of
+  boxes, teeth, mentions or Yes answers, reported as "in N region(s)". DentVLM
+  is never asked to count: it has no count task, so the model is asked
+  presence only and the count is derived from the regions with an explicit
+  status (`dental_pipeline.count_block`): `resolved` (an accepted No is 0; a
+  Yes with every region read is the number named), `partial` (region
+  questions: some regions Yes, at least one unreadable, so the confirmed
+  regions are a lower bound), `unlocated` (reported, but no region named: the
+  total is unavailable, not zero) and `unresolved`. The evaluation scores each
   finding as present or absent per image and per cell (`region_presence.csv`),
-  so a class that occurs several times in an image or a cell is scored once.
+  so a class that occurs several times in a cell is scored once, and compares
+  the count with the number of distinct cells the true boxes occupy
+  (`occupied_regions.csv`, the `counting` knob; see "Optional location
+  scoring and counting").
 * **Findings without a DentVLM task** (furcation involvement, apical surgery,
   root resorption, orthodontic appliances, surgical plates) are not asked and
   are reported as "not assessed by this model". `ask_untrained`
@@ -160,7 +171,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 | File | Role |
 | --- | --- |
 | `dental_pipeline.py` | task table and verbatim questions, answer and region extraction, protocol knobs, model runner, resumable run loop, dentist summary |
-| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell, side-convention check, CSV/JSON export |
+| `dental_eval.py` | ground-truth loaders (UMFIH YOLO, DENTEX with FDI tooth numbers), location truth (adapted, FDI, or fixed windows), metrics incl. presence per cell and occupied-region counts (one primary cell per true box), side-convention check, CSV/JSON export |
 | `dental_analysis.py` | offline phrasing/vote and region comparisons, recovery, case breakdowns, paired saved-run comparisons |
 | `response_cache.py` | immutable, content-addressed reuse of exact local DentVLM responses across compatible experiments |
 | `location_adapter.py` | translates ground-truth boxes into the six cells: vision-LLM adapter (numbered boxes drawn on the image), per-image area adapter (the cell areas of that radiograph, then geometry), experimental DentVLM spotlight adapter, resumable per-dataset run |
@@ -171,7 +182,7 @@ side, and the notebook checks the convention against DENTEX boxes.
 | `llm_parser.py` | reading what the models wrote: the strict readers, the optional parser LLM behind them, one mode per stage plus a global override, the prompts, and the record of every parse |
 | `run_monitor.py` | the console and failure side of a run: dense per-item progress with ETA, call counters with a print policy, the failure ledger and the guard that keeps a loop alive |
 | `main_notebook.ipynb` | Kaggle runner; the experiments to run and compare are Cell 3, the ranking is Cell 11 |
-| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_llm_api.py`, `test_llm_parser.py`, `test_experiments.py`, `test_response_cache.py`, `test_run_monitor.py` | offline tests with fake models (`python -m unittest -q`) |
+| `test_dental_pipeline.py`, `test_location_adapter.py`, `test_report_writer.py`, `test_location_scoring.py`, `test_region_counting.py`, `test_llm_api.py`, `test_llm_parser.py`, `test_experiments.py`, `test_response_cache.py`, `test_run_monitor.py` | offline tests with fake models (`python -m unittest -q`) |
 
 ## Small evaluation comparisons (Cells 11 and 12)
 
@@ -183,7 +194,7 @@ The existing finding and location scoring rules are preserved.
 | --- | --- |
 | `stage_changes` | First saved phrasing vs whole-image vote, and whole-image vs region-question outcomes. Includes corrected errors, new errors, unchanged, unresolved and not-assessed outcomes; overall and per finding. |
 | `phrasing_votes` | Agreement, disagreement, ties, and unresolved phrasings per task. Available when multiple phrasing answers were saved. |
-| `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules. Only for rationale mode with multiple saved phrasings; region-question locations do not use this vote. |
+| `region_vote_comparison` | Union vs majority using identical saved rationale answers and the existing vote/OR rules, re-aggregated with `dental_pipeline._finding` so the regions are merged first and counted after (never a sum over wordings); the count metrics come with it. Only for rationale mode with multiple saved phrasings; region-question locations do not use this vote. |
 | `parse_recovery` | First-pass, recovered, unresolved questions by task/stage, plus correctness where ground truth supports it. Each phrasing is a separate question. |
 | `call_usage` | Recorded analyzer completions, tokens and latency, split into first attempts and parse retries. Logical calls, actual inference calls and cache hits are separate, with inference-only token/latency totals. Missing usage is unavailable; transport attempts are not separate saved completions. |
 | `case_breakdown` | Trained/untrained task support, instance counts, other findings, named/true cells, boundary-crossing boxes, and location-truth sources. Unasked findings remain not assessed. |
@@ -201,8 +212,8 @@ they do not simulate retries OFF or change predictions. Crown and bridge are
 combined with the existing OR rule before finding scoring. Their individual retry
 answers cannot be graded from the merged restoration label, so correctness is
 unavailable for those tasks; extra tasks without benchmark labels are likewise
-unscored. A recovered parse can still be wrong. Named-cell multiplicity is never
-treated as a tooth count.
+unscored. A recovered parse can still be wrong. An occupied-region count is
+never treated as a tooth count.
 
 Cell 11 compares the experiments of Cell 3 automatically: every experiment with a
 complete set of results for a dataset is scored paired against the first one and
@@ -409,6 +420,18 @@ truncation. `"llm"` is the default wherever the strict reader can succeed while
 losing the meaning, because consulting it first would hide the very thing the
 second reader is there to catch.
 
+The location prompt is what makes the occupied-region count trustworthy when
+the parser reads a rationale: it lists every region the reply places the
+finding in, a region named twice once, a "both the upper and lower" phrase as
+two, a region mentioned only to deny the finding or to describe another finding
+not at all, and it refuses to expand a broad site ("the posterior teeth", "the
+lower jaw") into several regions - such a site is unresolved, never a guess.
+Its tooth-number table is generated from `dental_pipeline.unit_cell`, the same
+mapping the scorer and the adapters use, so FDI quadrant 1 reads as DentVLM's
+"left" exactly as `fdi_cell` does (prompt version 2; version 1 stated the
+quadrants the other way round). The side convention is part of the parser
+settings, so a flipped `LEFT_IS_IMAGE_LEFT` is a different reading.
+
 **One switch over all ten.** `parser_mode` in Cell 3:
 
 | value | effect |
@@ -553,6 +576,33 @@ the first scores where a detected finding was placed, the second whether each
 cell was called correctly at all, absent findings included. Both need the
 location truth, so they follow `evaluate_location`.
 
+`occupied_regions.csv` (the `counting` knob) compares, per finding and image,
+the number of distinct cells the model reported the finding in with the number
+of distinct cells its true boxes occupy. Every true box is placed in exactly one
+cell (`dental_eval.box_primary_region`: the adapted, FDI or fixed-window cell;
+when several cells hold a box, the one holding the largest share of it, ties to
+cell order), and the cells of one class are deduplicated, so three caries boxes
+in one cell and two in another are a truth count of 2, and the same prediction
+`{A, B}` is exact. A case is scored only when both sides are resolved: an
+accepted No is a predicted 0, so true negatives (exact 0), false alarms
+(overcount) and missed findings (undercount) all count; a Yes without a named
+region (`unlocated`), an unreadable decision or location (`unresolved`), a
+partial region set from the region questions (`partial`) and a finding whose
+true boxes could not be placed (`truth_incomplete`) are excluded under that
+reason and never become a zero. The table gives `exact_rate`, `mae`,
+`overcount_rate` and `undercount_rate` over the scored cases, the expected /
+scored / excluded denominators with the excluded cases by reason, and
+`exact_rate_of_expected`, the end-to-end success over every expected check, so
+an unresolved prediction is charged against the run rather than hidden. In the
+region comparison the table has two rows per finding: `presence` (the region
+questions, the run's answer) and `whole_image` (the rationale stage alone).
+`straddling_truth_boxes` says how many scored true boxes several cells held:
+the location tables keep every cell such a box touches, the count target keeps
+one, so those are the cases where the two families can disagree. A count is
+compared with a count only; a right count with wrong cells (truth `{A, B}`,
+prediction `{A, C}`) is exact here and shows its mistake in `regions.csv`
+(TP 1, FP 1, FN 1, TN 3).
+
 ## Caveats
 
 * The paper reports DentVLM's own location IoU at about 38% on its test set, so
@@ -568,14 +618,43 @@ location truth, so they follow `evaluate_location`.
   UMFIH and no DentVLM task; their rows are not statistically meaningful even
   with `ask_untrained=True`.
 * The weights are CC BY-NC 4.0: research use only.
-## Optional location scoring
+## Optional location scoring and counting
 
-In an experiment, set `evaluate_location = True` (default) to score locations,
-or `False` to skip location scoring and location-truth adapter calls. Finding
-scores remain enabled; inference and saved predictions are unchanged. Presence per cell follows this switch.
-Re-run Cell 3, Cell 10, and Cell 11 to evaluate existing results with this setting;
-no inference rerun is required. Cell 13 also skips its side check when disabled.
-The report records `summary.evaluate_location`. Re-exporting a report with location
-scoring disabled removes its previous location CSVs so stale metrics are not shown.
-The same rule retires `counts.csv`: this branch has no count question, so a
-`counts.csv` written by an earlier version is deleted on re-export.
+Three settings are independent: how findings are asked (`location`:
+`"rationale"`, `"regions"` or `"none"`), whether occupied-region counts are
+scored and reported (`counting`), and whether location correctness is scored
+(`evaluate_location`). Neither switch changes a question, a saved answer or the
+run manifest: both are evaluation and report settings, so an existing run is
+re-scored by re-running Cells 3, 10 and 11 with no inference.
+
+| `counting` | `evaluate_location` | what is scored |
+| --- | --- | --- |
+| off | off | image-level presence only; no true box is placed and no adapter runs |
+| on | off | presence and `occupied_regions.csv`; region identity is ignored in the count comparison, but the regions are still extracted and the truth still adapted (with a hosted `location_truth`, Cell 10 says the adapted truth serves "counts only") |
+| off | on | presence, `region_presence.csv` and `regions.csv`; no count table, no multiplicity in the report |
+| on | on | all three families |
+
+With `counting` off the count leaves everything: the evaluation tables and
+summary, the leaderboard columns, the deterministic summary ("regions: ..."
+instead of "in N region(s): ...") and the dentist report, whose structured
+input, legend and prompt then carry no multiplicity at all. With it on, the
+report gets each present finding's multiplicity as the number of regions it was
+reported in ("reported in two regions", never "two lesions" or "two teeth"),
+or the words that say why there is none: "at least N" for a partial set, "not
+stated" when the model named no region, "unresolved" when its location could
+not be read. `counting` with `location="none"` is refused at build time: there
+is no region evidence to count. The same truth mapping (`location_truth`)
+serves both families, so toggling `evaluate_location` never changes the count
+target. Re-exporting an evaluation with a switch off removes that family's CSVs
+so stale metrics are not shown; the same rule retires `counts.csv`, the count
+question of the other branch, which this branch never writes.
+
+The finding schema of a saved result carries the count (`region_count`,
+`count_status`, `unresolved_regions`, and the whole-image stage's regions next
+to the authoritative ones). It is versioned in the run manifest
+(`findings_version` 2), so a directory written before it is refused on resume
+rather than filled with two schemas; rerun it into a new directory (local
+replies come back from the response cache). Scoring such an older directory
+still works: the count is derived from its presence and regions, and in the
+region comparison the regions left unresolved are reconstructed from its saved
+calls.

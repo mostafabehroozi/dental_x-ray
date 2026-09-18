@@ -129,7 +129,9 @@ class StructuredInputTests(unittest.TestCase):
         impacted = by["impacted_tooth"]
         self.assertEqual((impacted["located_in"], impacted["multiplicity"]), (["lower-right-posterior", "lower-left-posterior"], 2))
         caries = by["carious_lesion"]
-        self.assertEqual((caries["status"], caries["located_in"], caries["multiplicity"]), ("present", [], 0))
+        # Reported without a region: the multiplicity is unknown, never 0.
+        self.assertEqual((caries["status"], caries["located_in"]), ("present", []))
+        self.assertTrue(caries["multiplicity"].startswith("not_stated"))
         self.assertTrue(caries["location_status"].startswith("not_stated"))
         implant = by["dental_implant"]
         self.assertEqual((implant["status"], implant["multiplicity"], set(implant["regions"].values())),

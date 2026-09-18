@@ -125,9 +125,15 @@ class AnalysisTests(unittest.TestCase):
         gt, results = fixture()
         results["img"]["calls"] = [call("fillings", "yes", stage="region", cell="upper-left")]
         with patch.object(ev, "gt_regions", side_effect=AssertionError("location evaluated")):
-            report = ev.evaluate(gt, results, evaluate_location=False)
+            report = ev.evaluate(gt, results, evaluate_location=False, counting=False)
         self.assertEqual(report["region_vote_comparison"], [])
         self.assertEqual(report["parse_recovery"][0]["correctness_scored"], 0)
+        # The union/majority replay also serves the counts: the vote decides the region set that is counted.
+        with patch.object(ev, "gt_regions", side_effect=AssertionError("location evaluated")):
+            counted = ev.evaluate(gt, results, evaluate_location=False, counting=True)
+        modes = {r["region_vote"]: r for r in counted["region_vote_comparison"]}
+        self.assertEqual((modes["union"]["count_exact_rate"], modes["majority"]["count_exact_rate"]), (0.8889, 1.0))
+        self.assertIsNone(modes["union"]["regions_f1"])
         results["img"].pop("tasks")
         results["img"]["calls"] = [{"stage": "presence"}]
         report = ev.evaluate(gt, results)
@@ -171,7 +177,8 @@ class AnalysisTests(unittest.TestCase):
         gt, base = fixture()
         variant = copy.deepcopy(base)
         variant["img"]["protocol"]["ask_untrained"] = True
-        variant["img"]["findings"]["furcation_lesion"].update(asked=True, presence="no")
+        variant["img"]["findings"]["furcation_lesion"].update(asked=True, presence="no", region_count=0,
+                                                              count_status="resolved")
         variant["img"]["findings"]["dental_filling"]["presence"] = None
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp) / "a", Path(tmp) / "b"

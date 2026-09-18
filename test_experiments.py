@@ -159,10 +159,19 @@ class PathAndRoleTests(unittest.TestCase):
             self.assertIsNone(xp.local_response_cache({**base, "reuse_local_responses": False}, server))
 
     def test_adapter_follows_the_location_knobs(self):
-        off, windows = xp.build([{"name": "off", "evaluate_location": False},
-                                 {"name": "windows", "location_truth": "geometry"}], SHARED)
+        off, windows, count_only = xp.build([
+            {"name": "off", "evaluate_location": False, "counting": False},
+            {"name": "windows", "location_truth": "geometry"},
+            {"name": "count-only", "evaluate_location": False, "counting": True, "location_truth": "areas",
+             "adapter": {"base_url": "http://local/v1", "api_key": "k"}}], SHARED)
         self.assertIsNone(xp.location_adapter(off))
         self.assertIsNone(xp.location_adapter(windows))
+        self.assertFalse(xp.uses_location_truth(off))
+        # Counting alone still needs the true boxes placed: the same adapter, the same truth directory.
+        self.assertTrue(xp.uses_location_truth(count_only))
+        with patch.object(xp.llm_api, "connect", return_value=object()):
+            self.assertEqual(xp.location_adapter(count_only).kind, "areas")
+        self.assertEqual(xp.truth_dir(count_only, "d"), xp.truth_dir({**count_only, "evaluate_location": True}, "d"))
 
 
 if __name__ == "__main__":
