@@ -1,0 +1,128 @@
+DentVLM branch - experiment plan and the configurations that matter
+====================================================================
+Branch dentvlm at c96b1ca, worktree ~/dev/projects/Gap-AI-dentvlm, written 2026-09-19.
+The plan is implemented in Cell 3 of main_notebook.ipynb (uncommitted). Companion pages:
+"DentVLM Knob Atlas" (every knob, its values, verdicts) and "DentVLM Defaults Review".
+
+HOW TO RUN
+----------
+1. Cell 3: set PHASE (0..4). Run Cells 3 -> 11. Read the tables named below. Set the next PHASE.
+2. Every phase resumes: finished images are skipped; a DentVLM question already asked on the same
+   image with the same server settings is a cache hit (<output_root>/_response_cache). The sweep pays
+   only for questions nobody has asked yet. Cell 3 prints "budget per image" with exactly those counts.
+3. LIMIT (per phase) = first N images of every dataset. Lower it to fit a Kaggle session (12 h max,
+   30 GPU-h per week); raise it later and the run extends itself.
+4. Before Phase 1, fix the two phrasing rows in dental_pipeline.TASKS (implant #2 asks about
+   "abnormalities with the implant"; calculus #1/#2 differ by one article). The questions are hashed
+   into the run manifest, so do it before 04-phrasings3 exists.
+
+FIXED SETTINGS (SHARED in Cell 3) - one logical value each
+-----------------------------------------------------------
+backend                 "local"      DentVLM through llama.cpp; "api" only for the hosted control (09)
+phrasings               1            paper protocol; 3 in 04; 2 can only tie (unresolved) - never
+region_vote             "union"      majority is replayed for free by Cell 11 (vote_replay_comparison)
+location                "rationale"  paper's scorer; "regions" in 05; "none" throws away free evidence
+ask_untrained           False        True in 02 (+5 calls)
+extra_tasks             False        3-21 unscored calls/image (no UMFIH class); on only for a report demo
+parse_retries           1            one format reminder after an unreadable line 1; free otherwise
+evaluate_location       True         no inference
+counting                True         no inference (exact_rate is dominated by absent findings - read with care)
+location_truth          LOCATION_TRUTH  "areas" or "llm", decided by Phase 0; never "fdm" (circular), never
+                                     "geometry" as the scoring truth (its accuracy is printed for free)
+location_failure_policy "exclude"    unplaceable boxes are excluded and counted, never scored on fixed windows
+adapter                 one strong hosted VLM (gpt-5 by default; OpenRouter alternative in the comment)
+temperature             0.0          authors: 0.1 with top_p 0.001 = greedy
+max_tokens              512          authors' output cap (1024 for the hosted control only)
+ctx_size                16384        authors' max input; must hold 8192 image tokens + question + answer
+image_max_tokens        8192         authors' max_pixels; 1369 (their 1024x1024 bound) in 03; None = hidden 4096
+image_min_tokens        None         no floor, as the authors
+cache_prompt            True         KV prefix reuse per image; speed only
+reuse_local_responses   True         the exact cache the whole plan relies on
+smoke_images            2            raw replies before each run
+report_images           5            one hosted call per report; five are enough to judge the writer
+parser_mode             "code"       the paper's strict readers; None (manual per-stage) only in 10
+reporter / parser       gpt-5 text role (any text model with a key); never scored, never an experiment
+report_language         "English"
+
+THE PHASES
+----------
+PHASE 0  location-truth check - dentex_val only (50 images, exact FDI cells)
+  {"name": "01-paper", "location_truth": "areas"}
+  {"name": "01-paper-truth-llm", "location_truth": "llm"}         (DentVLM replies all cached)
+  cost: 500 DentVLM calls + ~100 hosted adapter calls
+  read: Cell 10 "adapter vs FDI truth" for both (adapter_exact, geometry_exact), summary.side_agreement
+  decide: LOCATION_TRUTH = the adapter with the higher adapter_exact; below ~0.8 spot-check drawn/ images
+
+PHASE 1  core sweep - umfih_test (100) + dentex_val (50)
+  {"name": "01-paper"}                                   10 calls/image   the paired reference
+  {"name": "02-untrained", "ask_untrained": True}        +5 new           zero-shot on the 5 uncovered classes
+  {"name": "03-image1369", "image_max_tokens": 1369}     +10 new          authors' 1024x1024 bound; speed too
+  {"name": "04-phrasings3", "phrasings": 3}              +20 new          stability under rewording + vote
+  cost: 45 new calls/image = 6,750 calls
+  read: comparison/<dataset>/run_comparison (paired_f1_delta, corrected, worsened, became_unresolved);
+        02: finding rows with trained_task=False; 04: stage_changes first_phrasing_to_vote, phrasing_votes,
+        vote_replay_comparison (union vs majority); 03: paired table + seconds per call in [DONE]
+
+PHASE 2  region questions - own LIMIT
+  {"name": "05-regions", "location": "regions"}          +60 new          recognition vs search
+  cost: 9,000 calls on the full pair (more than all of Phase 1); lower LIMIT[2] to fit a session
+  read: whole_image.csv next to presence.csv (FN->TP recovered vs TN->FP added, per finding),
+        stage_changes whole_image_to_regions, region_presence.csv (exact per cell on dentex_val),
+        occupied_regions (stages presence and whole_image)
+
+PHASE 3  interactions - first LIMIT[3]=30 images per dataset; keep only the ones earned
+  {"name": "06-untrained-regions", "ask_untrained": True, "location": "regions"}   +30   if 02 showed signal
+  {"name": "07-regions-1369", "location": "regions", "image_max_tokens": 1369}     +60   if 03 >= 01 and 05 recovered
+  {"name": "08-phrasings3-1369", "phrasings": 3, "image_max_tokens": 1369}         +20   if 03 >= 01 and 04 net-corrected
+  read: the same paired columns on 60 images; treat |delta F1| < ~0.03 as noise at this size
+
+PHASE 4  references - hosted keys
+  {"name": "09-api-control", "backend": "api", "max_tokens": 1024,
+   "analyzer": {"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-instruct", "request_options": {}}}
+        1,500 hosted calls; is the dental foundation model better than a frontier VLM on its own questions?
+  {"name": "10-parser-reader", "parser_mode": None}
+        0 GPU calls (all cached); hosted parser calls per Yes answer; how much location the verbatim
+        descriptor reader loses (parser_usage: fallbacks, llm_ok, unresolved; regions.csv vs 01-paper)
+
+Not run, on purpose: phrasings=2; location="none"; region_vote as a run knob; extra_tasks=True in a scored
+sweep; location_truth "fdm" / "geometry"; failure policy "error" / "geometry"; parser_mode "llm" or
+"code_then_llm" globally; temperature > 0; max_tokens < 512; image_max_tokens None; a thinking model as the
+hosted analyzer at 512 tokens; a hosted model in region mode; cropping; phrasing-voted region questions
+(not implemented, 180 calls/image); phrasings3 x regions (free but identical presence: region questions
+always use wording 1).
+
+BUDGET
+------
+new GPU calls = sum over experiments of (new questions/image printed by Cell 3) x images
+seconds per call: measure from the first [DONE] line (paper: 1.55 s vLLM strong GPU, 3.21 s consumer GPU;
+llama.cpp Q8_0 with an 8192-token image on a Kaggle P100/T4 will be slower). At 3-5 s/call:
+  Phase 0   500 calls     0.4-0.7 h
+  Phase 1   6,750 calls   5.6-9.4 h
+  Phase 2   9,000 calls   7.5-12.5 h  (use LIMIT or two sessions; the run resumes)
+  Phase 3   <= 6,600      <= 5.5-9.2 h (fewer when interactions are not earned)
+  Phase 4   0 GPU; 1,500 hosted analyzer + a few hundred parser calls
+Known inefficiency: 02-untrained also asks its 5 questions on dentex_val (no such classes there): 250 calls.
+
+READING GUIDE (Cell 11 / 12)
+----------------------------
+leaderboard.csv           one row per experiment x dataset: TP/TN/FP/FN, coverage, F1, calls, cache hits
+comparison/<dataset>/     paired against 01-paper: corrected, worsened, newly unresolved, paired_f1_delta
+presence.csv              per finding; whole_image.csv the same for the whole-image stage of 05
+regions.csv               where a found finding was placed (per-cell TP/FP/TN/FN, exact set, Jaccard)
+region_presence.csv       each cell called correctly at all (meaningful in regions mode; x6 in rationale mode)
+occupied_regions.csv      distinct regions reported vs occupied (exact_rate, mae, over/undercount)
+stage_changes             first phrasing -> vote; whole image -> regions
+phrasing_votes            agreement / disagreement / tie per task
+vote_replay_comparison    union vs majority on the same saved answers
+parse_recovery            unreadable line-1 replies and whether the reminder fixed them
+case_breakdown            slices: 1 vs 2+ instances, boundary-crossing boxes, images without findings
+truth_agreement (Cell 10) adapter_exact / geometry_exact on DENTEX boxes with FDI numbers
+side_agreement            LEFT_IS_IMAGE_LEFT check (flip in dental_pipeline.py if far below 0.5, re-score)
+
+BEFORE THE FIRST SESSION
+------------------------
+- Kaggle secrets: HF_TOKEN (gated DentVLM checkpoint), OPENAI_API_KEY (or switch ADAPTER/TEXT_MODEL to the
+  OpenRouter spec in the Cell 3 comment), OPENROUTER_API_KEY for 09.
+- Data on disk: /kaggle/working/umfih_14class/data/test (100 images) and
+  /kaggle/working/DENTEX/validation_data/... + validation_triple.json (50 images).
+- Fix the implant / calculus wordings (see above), then run PHASE 0.
