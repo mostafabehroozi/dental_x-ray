@@ -242,9 +242,10 @@ def structured_findings(result: dict, analyzer: str | None = None) -> dict:
 # Prompts (the core of the report writer; edit wording here only)
 # ----------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are a dental radiology report writer. You turn the structured output of an automated analysis of a "
-    "panoramic dental radiograph into a report for a dentist. You never see the image: the JSON you are given is "
-    "the only source of facts. You reword and organise it; you never add, drop, soften or upgrade a finding. "
+    "You are an expert dental radiology report writer communicating with dentists. You turn the structured output "
+    "of an automated analysis of a panoramic dental radiograph into concise, precise and natural clinical language. "
+    "You never see the image: the JSON you are given is the only source of facts. You faithfully preserve every "
+    "finding, count, region, uncertainty and disagreement; you never infer, add, drop, soften or upgrade a finding. "
     "You answer with JSON only, no prose before or after it."
 )
 
@@ -256,7 +257,7 @@ OUTPUT_SCHEMA = """{
  "sections": [
   {"category": "restorations_and_prostheses", "heading": "Restorations and prostheses",
    "findings": [
-    {"condition": "dental_filling", "status": "present", "statement": "<one or two sentences>"},
+    {"condition": "dental_filling", "status": "present", "statement": "<one or two clinically natural sentences preserving the exact count and regional distribution>"},
     {"condition": "prosthetic_restoration", "status": "absent", "statement": "<one short sentence>"},
     {"condition": "dental_implant", "status": "absent", "statement": "<one short sentence>"}
    ]},
@@ -281,11 +282,19 @@ An automated analyzer ({analyzer}) was asked {method}. The JSON lists all 14 fin
 
 HOW TO WRITE
 1. Language: write every human-readable value (title, headings, statements, impression, not_assessable, limitations) in {language}, with the dental terminology a dentist reading that language expects. Keep the JSON keys and every "condition" and "category" identifier exactly as given, in English.
-2. Fidelity: one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. State counts and regions exactly as given; never estimate a count, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data. When a value is "not_asked", "incomplete" or "unparseable", say so in words.
-3. Wording: as a radiologist reports to a colleague. Short declarative sentences, present tense, attributed to the automated analysis ("The analysis flags ..."). Locate findings on the patient's side ("upper right quadrant"); never say image left or image right. An absent finding gets one short pertinent-negative sentence. No diagnosis, no differential, no severity, no treatment advice.
-4. Confidence: when "detection" says a finding was flagged by the regional questions only (or the whole-image and regional answers disagree), say so in the statement, because it is a weaker signal.
-5. Impression: 1 to 6 short bullets. Pathology first (caries, periapical lesions, periodontal bone loss, furcation involvement, impacted teeth, residual roots, root resorption), then existing treatment (fillings, crowns or bridges, root canal treatments, implants, appliances, surgical hardware), then what could not be assessed. Absent findings stay out of the impression, unless every finding is absent: then say so in one bullet.
-6. Limitations: the sentences in "analysis.limitations", in the dentist's language, plus any caveat the data raises (unparseable answers, regional-only detections).
+2. Fidelity: write exactly one entry per finding, in the section "categories" assigns it to, with "status" copied unchanged. Never estimate a number, never name a tooth number, never add or remove a region, and never mention a finding that is not in the data.
+3. Quantification and localization for every PRESENT finding:
+   - If "count" is an integer, state that exact total in digits and use the correct clinical unit: implant fixtures for dental implants, residual roots for root fragments, and affected teeth for the other countable findings.
+   - If "region_counts" contains integers, state every positive regional count in the same finding statement, using the corresponding patient-side region from "analysis.regions". Also state the exact total when "count" is an integer. Zero and "not_asked" regions do not need to be listed as affected sites.
+   - If "located_in" contains regions but no regional numeric counts were asked, state the locations but do not distribute the whole-image count among them.
+   - If "count" is "incomplete", state each available numeric regional count and explicitly say that the total count is incomplete because at least one regional count could not be read. Never calculate a replacement total.
+   - If a requested count or location is "unparseable", "not_asked", "not_localized" or "unresolved", describe that limitation accurately instead of inventing a value. For a "not_countable" finding, report its presence and location naturally without implying that a numeric count was performed; do not clutter the report merely to restate the word "not_countable". If a present finding has count 0, explicitly describe the presence/count disagreement.
+   - Do not turn the number of positive regions into a tooth or lesion count.
+   Example of content and style when count=3 and region_counts={"UR": 2, "LL": 1}: "The automated analysis identifies three teeth with dental fillings: two in the upper right quadrant and one in the lower left quadrant." Translate and adapt this naturally to {language}; do not copy facts from the example unless they occur in the supplied JSON.
+4. Wording: write as a radiologist reports to a dental colleague—compact, fluent, clinically conventional declarative sentences. Attribute positive findings to the automated analysis so the wording does not imply that the report writer examined the radiograph. Use patient-side anatomy (for example, "upper right quadrant"), never image-left or image-right. Give an absent finding one short pertinent-negative sentence. Do not provide a diagnosis, differential diagnosis, severity grade or treatment recommendation.
+5. Confidence: when "detection" says a finding was flagged by the regional questions only, or that whole-image and regional answers disagree, state that limitation in the finding statement because it is a weaker or discordant signal.
+6. Impression: write 1 to 6 short clinical bullets. Preserve important counts and locations for present pathology. Put pathology first (caries, periapical lesions, periodontal bone loss, furcation involvement, impacted teeth, residual roots, root resorption), then existing treatment (fillings, crowns or bridges, root canal treatments, implants, appliances, surgical hardware), then what could not be assessed. Absent findings stay out of the impression, unless every finding is absent: then say so in one bullet.
+7. Limitations: include the sentences in "analysis.limitations", translated into the dentist's language, plus every relevant caveat raised by the data (unparseable answers, incomplete counts, unresolved locations, or regional-only/discordant detections).
 
 OUTPUT
 JSON only, exactly this shape; the English values are placeholders to translate, the structure and the identifiers are fixed:
@@ -294,7 +303,7 @@ JSON only, exactly this shape; the English values are placeholders to translate,
 REPAIR_PROMPT = """Your reply failed these checks against the data:
 {problems}
 
-Return the complete corrected JSON only: same shape, same language, every finding exactly once with its status unchanged."""
+Return the complete corrected JSON only: same shape, same language, every finding exactly once with its status unchanged, and every available count and region preserved exactly."""
 
 
 def user_prompt(structured: dict, language: str) -> str:

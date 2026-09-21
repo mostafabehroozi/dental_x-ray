@@ -173,6 +173,14 @@ class StructuredInputTests(unittest.TestCase):
         self.assertIn("DentalGPT-7B", prompt)
         self.assertIn('"condition": "dental_filling"', prompt)
         self.assertIn(rw.OUTPUT_SCHEMA, prompt)
+        self.assertIn("If \"count\" is an integer, state that exact total in digits", prompt)
+        self.assertIn("state every positive regional count", prompt)
+        self.assertIn("do not distribute the whole-image count", prompt)
+        self.assertIn("the total count is incomplete", prompt)
+        self.assertIn("without implying that a numeric count was performed", prompt)
+        self.assertIn("presence/count disagreement", prompt)
+        self.assertIn("Do not turn the number of positive regions into a tooth or lesion count", prompt)
+        self.assertIn("clinically conventional declarative sentences", prompt)
         for placeholder in ("{language}", "{findings_json}", "{analyzer}", "{method}", "{output_schema}"):
             self.assertNotIn(placeholder, prompt)
 
