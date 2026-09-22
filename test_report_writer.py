@@ -126,6 +126,15 @@ class StructuredInputTests(unittest.TestCase):
         self.assertEqual((impacted["count"], impacted["located_in"]), ("incomplete", ["LL", "LR"]))
         self.assertEqual(impacted["region_counts"], {"UR": "not_asked", "UL": "not_asked", "LL": 1, "LR": "unparseable"})
         self.assertFalse(by["periodontal_bone_loss"]["countable"])
+        evidence = filling["question_evidence"]
+        self.assertEqual([(e["stage"], e["region"]) for e in evidence],
+                         [("presence", "whole_image"), ("region", "UR"), ("region_count", "UR"),
+                          ("region", "UL"), ("region", "LL"), ("region", "LR")])
+        self.assertEqual((evidence[1]["scope"], evidence[1]["location"]),
+                         ("region", rw.REGION_TEXT["UR"]))
+        self.assertEqual((evidence[2]["question"], evidence[2]["answer"]),
+                         (n("dental_filling", "UR"), "2 teeth with fillings"))
+        self.assertTrue(all(e["attempt"] == 1 for e in evidence))
         self.assertEqual(s["summary"], {"present": ["impacted_tooth", "dental_filling", "endodontic_treatment"],
                                         "absent": [c for c in rw.PATHOLOGY + rw.TREATMENT
                                                    if c not in ("impacted_tooth", "dental_filling", "endodontic_treatment", "dental_implant")],
@@ -151,6 +160,25 @@ class StructuredInputTests(unittest.TestCase):
         self.assertEqual((by["carious_lesion"]["count"], by["carious_lesion"]["region_counts"]), ("not_asked", {}))
         self.assertEqual(s["summary"]["regional_only"], [])
 
+    def test_arch_report_input_names_upper_and_lower_with_source_questions(self):
+        upper_q = dp.presence_question("dental_filling", region="upper", scheme="arch")
+        lower_q = dp.presence_question("dental_filling", region="lower", scheme="arch")
+        upper_n = dp.count_question("dental_filling", region="upper", scheme="arch")
+        script = {q("dental_filling"): "A", upper_q: "A", upper_n: "2", lower_q: "B"}
+        result = dp.analyze_image(ScriptedRunner(script), self.image,
+                                  protocol=dp.Protocol(region_scheme="arch"))
+
+        structured = rw.structured_findings(result)
+        filling = next(f for f in structured["findings"] if f["condition"] == "dental_filling")
+        self.assertEqual([r["name"] for r in structured["analysis"]["regions"]], ["upper", "lower"])
+        self.assertEqual((filling["located_in"], filling["count"], filling["region_counts"]),
+                         (["upper"], 2, {"upper": 2, "lower": "not_asked"}))
+        regional = [e for e in filling["question_evidence"] if e["scope"] == "region"]
+        self.assertEqual([(e["region"], e["location"], e["question"], e["answer"]) for e in regional],
+                         [("upper", rw.REGION_TEXT["upper"], upper_q, "A"),
+                          ("upper", rw.REGION_TEXT["upper"], upper_n, "2"),
+                          ("lower", rw.REGION_TEXT["lower"], lower_q, "B")])
+
     def test_counting_off_protocol(self):
         result = dp.analyze_image(ScriptedRunner(SCRIPT), self.image, protocol=dp.Protocol(counting=False))
         s = rw.structured_findings(result)
@@ -172,6 +200,7 @@ class StructuredInputTests(unittest.TestCase):
         self.assertIn("in Persian", prompt)
         self.assertIn("DentalGPT-7B", prompt)
         self.assertIn('"condition": "dental_filling"', prompt)
+        self.assertIn('"question_evidence"', prompt)
         self.assertIn(rw.OUTPUT_SCHEMA, prompt)
         self.assertIn("If \"count\" is an integer, state that exact total in digits", prompt)
         self.assertIn("state every positive regional count", prompt)
@@ -181,6 +210,10 @@ class StructuredInputTests(unittest.TestCase):
         self.assertIn("presence/count disagreement", prompt)
         self.assertIn("Do not turn the number of positive regions into a tooth or lesion count", prompt)
         self.assertIn("clinically conventional declarative sentences", prompt)
+        self.assertIn("name ALL AND ONLY those regions", prompt)
+        self.assertIn("upper jaw/maxilla and/or lower jaw/mandible", prompt)
+        self.assertIn("did not establish a reliable location", prompt)
+        self.assertIn("You did NOT inspect the radiograph", prompt)
         for placeholder in ("{language}", "{findings_json}", "{analyzer}", "{method}", "{output_schema}"):
             self.assertNotIn(placeholder, prompt)
 
