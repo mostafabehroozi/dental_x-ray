@@ -71,11 +71,13 @@ def good_report(structured: dict, language: str = "English", **overrides) -> dic
         sections.append({"category": category["key"], "heading": category["label"], "findings": entries})
     report = {
         "language": language, "title": "Panoramic radiograph: automated findings report",
-        "headings": {"image": "Image", "findings": "Findings", "impression": "Impression",
-                     "not_assessable": "Not assessable", "limitations": "Limitations"},
+        "headings": {"image": "Image", "impression": "Clinical priorities", "findings": "Detailed findings",
+                     "not_assessable": "Not assessable", "limitations": "Limitations",
+                     "distillation": "Clinical distillation"},
         "sections": sections, "impression": ["Impacted teeth flagged in the lower jaw."],
         "not_assessable": [f"{c} could not be assessed." for c in structured["summary"]["unparseable"]],
         "limitations": list(structured["analysis"]["limitations"]),
+        "distillation": "Regional analysis identifies impacted teeth in the mandibular quadrants.",
     }
     report.update(overrides)
     return report
@@ -214,6 +216,10 @@ class StructuredInputTests(unittest.TestCase):
         self.assertIn("upper jaw/maxilla and/or lower jaw/mandible", prompt)
         self.assertIn("did not establish a reliable location", prompt)
         self.assertIn("You did NOT inspect the radiograph", prompt)
+        self.assertIn("FIRST clinical section", prompt)
+        self.assertIn('localized equivalent of "**Location:**"', prompt)
+        self.assertIn("FINAL section", prompt)
+        self.assertIn("dense specialist dental/radiologic language", prompt)
         for placeholder in ("{language}", "{findings_json}", "{analyzer}", "{method}", "{output_schema}"):
             self.assertNotIn(placeholder, prompt)
 
@@ -286,6 +292,7 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("'not_assessable' must name the unparseable findings: dental_implant",
                       rw.verify_report(good_report(s, not_assessable=[]), s))
         self.assertIn("'limitations' must be a non-empty list of strings", rw.verify_report(good_report(s, limitations=[]), s))
+        self.assertIn("'distillation' must be a non-empty string", rw.verify_report(good_report(s, distillation=" "), s))
         report = good_report(s)
         report["sections"][0]["findings"][0]["statement"] = "  "
         self.assertIn("dental_filling: 'statement' must be a non-empty string", rw.verify_report(report, s))
@@ -344,11 +351,14 @@ class WriterTests(unittest.TestCase):
         md = payload["markdown"]
         self.assertTrue(md.startswith("# Panoramic radiograph: automated findings report"))
         self.assertIn("**Image:** img1.png", md)
+        self.assertIn("## Clinical priorities\n- Impacted teeth flagged in the lower jaw.\n\n## Detailed findings", md)
         self.assertIn("### Restorations and prostheses\n- ● Statement about dental_filling.\n- ○ Statement about prosthetic_restoration.", md)
         self.assertIn("- ? Statement about dental_implant.", md)
-        self.assertIn("## Impression\n- Impacted teeth flagged in the lower jaw.", md)
         self.assertIn("## Not assessable\n- dental_implant could not be assessed.", md)
         self.assertIn("## Limitations\n- Experimental output", md)
+        self.assertIn("## Clinical distillation\nRegional analysis identifies impacted teeth in the mandibular quadrants.", md)
+        self.assertLess(md.index("## Clinical priorities"), md.index("## Detailed findings"))
+        self.assertGreater(md.index("## Clinical distillation"), md.index("## Limitations"))
         self.assertIn("*DentalGPT-7B · 74 questions → gpt-5*", md)
         self.assertNotIn("sk-test", json.dumps(payload))
         # Sections are rendered in the fixed order whatever order the model used.
