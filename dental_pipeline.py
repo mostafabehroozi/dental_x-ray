@@ -1,33 +1,8 @@
-"""In-distribution DentVLM pipeline: presence, location, and multiplicity on panoramic radiographs.
+"""Twelve source-backed PAN VQA tasks, native answers, and external parsing.
 
-Every text sent to the model is a question DentVLM (Meng et al., Nature
-Communications 2026; arXiv 2509.23344) was trained and evaluated on:
-
-* One yes/no question per panoramic task, worded as in the authors' released
-  test set or as one of the nine templates of Supplementary Table 7, e.g.
-  "Based on the imaging, determine whether the patient has {task}?".
-* DentVLM answers "Yes"/"No" on line 1 and then writes a rationale that names
-  the location with one of nine fixed descriptors ("the left posterior region
-  of the upper dentition", ...). Location is read from that rationale exactly
-  as the authors' scorer does; nothing about location is ever asked in words.
-* Multiplicity is the number of distinct regions the model reports a finding in
-  (0-6): the size of the deduplicated region set, never the number of boxes,
-  teeth, mentions or Yes answers. The model is never asked to count: it only
-  decides presence, and the count is derived from the regions with an explicit
-  status (count_block), so "no region named" and "nothing found" stay apart.
-* The region comparison asks every task once per dental-arch region, on the
-  whole uncropped image, by naming the region inside the task's own question
-  with the model's own words: "... has caries in the left posterior region of
-  the lower dentition?". Every region is asked whatever the whole image
-  answered (kept as a separate result), so a finding missed with the model's
-  attention on the whole image can be recovered in a region. The image is
-  never cropped: a cropped panoramic is outside the model's image
-  distribution, while the six region descriptors are the exact strings it was
-  trained to write in its rationales.
-
-Nothing else (JSON contracts, <think> tags, invented region wording, paraphrase
-retries, forced zeros) is used. Findings the model has no task for are not
-asked by default and are reported as "not assessed".
+New inference uses a fixed protocol. Benchmark projection is evaluation-only;
+historical voting helpers remain available for read-only artifact analysis.
+Source-region names are not verified patient-side anatomical labels.
 """
 from __future__ import annotations
 
@@ -44,137 +19,152 @@ import llm_api
 import run_monitor as mon
 from response_cache import ResponseCache
 
-# Stable ontology in YOLO class order of the UMFIH 14-class dataset.
-CONDITIONS = (
-    "dental_implant",
-    "prosthetic_restoration",
-    "dental_filling",
-    "endodontic_treatment",
-    "carious_lesion",
-    "periodontal_bone_loss",
-    "impacted_tooth",
-    "periapical_lesion",
-    "root_fragment",
-    "furcation_lesion",
-    "apical_surgery",
-    "root_resorption",
-    "orthodontic_device",
-    "surgical_device",
-)
-
-# Display names for the dentist report.
-LABELS = {
-    "dental_implant": "Dental implant",
-    "prosthetic_restoration": "Dental crown or bridge",
-    "dental_filling": "Dental filling",
-    "endodontic_treatment": "Root canal treatment",
-    "carious_lesion": "Dental caries",
-    "periodontal_bone_loss": "Periodontal bone loss",
-    "impacted_tooth": "Impacted tooth",
-    "periapical_lesion": "Periapical lesion",
-    "root_fragment": "Residual root",
-    "furcation_lesion": "Furcation involvement",
-    "apical_surgery": "Apical surgery",
-    "root_resorption": "Root resorption",
-    "orthodontic_device": "Orthodontic appliance",
-    "surgical_device": "Surgical fixation plate or screws",
-}
-
-# DentVLM's panoramic tasks (Supplementary Tables S2-S3 and the image-task mapping of
-# Figure 1a), in asking order. questions[0] is Table S7 template #2 or the verbatim
-# wording of the authors' released test set; [1] and [2] are verbatim alternates used
-# only by the phrasing-ensemble option. Edit wording here only.
-TASKS = {
-    "implant": {"name": "Implant", "questions": (
-        "Based on the imaging, determine whether the patient has an implant?",
-        "Based on the imaging, does the patient have any abnormalities with the implant?",
-        "Please confirm whether the patient has an implant?")},
-    "prosthetic_crown": {"name": "Prosthetic Crown", "questions": (
-        "Based on the imaging analysis, does the patient have a prosthetic crown?",
-        "Please confirm whether the patient has a prosthetic crown?",
-        "Based on the imaging, determine whether the patient has a prosthetic crown?")},
-    "prosthetic_bridge": {"name": "Prosthetic Bridge", "questions": (
-        "Based on the imaging, determine whether the patient has a prosthetic bridge?",
-        "Evaluate the images to confirm whether there is a prosthetic bridge disease?",
-        "Please confirm whether the patient has a prosthetic bridge?")},
-    "fillings": {"name": "Fillings", "questions": (
-        "Based on the imaging analysis, does the patient have fillings?",
-        "Evaluate the images to confirm if there is a filling disease?",
-        "Based on the imaging, determine whether the patient has fillings?")},
-    "root_canal_therapy": {"name": "Root Canal Therapy", "questions": (
-        "Based on the imaging, determine whether the patient has root canal filling?",
-        "Based on the imaging analysis, does the patient have a root canal filling?",
-        "Please confirm whether the patient has root canal therapy?")},
-    "caries": {"name": "Caries", "questions": (
-        "Based on the imaging analysis, does the patient have caries?",
-        "Examine the images to determine if there is the presence of caries.",
-        "Based on the imaging, determine whether the patient has caries?")},
-    "periodontal_disease": {"name": "Periodontal Disease", "questions": (
-        "Based on the imaging, determine whether the patient has periodontal disease?",
-        "Examine the images to determine if periodontal disease is present?",
-        "Whether a patient has periodontal disease through imaging?")},
-    "impacted_tooth": {"name": "Impacted Tooth", "questions": (
-        "Based on the imaging, determine whether the patient has an impacted tooth?",
-        "Please confirm whether the patient has an impacted tooth?",
-        "Based on the imaging analysis, does the patient have an impacted tooth?")},
-    "apical_periodontitis": {"name": "Apical Periodontitis", "questions": (
-        "Based on the imaging, does the patient have apical periodontitis abnormalities?",
-        "Is there apical periodontitis in the images?",
-        "Based on the imaging, determine whether the patient has apical periodontitis?")},
-    "residual_root": {"name": "Residual Root", "questions": (
-        "Examine the imaging to determine if there is a disease related to residual roots?",
-        "Does the patient have any oral diseases related to residual roots?",
-        "Based on the imaging, determine whether the patient has residual roots?")},
-    "residual_crown": {"name": "Residual Crown", "questions": (
-        "Please confirm whether the patient has a residual crown?",
-        "Is there any oral disease related to residual crowns identified in the images?",
-        "Based on the imaging, determine whether the patient has a residual crown?")},
-    "insufficient_eruption_space": {"name": "Insufficient Space for Primary Tooth Eruption", "questions": (
-        "Based on the imaging, does the patient have insufficient space for the eruption of primary teeth?",
-        "Does the patient have insufficient space for the eruption of primary teeth?",
-        "Please confirm whether the patient has insufficient space for the eruption of primary teeth?")},
-    "calculus": {"name": "Calculus", "questions": (
-        "Evaluate the images to confirm if there is calculus disease?",
-        "Evaluate the images to confirm if there is a calculus disease?",
-        "Based on the imaging, determine whether the patient has calculus?")},
-}
-MAX_PHRASINGS = 3
-
-# UMFIH class -> DentVLM task(s). A crown or a bridge both count as a prosthetic restoration.
-CONDITION_TASKS = {
-    "dental_implant": ("implant",),
-    "prosthetic_restoration": ("prosthetic_crown", "prosthetic_bridge"),
-    "dental_filling": ("fillings",),
-    "endodontic_treatment": ("root_canal_therapy",),
-    "carious_lesion": ("caries",),
-    "periodontal_bone_loss": ("periodontal_disease",),
-    "impacted_tooth": ("impacted_tooth",),
-    "periapical_lesion": ("apical_periodontitis",),
-    "root_fragment": ("residual_root",),
-}
-TRAINED = tuple(c for c in CONDITIONS if c in CONDITION_TASKS)
-
-# UMFIH classes DentVLM has no task for. Asked only with Protocol.ask_untrained, through
-# Table S7 template #2 with these labels. The paper's zero-shot accuracy on diseases it was
-# not trained on is 52-64%, so this is off by default and scored as trained_task=False.
-UNTRAINED_LABELS = {
-    "furcation_lesion": "furcation involvement",
-    "apical_surgery": "apical surgery",
-    "root_resorption": "root resorption",
-    "orthodontic_device": "an orthodontic appliance",
-    "surgical_device": "surgical fixation plates or screws",
-}
-UNTRAINED_TEMPLATE = "Based on the imaging, determine whether the patient has {label}?"
-
-# DentVLM panoramic tasks without a UMFIH class: asked for the dentist report, never scored.
-EXTRA_TASKS = ("residual_crown", "insufficient_eruption_space", "calculus")
+# Canonical clinical vocabulary. Benchmark class IDs live in benchmark_schema.py.
+PROFILE = "pan_training_aligned_v1"
+RESULT_SCHEMA = "dentvlm-pan/1"
+PARSER_VERSION = 1
+SYSTEM_MESSAGE = "You are a helpful assistant."
+SOURCE_REVISION = "9463edb2af47f64510b0681efc20be6ecf870955"
+SAMPLING = {"top_p": 0.001, "repeat_penalty": 1.05, "repeat_last_n": -1,
+            "samplers": ["penalties", "temperature", "top_p"], "top_k": 0,
+            "min_p": 0.0, "seed": 0}
+# Location reference patterns only detect ambiguous associations; they never create diagnoses.
+TASKS = {'impacted_tooth': {'name': 'Impacted Tooth',
+                    'questions': ['Based on the imaging, determine whether the patient has an impacted '
+                                  'tooth?'],
+                    'question_provenance': {'evidence': 'author_released_training_example',
+                                            'record_id': 'en_dis_panoramic_2666_Impacted Tooth',
+                                            'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                            'file': 'data/inst_data_2nd_train.json',
+                                            'source_modality': 'PAN',
+                                            'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                    'location_reference_pattern': '\\bimpacted (?:tooth|teeth)\\b'},
+ 'prosthetic_crown': {'name': 'Prosthetic Crown',
+                      'questions': ['Based on the imaging analysis, does the patient have a prosthetic '
+                                    'crown?'],
+                      'question_provenance': {'evidence': 'author_released_training_example',
+                                              'record_id': 'en_dis_panoramic_5156_Prosthetic Crown',
+                                              'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                              'file': 'data/inst_data_2nd_train.json',
+                                              'source_modality': 'PAN',
+                                              'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                      'location_reference_pattern': '(?<!residual )\\bcrowns?\\b'},
+ 'root_canal_therapy': {'name': 'Root Canal Therapy',
+                        'questions': ['Based on the imaging, determine whether the patient has root '
+                                      'canal filling?'],
+                        'question_provenance': {'evidence': 'author_released_training_example',
+                                                'record_id': 'en_dis_panoramic_2109_Root Canal Therapy',
+                                                'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                                'file': 'data/inst_data_2nd_train.json',
+                                                'source_modality': 'PAN',
+                                                'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                        'documented_alternative': {'question': 'Can root canal therapy be seen in this '
+                                                               'dental X-ray?',
+                                                   'evidence': 'paper_figure_1_example',
+                                                   'used_by_baseline': False},
+                        'location_reference_pattern': '\\broot canal (?:therapy|treatment|filling)\\b'},
+ 'fillings': {'name': 'Fillings',
+              'questions': ['Based on the imaging analysis, does the patient have fillings?'],
+              'question_provenance': {'evidence': 'author_released_training_example',
+                                      'record_id': 'en_dis_panoramic_336_Fillings',
+                                      'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                      'file': 'data/inst_data_2nd_train.json',
+                                      'source_modality': 'PAN',
+                                      'pan_support': 'arXiv:2509.23344 Figure 1a'},
+              'location_reference_pattern': '(?<!canal )\\bfillings?\\b'},
+ 'prosthetic_bridge': {'name': 'Prosthetic Bridge',
+                       'questions': ['Based on the imaging, determine whether the patient has a '
+                                     'prosthetic bridge?'],
+                       'question_provenance': {'evidence': 'author_released_training_example',
+                                               'record_id': 'en_dis_panoramic_2869_Prosthetic Bridge',
+                                               'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                               'file': 'data/inst_data_2nd_train.json',
+                                               'source_modality': 'PAN',
+                                               'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                       'location_reference_pattern': '\\bbridges?\\b'},
+ 'apical_periodontitis': {'name': 'Apical Periodontitis',
+                          'questions': ['Based on the imaging, does the patient have apical '
+                                        'periodontitis abnormalities?'],
+                          'question_provenance': {'evidence': 'author_released_training_example',
+                                                  'record_id': 'en_dis_panoramic_5065_Apical '
+                                                               'Periodontitis',
+                                                  'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                                  'file': 'data/inst_data_2nd_train.json',
+                                                  'source_modality': 'PAN',
+                                                  'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                          'location_reference_pattern': '\\b(?:apical periodontitis|periapical '
+                                                        'lesions?)\\b'},
+ 'residual_root': {'name': 'Residual Root',
+                   'questions': ['Examine the imaging to determine if there is a disease related to '
+                                 'residual roots?'],
+                   'question_provenance': {'evidence': 'author_released_training_example',
+                                           'record_id': 'en_dis_panoramic_1971_Residual Root',
+                                           'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                           'file': 'data/inst_data_2nd_train.json',
+                                           'source_modality': 'PAN',
+                                           'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                   'location_reference_pattern': '\\b(?:residual roots?|root fragments?)\\b'},
+ 'implant': {'name': 'Implant',
+             'questions': ['Based on the imaging, determine whether the patient has an implant?'],
+             'question_provenance': {'evidence': 'author_released_training_example',
+                                     'record_id': 'en_dis_panoramic_392_Implant',
+                                     'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                     'file': 'data/inst_data_2nd_train.json',
+                                     'source_modality': 'PAN',
+                                     'pan_support': 'arXiv:2509.23344 Figure 1a'},
+             'location_reference_pattern': '\\bimplants?\\b'},
+ 'residual_crown': {'name': 'Residual Crown',
+                    'questions': ['Please confirm whether the patient has a residual crown?'],
+                    'question_provenance': {'evidence': 'author_released_training_example',
+                                            'record_id': 'en_dis_panoramic_1296_Residual Crown',
+                                            'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                            'file': 'data/inst_data_2nd_train.json',
+                                            'source_modality': 'PAN',
+                                            'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                    'location_reference_pattern': '\\bresidual crowns?\\b'},
+ 'insufficient_eruption_space': {'name': 'Insufficient Space for Primary Tooth Eruption',
+                                 'questions': ['Based on the imaging, does the patient have insufficient '
+                                               'space for the eruption of primary teeth?'],
+                                 'question_provenance': {'evidence': 'author_released_training_example',
+                                                         'record_id': 'en_dis_panoramic_2707_Insufficient '
+                                                                      'Space for Primary Tooth Eruption',
+                                                         'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                                         'file': 'data/inst_data_2nd_train.json',
+                                                         'source_modality': 'PAN',
+                                                         'pan_support': 'arXiv:2509.23344 Figure 1a'},
+                                 'location_reference_pattern': '\\binsufficient space\\b'},
+ 'caries': {'name': 'Caries',
+            'questions': ['Examine the images to determine if there is the presence of caries.'],
+            'question_provenance': {'evidence': 'author_released_training_example',
+                                    'record_id': 'en_dis_panoramic_4414_Caries',
+                                    'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                    'file': 'data/inst_data_2nd_train.json',
+                                    'source_modality': 'PAN',
+                                    'pan_support': 'arXiv:2509.23344 Figure 1a'},
+            'location_reference_pattern': '\\bcaries\\b'},
+ 'calculus': {'name': 'Calculus',
+              'questions': ['Evaluate the images to confirm if there is calculus disease?'],
+              'question_provenance': {'evidence': 'author_released_training_example',
+                                      'record_id': 'en_dis_upper_1137_Calculus',
+                                      'revision': '9463edb2af47f64510b0681efc20be6ecf870955',
+                                      'file': 'data/inst_data_2nd_train.json',
+                                      'source_modality': 'UPP',
+                                      'pan_support': 'arXiv:2509.23344 Figure 1a'},
+              'location_reference_pattern': '\\bcalculus\\b'}}
+CONDITIONS = tuple(TASKS)
+LABELS = {key: task["name"] for key, task in TASKS.items()}
+TRAINED = CONDITIONS
+MAX_PHRASINGS = 1
+# Deprecated empty exports for readers of historical artifacts; never dispatch tasks.
+EXTRA_TASKS = ()
+UNTRAINED_LABELS = {}
 
 # The nine location descriptors DentVLM writes in its rationale (Supplementary Note S1), in
 # the order of the authors' scorer, and the six dental-arch cells they map onto. "left" and
 # "right" are DentVLM's own words: Table S6 defines its "left posterior region" as FDI
 # quadrants 1 and 4, the patient's right, which is the left side of a panoramic as displayed.
-# LEFT_IS_IMAGE_LEFT records that reading; the DENTEX side check in the notebook confirms it,
-# and flipping it mirrors the cell windows and the FDI mapping together.
+# LEFT_IS_IMAGE_LEFT is the Table S6 source-frame convention for reproducible scoring.
+# Figure 1 conflicts with this convention: patient laterality is UNVERIFIED.
 CELLS = ("upper-right", "upper-anterior", "upper-left", "lower-right", "lower-anterior", "lower-left")
 DESCRIPTORS = {
     "the right posterior region of both the upper and lower dentition": ("upper-right", "lower-right"),
@@ -256,40 +246,21 @@ assert set(CELL_DESCRIPTORS) == set(CELLS), "every cell needs one descriptor to 
 # Questions
 # ----------------------------------------------------------------------------
 def questions_for(task: str) -> tuple[str, ...]:
-    if task in TASKS:
-        return TASKS[task]["questions"]
-    if task in UNTRAINED_LABELS:
-        return (UNTRAINED_TEMPLATE.format(label=UNTRAINED_LABELS[task]),)
-    raise KeyError(task)
+    return tuple(TASKS[task]["questions"])
 
 
 def task_name(task: str) -> str:
-    return TASKS[task]["name"] if task in TASKS else LABELS[task]
+    return TASKS[task]["name"] if task in TASKS else task.replace("_", " ")
 
 
 def region_question(task: str, cell: str, phrasing: int = 0) -> str:
-    """The task's own question restricted to one region, e.g. "Based on the imaging analysis, does
-    the patient have caries in the left posterior region of the lower dentition?".
-
-    The smallest change that adds a region to an in-distribution question: the verbatim sentence is
-    kept, and the only words added are one of the nine descriptors DentVLM was trained to write as
-    a location (Supplementary Note 1), so the region is asked in the model's own vocabulary and its
-    own left/right convention. Nothing explains the region: an explanation is text the model never
-    saw.
-    """
-    if cell not in CELL_DESCRIPTORS:
-        raise ValueError(f"unknown cell {cell!r}; expected one of {CELLS}")
-    stem = questions_for(task)[phrasing].strip().rstrip("?.").rstrip()
-    return f"{stem} in {CELL_DESCRIPTORS[cell]}?"
+    raise ValueError("Regional questions are retired. Use the fixed PAN questions and rationale locations.")
 
 
 def condition_tasks(condition: str, ask_untrained: bool = False) -> tuple[str, ...]:
-    """Task keys that decide a condition; empty when the model is not asked about it."""
-    if condition in CONDITION_TASKS:
-        return CONDITION_TASKS[condition]
-    if ask_untrained and condition in UNTRAINED_LABELS:
-        return (condition,)
-    return ()
+    """Compatibility accessor for the evaluation mapping; never drives inference."""
+    from benchmark_schema import CONDITION_TASKS
+    return CONDITION_TASKS.get(condition, ())
 
 
 # ----------------------------------------------------------------------------
@@ -307,12 +278,17 @@ def first_line(text: str) -> str:
 
 
 def extract_answer(text: str) -> str | None:
-    """'yes', 'no', or None (unparseable). Read from the first line; both words -> None."""
-    line = first_line(text)
-    yes, no = bool(_YES.search(line)), bool(_NO.search(line))
-    if yes == no:
+    """Only an unambiguous leading Yes/No is a diagnosis; never search the rationale."""
+    line = first_line(text).lstrip("* _")
+    match = re.match(r"^(yes|no)\b", line, re.I)
+    if match is None or (bool(_YES.search(line)) and bool(_NO.search(line))):
         return None
-    return "yes" if yes else "no"
+    answer = match.group(1).lower()
+    opposite = "no" if answer == "yes" else "yes"
+    rest = [v.strip() for v in text.splitlines() if v.strip()][1:]
+    if any(re.match(rf"^{opposite}\b", v, re.I) and not (answer == "yes" and extract_regions(v)) for v in rest):
+        return None
+    return answer
 
 
 def extract_regions(text: str) -> list[str]:
@@ -323,6 +299,41 @@ def extract_regions(text: str) -> list[str]:
         if descriptor in low:
             found.update(cells)
     return [c for c in CELLS if c in found]
+
+
+def location_evidence(text: str, task: str) -> list[dict]:
+    matches = []
+    for sentence in re.split(r"[.!?;\n]+", text):
+        low = sentence.lower()
+        negated = bool(re.search(r"\b(no|not|without|absent|absence|cannot|could|might|may)\b", low))
+        other = any(key != task and re.search(spec["location_reference_pattern"], low)
+                    for key, spec in TASKS.items())
+        for descriptor, cells in DESCRIPTORS.items():
+            for hit in re.finditer(re.escape(descriptor), sentence, re.I):
+                matches.append({"text": hit.group(), "descriptor": descriptor, "regions": list(cells),
+                                "context": sentence.strip(), "reportable": not negated and not other,
+                                "reason": "negated_or_uncertain" if negated else "ambiguous_task" if other else None})
+    return matches
+
+
+def contradicts_positive(text: str, task: str) -> bool:
+    """Abstain on explicit unlocalized denials of the very task answered Yes.
+
+    Regional negations are handled separately; they do not undo image-level presence.
+    This is a conservative textual guard, not a semantic diagnosis reader.
+    """
+    denial = r"\b(no evidence|no signs|not observed|not seen|not visible|not present|not detected|absent|does not have)\b"
+    for sentence in re.split(r"[.!?;\n]+", text):
+        if (re.search(TASKS[task]["location_reference_pattern"], sentence, re.I)
+                and re.search(denial, sentence, re.I) and not extract_regions(sentence)):
+            return True
+    return False
+
+
+def report_location(cell: str) -> str:
+    """Patient laterality is deliberately unresolved until independently validated."""
+    row, zone = cell.split("-", 1)
+    return f"{row} anterior region" if zone == "anterior" else f"{row} posterior region (side unresolved)"
 
 
 # ----------------------------------------------------------------------------
@@ -358,7 +369,7 @@ class VisionRunner:
         api_key: str = "local-llama-cpp",
         model: str = "dentvlm",
         max_tokens: int = 512,
-        temperature: float | None = 0.0,
+        temperature: float | None = 0.1,
         timeout: float = 600.0,
         local: bool = True,
         cache_prompt: bool = True,
@@ -372,6 +383,8 @@ class VisionRunner:
         if token_param not in llm_api.TOKEN_PARAMS:
             raise ValueError(f"token_param must be one of {llm_api.TOKEN_PARAMS}")
         llm_api.validate_api_retries(api_call_retries)
+        if local and (max_tokens != 512 or temperature != 0.1 or token_param != "max_tokens" or request_options):
+            raise ValueError("Local PAN inference requires max_tokens=512, temperature=0.1 and no request overrides")
         self.client = client if client is not None else llm_api.connect(base_url, api_key, timeout)
         self.model = model
         self.max_tokens = max_tokens
@@ -417,16 +430,18 @@ class VisionRunner:
         return {
             "model": self.model, "max_tokens": self.max_tokens, "token_param": self.token_param,
             "temperature": self.temperature, "local": self.local, "cache_prompt": self.cache_prompt,
-            "request_options": self.request_options,
-            "api_call_retries": self.api_call_retries,
+            "request_options": self.request_options, "sampling": SAMPLING if self.local else {},
+            "runtime_provenance": getattr(self, "runtime_provenance", {}),
+            "system_message": SYSTEM_MESSAGE, "api_call_retries": self.api_call_retries,
         }
 
     def ask(self, image: str | Path | bytes, question: str) -> dict:
-        # Image before the question and no system message of our own: the chat template
-        # injects Qwen's default "You are a helpful assistant.", which the authors use.
+        if self.local and question not in {q for t in TASKS.values() for q in t["questions"]}:
+            raise ValueError("Only canonical PAN questions are allowed")
+        # The authors' system message exactly once, then image before the canonical question.
         request = {
             "model": self.model,
-            "messages": [{"role": "user", "content": [
+            "messages": [{"role": "system", "content": SYSTEM_MESSAGE}, {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": image_data_uri(image)}},
                 {"type": "text", "text": question},
             ]}],
@@ -435,7 +450,10 @@ class VisionRunner:
         if self.local:
             # Reuse the image KV prefix across the questions of one image; repetition penalty as
             # in the authors' inference script (1.05).
-            request["extra_body"] = {"cache_prompt": self.cache_prompt, "repeat_penalty": 1.05, "seed": 0}
+            request["top_p"] = SAMPLING["top_p"]
+            request["extra_body"] = {"cache_prompt": self.cache_prompt, **{k: v for k, v in SAMPLING.items() if k != "top_p"}}
+        if self.local and self.request_options:
+            raise ValueError("Request overrides are disabled for the fixed PAN runtime")
         request.update(self.request_options)
         cache_key = self.response_cache.key(request) if self.response_cache is not None else None
         cached = self.response_cache.get(cache_key) if self.response_cache is not None else None
@@ -457,35 +475,20 @@ class VisionRunner:
 # ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Protocol:
-    """Everything the wrapper may vary. Defaults are the paper's protocol."""
+    """Fixed PAN protocol. Historical protocols are read as data, never instantiated."""
+    profile: str = PROFILE
+    location: str = "rationale"
 
-    phrasings: int = 1            # 1, or up to 3 verbatim wordings per task with a majority vote
-    region_vote: str = "union"    # with phrasings > 1: "union" (matching voting) or "majority"
-    location: str = "rationale"   # "rationale" (free) | "regions" (every region named in the question, every task) | "none"
-    ask_untrained: bool = False   # ask the five UMFIH classes DentVLM was never trained on
-    extra_tasks: bool = True      # ask residual crown, eruption space, calculus (reported, not scored)
-    parse_retries: int = 0        # extra attempts per failed question; notebook defaults to 1
-
-    def __post_init__(self) -> None:
-        llm_api.validate_parse_retries(self.parse_retries)
-        if not 1 <= self.phrasings <= MAX_PHRASINGS:
-            raise ValueError(f"phrasings must be between 1 and {MAX_PHRASINGS}")
-        if self.region_vote not in REGION_VOTES:
-            raise ValueError(f"region_vote must be one of {REGION_VOTES}")
-        if self.location not in LOCATION_LEVELS:
-            if self.location == "crops":  # the cropping mode this replaced
-                raise ValueError("location 'crops' is gone: 'regions' names the region inside the "
-                                 "question and keeps the whole image, which the cropping never did")
-            raise ValueError(f"location must be one of {LOCATION_LEVELS}")
+    def __post_init__(self):
+        if self.profile != PROFILE or self.location != "rationale":
+            raise ValueError("New inference requires pan_training_aligned_v1 with rationale locations.")
 
     def tasks(self) -> tuple[str, ...]:
-        """Task keys in asking order: condition tasks in ontology order, then the extras."""
-        keys: list[str] = []
-        for condition in CONDITIONS:
-            keys.extend(condition_tasks(condition, self.ask_untrained))
-        if self.extra_tasks:
-            keys.extend(EXTRA_TASKS)
-        return tuple(dict.fromkeys(keys))
+        return tuple(TASKS)
+
+    @property
+    def ask_untrained(self):
+        return False
 
 
 def vote(answers: list[dict], region_vote: str) -> dict:
@@ -657,178 +660,81 @@ def _finding(condition: str, tasks: dict, protocol: Protocol, cells: dict | None
 
 
 def analyze_image(runner, image_path: str | Path, protocol: Protocol = Protocol(), parser=None) -> dict:
-    """One yes/no question per task on the whole image; regions from the rationale, or from the same
-    question asked once per region with the region named in it (the whole-image answers are then kept
-    under "whole_image"). The image sent is always the whole radiograph. Deterministic order.
-
-    `parser` is an optional llm_parser.ParserService: the reader for every reply of this image. With
-    None (and with a service whose stages all resolve to "code") the strict readers below are used
-    exactly as before and the saved artifact is unchanged; otherwise every parse is recorded next to
-    the call it read, and an unresolved parse stays unresolved rather than becoming an answer.
-    """
-    path = Path(image_path)
-    calls: list[dict] = []
-    tasks: dict[str, dict] = {}
-    aggregation_warnings: list[dict] = []
-    usage_at_start = parser.usage_snapshot() if parser is not None else None
-
-    def ask(stage, task, cell, image, question):
-        hint = ("Start your reply with exactly Yes or No on the first line, choosing one. "
-                "Then give your brief rationale and location as requested.")
-        parse_stage = "whole_image_decision" if stage == "presence" else "region_decision"
-        context = f"image={path.name} | task={task} | stage={stage} | cell={cell or 'whole'}"
-        pending: list[dict] = []
-
-        def parse(reply):
-            if parser is None:
-                # A cut-off rationale can contain incomplete locations even if line 1 is readable.
-                value = None if reply.get("truncated") else extract_answer(reply["text"])
-                return value, None if value is not None else "missing_or_ambiguous_decision"
-            outcome = parser.decision(parse_stage, reply["text"], question,
-                                      truncated=bool(reply.get("truncated")), context=context)
-            pending.append(outcome.record)
-            return outcome.value, outcome.error
-
-        def record(asked_question, reply):
-            _record(calls, stage, task, cell, asked_question,
-                    {**reply, **({"parsing": list(pending)} if pending else {})})
-            pending.clear()
-
-        return llm_api.ask_parsed(
-            runner, image, question, parse=parse, retries=protocol.parse_retries, context=context,
-            record=record, fallback=lambda _: question + "\n\n" + hint)
-
-    def locate(task, question, answer, reply):
-        """The regions one whole-image answer names, and whether that location is unresolved.
-
-        Only an answer that reported the finding is put to the location parser: the regions of a No
-        answer are never used by the vote or by the report, so they keep the strict reader's reading
-        and cost nothing.
-        """
-        if answer is None:
-            return [], False, None
-        if parser is None or answer != "yes":
-            return extract_regions(reply["text"]), False, None
-        outcome = parser.location("rationale_location", reply["text"], question=question,
-                                  truncated=bool(reply.get("truncated")),
-                                  context=f"image={path.name} | task={task} | stage=rationale")
-        return list(outcome.value or []), not outcome.resolved, outcome.record
-
-    for task in protocol.tasks():
-        answers = []
-        for question in questions_for(task)[:protocol.phrasings]:
-            answer, reply = ask("presence", task, None, path, question)
-            regions, unresolved, location_record = locate(task, question, answer, reply)
-            if location_record is not None:
-                calls[-1].setdefault("parsing", []).append(location_record)
-            answers.append({"answer": answer, "regions": regions,
-                            **({"regions_unresolved": True} if unresolved else {}),
-                            "truncated": reply["truncated"]})
-        tasks[task] = {"name": task_name(task), "answers": answers, **vote(answers, protocol.region_vote)}
-        parsed_answers = [a["answer"] for a in answers if a["answer"] is not None]
-        if parsed_answers and tasks[task]["presence"] is None:
-            warning = {"kind": "phrasing_tie", "task": task, "answers": parsed_answers, "policy": "neutral"}
-            aggregation_warnings.append(warning)
-            llm_api.monitor("AGGREGATION WARNING", f"task={task}", reason="phrasing tie", policy="neutral")
-        # The whole-image stage, kept whatever the region questions decide below.
-        tasks[task]["whole_image"] = tasks[task]["presence"]
-        tasks[task]["whole_image_regions"] = tasks[task]["regions"] if protocol.location != "none" else None
-
-    region_cells = None
-    if protocol.location == "regions":
-        # The same whole image, one question per region: the task's own sentence with one of the model's
-        # nine location descriptors inside it. Every region is asked every task, whatever the whole image
-        # answered, so a task missed with the model's attention spread over the whole image can be
-        # recovered in a region: it is present when any region says yes, absent when every region says no.
-        # Task-major (each finding walked region by region); every call shares the same image prefix.
-        region_cells = {task: {} for task in tasks}
-        for task in tasks:
-            for cell in CELLS:
-                answer, _ = ask("region", task, cell, path, region_question(task, cell))
-                region_cells[task][cell] = answer
-        for task, answers in region_cells.items():
-            presence = tasks[task]["presence"] = _any_yes(answers.values())
-            tasks[task]["regions"] = [c for c in CELLS if answers[c] == "yes"] if presence == "yes" else None
-    elif protocol.location == "none":
-        for task in tasks:
-            tasks[task]["regions"] = None
-
-    findings = {c: _finding(c, tasks, protocol, region_cells) for c in CONDITIONS}
-    for condition, finding in findings.items():
-        decisions = [tasks[k]["presence"] for k in finding["tasks"] if tasks[k]["presence"] is not None]
-        if "yes" in decisions and "no" in decisions:
-            warning = {"kind": "task_conflict", "condition": condition, "answers": decisions,
-                       "policy": "existing any-yes aggregation"}
-            aggregation_warnings.append(warning)
-            llm_api.monitor("AGGREGATION WARNING", f"condition={condition}", reason="task conflict",
-                            policy="any-yes")
-
-    return {
-        "image": str(path.resolve()),
-        "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "protocol": asdict(protocol),
-        "location_level": protocol.location,
-        "left_is_image_left": LEFT_IS_IMAGE_LEFT,
-        "tasks": tasks,
-        "findings": findings,
-        "calls": calls,
-        "call_count": len(calls),
-        "inference_call_count": sum(not call.get("cache_hit", False) for call in calls),
-        "cache_hit_count": sum(call.get("cache_hit", False) for call in calls),
-        "parse_recovery": llm_api.parse_recovery_summary(calls),
-        "aggregation_warnings": aggregation_warnings,
-        **({"parser": parser.public(), "parser_fingerprint": parser.fingerprint(),
-            "parser_usage": parser.usage_since(usage_at_start)} if parser is not None else {}),
-    }
-
-
-def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | None = None,
-               parser=None) -> dict:
-    """Everything that defines a run; its hash guards resume. provenance = checkpoint/server facts.
-
-    The parser configuration is part of the run whenever it can change how a reply is read, so
-    resuming a directory with a different parser model, prompt or mode is refused instead of
-    filling one result set with two readings. A service that reads with code alone is the absence
-    of a parser and is left out, which keeps every run written before this existed resumable.
-    """
-    config = {
-        "protocol": asdict(protocol),
-        "questions": {task: questions_for(task)[:protocol.phrasings] for task in protocol.tasks()},
-        "descriptors": DESCRIPTORS, "cells": CELLS,
-        # The region questions are model input; the cell windows never are (they are evaluation
-        # geometry), so flipping LEFT_IS_IMAGE_LEFT does not invalidate a saved run.
-        "region_questions": ({task: {cell: region_question(task, cell) for cell in CELLS}
-                              for task in protocol.tasks()} if protocol.location == "regions" else None),
-        "runner": runner_settings, "provenance": provenance or {},
-        "parse_recovery_version": 1,
-        # 2: every finding carries its occupied-region count with a status, the regions left unresolved
-        # by the region questions, and the whole-image stage's regions next to the authoritative ones.
-        # A directory written under version 1 is refused rather than filled with two finding schemas.
-        "findings_version": 2,
-    }
+    """Twelve independent canonical requests; failure of a task remains visible."""
+    if not isinstance(protocol, Protocol):
+        raise ValueError("New inference requires the fixed PAN Protocol")
     if parser is not None and parser.policy.uses_llm():
-        config["parser"] = parser.settings()
+        raise ValueError("PAN inference uses deterministic parsing only")
+    if isinstance(runner, VisionRunner) and not runner.local:
+        raise ValueError("The PAN baseline requires the verified local DentVLM runtime")
+    path = Path(image_path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    calls, tasks, findings = [], {}, {}
+    for task in protocol.tasks():
+        question = questions_for(task)[0]
+        error = None
+        try:
+            reply = runner.ask(path, question)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            reply = {"text": "", "truncated": False, "finish_reason": "error", "error": error,
+                     "cache_hit": False}
+        error = error or reply.get("error")
+        reply["truncated"] = bool(reply.get("truncated") or reply.get("finish_reason") == "length")
+        text = reply.get("text", "")
+        answer = None if error or reply.get("truncated") else extract_answer(text)
+        contradictory = answer == "yes" and contradicts_positive(text, task)
+        if contradictory:
+            answer = None
+        reason = ("transport_error" if error else "truncated" if reply.get("truncated") else
+                  "contradictory_response" if contradictory else
+                  "missing_or_ambiguous_decision" if answer is None else None)
+        evidence = location_evidence(text, task) if answer == "yes" else []
+        regions = extract_regions(text) if answer == "yes" else None
+        report_regions = [c for c in CELLS if any(c in m["regions"] and m["reportable"] for m in evidence)]
+        location_status = ("unresolved" if answer is None else "not_applicable" if answer == "no" else
+                           "located" if report_regions else "unresolved" if evidence else "not_stated")
+        recovery = {"attempt": 1, "value": answer, "error": reason, "recovered": False, "status": "exhausted" if reason else "parsed"}
+        _record(calls, "presence", task, None, question,
+                {**reply, "parse_recovery": recovery, "question_provenance": TASKS[task]["question_provenance"]})
+        block = {"name": task_name(task), "question": question, "raw_response": text,
+                 "rationale": text, "finish_reason": reply.get("finish_reason"), "presence": answer, "regions": regions,
+                 "whole_image": answer, "whole_image_regions": regions,
+                 "answers": [{"answer": answer, "regions": regions or [], "truncated": bool(reply.get("truncated"))}],
+                 "parse_status": "resolved" if answer else "unresolved", "parse_error": reason,
+                 "error": error, "location_matches": evidence, "report_regions": report_regions,
+                 "location_status": location_status, "patient_laterality": "unresolved",
+                 "question_provenance": TASKS[task]["question_provenance"]}
+        tasks[task] = block
+        findings[task] = {**block, "asked": True, "tasks": [task], "unresolved_regions": [],
+                          **count_block(answer, regions)}
+    return {"schema": RESULT_SCHEMA, "profile": PROFILE, "image": str(path.resolve()),
+            "image_sha256": digest, "protocol": asdict(protocol), "location_level": "rationale",
+            "left_is_image_left": LEFT_IS_IMAGE_LEFT, "patient_laterality": "unresolved",
+            "tasks": tasks, "findings": findings, "calls": calls, "call_count": len(calls),
+            "inference_call_count": sum(not c.get("cache_hit", False) for c in calls),
+            "cache_hit_count": sum(bool(c.get("cache_hit")) for c in calls),
+            "parse_recovery": llm_api.parse_recovery_summary(calls), "aggregation_warnings": [],
+            "parser_version": PARSER_VERSION, "runtime": runner.settings() if hasattr(runner, "settings") else {}}
+
+
+def run_config(protocol: Protocol, runner_settings: dict, provenance: dict | None = None, parser=None) -> dict:
+    if parser is not None and parser.policy.uses_llm():
+        raise ValueError("PAN inference uses deterministic parsing only")
+    config = {"schema": RESULT_SCHEMA, "protocol": asdict(protocol), "registry": TASKS,
+              "questions": {task: questions_for(task) for task in protocol.tasks()},
+              "descriptors": DESCRIPTORS, "cells": CELLS, "system_message": SYSTEM_MESSAGE,
+              "parser_version": PARSER_VERSION, "runner": runner_settings, "provenance": provenance or {},
+              "findings_version": 3, "patient_laterality": "unresolved"}
     config["hash"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     return config
 
 
 def result_line(result: dict) -> str:
-    """Dense one-line state of one image: what was found, what stayed unresolved, what was never
-    asked (a finding with no trained task), and any aggregation warning behind the answers."""
-    findings = result["findings"]
-    asked = [c for c in CONDITIONS if findings[c]["asked"]]
-    present = [c for c in asked if findings[c]["presence"] == "yes"]
-    unclear = [c for c in asked if findings[c]["presence"] is None]
-    parts = [f"yes={len(present)} no={sum(findings[c]['presence'] == 'no' for c in asked)} "
-             f"unclear={len(unclear)} not_asked={len(CONDITIONS) - len(asked)}"]
-    if present:
-        parts.append(", ".join(present[:3]) + (f", +{len(present) - 3}" if len(present) > 3 else ""))
-    if unclear:
-        parts.append("unresolved: " + ", ".join(unclear[:3]) + (f", +{len(unclear) - 3}" if len(unclear) > 3 else ""))
-    warnings = result.get("aggregation_warnings") or ()
-    if warnings:
-        parts.append(f"aggregation warnings={len(warnings)}")
-    return " | ".join(parts)
+    values = list(result["findings"].values())
+    return " | ".join([f"yes={sum(v.get('presence') == 'yes' for v in values)}",
+                       f"no={sum(v.get('presence') == 'no' for v in values)}",
+                       f"unresolved={sum(v.get('presence') is None for v in values)}"])
 
 
 def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, protocol: Protocol = Protocol(),
@@ -854,6 +760,8 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
         if previous.get("hash") != config["hash"]:
             raise ValueError(f"{out} holds a run with a different configuration; use a new directory.")
     else:
+        if any(results_dir.glob("*.json")):
+            raise ValueError("Legacy or incompatible results without a manifest; use a new directory")
         manifest_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     todo = [(image_id, Path(p)) for image_id, p in images.items()]
@@ -862,7 +770,11 @@ def run_dataset(runner, images: dict[str, str | Path], out_dir: str | Path, prot
     for image_id, path in todo:
         target = results_dir / f"{image_id}.json"
         if resume and target.is_file():
-            _load_result_file(target, image_id)  # a corrupt or foreign artifact stops the run
+            saved = _load_result_file(target, image_id)
+            if saved.get("schema") != RESULT_SCHEMA or saved.get("protocol") != asdict(protocol):
+                raise ValueError("Legacy or incompatible result cannot resume a PAN run")
+            if saved.get("image_sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+                raise ValueError(f"{image_id}: source image changed; use a new run directory")
             progress.skip(image_id)
             continue
         with mon.guard(f"{out.name}/{image_id}", failures) as step:
@@ -911,8 +823,14 @@ def _load_result_file(path: Path, expected_id: str | None = None) -> dict:
     if image_id != path.stem or (expected_id is not None and image_id != expected_id):
         raise llm_api.artifact_error(path, f"image_id {image_id!r} does not match filename/expected id")
     findings = payload.get("findings")
-    if not isinstance(findings, dict) or any(c not in findings for c in CONDITIONS):
+    from benchmark_schema import UMFIH_CLASSES
+    expected = CONDITIONS if payload.get("schema") == RESULT_SCHEMA else UMFIH_CLASSES
+    if payload.get("schema") not in (None, RESULT_SCHEMA):
+        raise llm_api.artifact_error(path, "unsupported result schema")
+    if not isinstance(findings, dict) or set(findings) != set(expected):
         raise llm_api.artifact_error(path, "incomplete findings schema")
+    if not payload.get("schema"):
+        payload["legacy_artifact"] = True
     return payload
 
 
@@ -930,8 +848,10 @@ def load_results(out_dir: str | Path) -> dict[str, dict]:
 # ----------------------------------------------------------------------------
 # Dentist summary
 # ----------------------------------------------------------------------------
-def describe_cell(cell: str, left_is_image_left: bool = LEFT_IS_IMAGE_LEFT) -> str:
-    """Patient-side wording for a cell, with the image side in parentheses."""
+def describe_cell(cell: str, left_is_image_left: bool | None = None) -> str:
+    """Unresolved laterality by default; explicit booleans retain legacy diagnostic formatting."""
+    if left_is_image_left is None:
+        return report_location(cell)
     row, col = cell.split("-")
     if col == "anterior":
         return f"{row} anterior"
@@ -944,50 +864,6 @@ def protocol_level(result: dict) -> str:
     return result.get("location_level", LOCATION_LEVELS[0])
 
 
-def dentist_report(result: dict, counting: bool = True) -> str:
-    """Deterministic plain-text summary of one image result for a dentist.
-
-    With counting on, a present finding says in how many regions it was reported (regions, never
-    teeth), and a partial region set is called at least that many; with counting off the regions are
-    listed without a number.
-    """
-    flag = result.get("left_is_image_left", LEFT_IS_IMAGE_LEFT)
-    present, absent, unclear, not_assessed = [], [], [], []
-    for condition in CONDITIONS:
-        finding = result["findings"][condition]
-        label = LABELS[condition]
-        if not finding["asked"]:
-            not_assessed.append(label)
-        elif finding["presence"] == "yes":
-            parts = [label]
-            if finding["regions"]:
-                where = ", ".join(describe_cell(c, flag) for c in finding["regions"])
-                unresolved = finding.get("unresolved_regions") or []
-                if not counting:
-                    parts.append(f"regions: {where}")
-                elif unresolved:
-                    parts.append(f"in at least {len(finding['regions'])} region(s) ({len(unresolved)} region(s) "
-                                 f"could not be read): {where}")
-                else:
-                    parts.append(f"in {len(finding['regions'])} region(s): {where}")
-            elif finding["regions"] is not None:
-                parts.append("region not stated")
-            elif protocol_level(result) != "none":
-                parts.append("region could not be read")
-            present.append(" - " + "; ".join(parts))
-        elif finding["presence"] == "no":
-            absent.append(label)
-        else:
-            unclear.append(label)
-    extras_present = [t["name"] for k, t in result["tasks"].items() if k in EXTRA_TASKS and t["presence"] == "yes"]
-    lines = [f"Image: {Path(result['image']).name}", "Findings present:"]
-    lines += present or [" - none"]
-    if extras_present:
-        lines.append("Also present (no benchmark class): " + ", ".join(extras_present))
-    lines.append("Not seen: " + (", ".join(absent) or "none"))
-    if unclear:
-        lines.append("Not assessable (unparseable answer): " + ", ".join(unclear))
-    if not_assessed:
-        lines.append("Not assessed by this model: " + ", ".join(not_assessed))
-    lines.append("Experimental model output for dentist review; not a diagnosis.")
-    return "\n".join(lines)
+def dentist_report(result: dict, counting: bool = False) -> str:
+    from report_writer import structured_findings, render_facts
+    return render_facts(structured_findings(result, counting=counting))

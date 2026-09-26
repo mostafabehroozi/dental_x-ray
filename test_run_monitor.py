@@ -25,7 +25,7 @@ NO = "no" if DENTVLM else "B"
 
 def protocol(**kwargs):
     """The cheapest protocol on either branch: whole-image presence, no counts, no crops."""
-    base = {"location": "none"} if DENTVLM else {"presence_level": "overall", "counting": False}
+    base = {"location": "rationale"} if DENTVLM else {"presence_level": "overall", "counting": False}
     return dp.Protocol(**dict(base, **kwargs))
 
 
@@ -211,72 +211,6 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(summary["calls"], 28)
 
 
-class RunLoopFailureTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def _run(self, names, fail, **kwargs):
-        runner = FlakyRunner(fail)
-        self.images = _images(self.root, names)
-        ledger = mon.Ledger("session")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            run_dir = dp.run_dataset(runner, self.images, self.root / "run" / "umfih", protocol=protocol(),
-                                     ledger=ledger, **kwargs)
-        return runner, dp.load_results(run_dir), ledger, out.getvalue(), Path(run_dir)
-
-    def test_one_failing_image_does_not_cost_the_others(self):
-        runner, results, ledger, printed, run_dir = self._run(["img1", "img2", "img3"], {"img2"})
-        self.assertEqual(sorted(results), ["img1", "img3"])
-        self.assertEqual(len(ledger), 1)
-        self.assertEqual(ledger.entries[0]["scope"], "umfih/img2")
-        self.assertIn("upstream refused img2", printed)          # the provider's message, in full
-        self.assertIn("done=2 resumed=0 failed=1", printed)
-        saved = json.loads((run_dir / "failures.json").read_text())
-        self.assertEqual(saved["failures"][0]["reason"], "RuntimeError")
-        # The failed image is simply not there: a rerun picks it up and the finished two are skipped.
-        with contextlib.redirect_stdout(io.StringIO()):
-            dp.run_dataset(FlakyRunner(), self.images, run_dir, protocol=protocol())
-        self.assertEqual(len(dp.load_results(run_dir)), 3)
-
-    def test_a_hopeless_run_stops_instead_of_burning_the_dataset(self):
-        names = [f"img{i}" for i in range(1, 8)]
-        runner, results, ledger, printed, _ = self._run(names, set(names))
-        self.assertEqual(results, {})
-        self.assertEqual(len(ledger), 3)
-        self.assertIn("[STOPPED]", printed)
-        self.assertEqual({Path(s).stem for s in runner.asked}, {"img1", "img2", "img3"})
-
-    def test_per_image_line_names_what_was_found(self):
-        """One positive answer, and the image's line has to name the finding it belongs to."""
-        first = dp.CONDITIONS[0]
-        positive = (dp.questions_for(dp.condition_tasks(first, False)[0])[0] if DENTVLM
-                    else dp.presence_question(first, "plain"))
-
-        class OneFinding(FlakyRunner):
-            def ask(self, image, question):
-                hit = question.strip().startswith(positive.strip())
-                return reply(("Yes" if DENTVLM else "A") if hit else ("No" if DENTVLM else "B"))
-
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            dp.run_dataset(OneFinding(), _images(self.root, ["img1"]), self.root / "run" / "umfih",
-                           protocol=protocol())
-        printed = out.getvalue()
-        self.assertIn("yes=1" if DENTVLM else "present=1", printed)
-        self.assertIn(first, printed)
-
-    def test_results_stay_loadable_after_a_failure(self):
-        _, results, _, _, run_dir = self._run(["img1", "img2"], {"img1"})
-        self.assertEqual(list(results), ["img2"])
-        report = ev.evaluate({"img2": {"path": str(self.root / "img2.png"), "boxes": [],
-                                       "annotated": set(dp.CONDITIONS)}},
-                             results, evaluate_location=False)
-        self.assertEqual(report["summary"]["images_scored"], 1)
 
 
 class AdapterAndReportFailureTests(unittest.TestCase):
@@ -287,8 +221,8 @@ class AdapterAndReportFailureTests(unittest.TestCase):
         for name in ("img1", "img2", "img3"):
             path = self.root / f"{name}.png"
             path.write_bytes(b"bytes " + name.encode())
-            self.gt[name] = {"path": str(path), "annotated": set(dp.CONDITIONS),
-                             "boxes": [{"condition": dp.CONDITIONS[0], "xc": 0.3, "yc": 0.3, "w": 0.1, "h": 0.1}]}
+            self.gt[name] = {"path": str(path), "annotated": set(ev.CONDITIONS),
+                             "boxes": [{"condition": ev.CONDITIONS[0], "xc": 0.3, "yc": 0.3, "w": 0.1, "h": 0.1}]}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -377,7 +311,7 @@ class TruthReportTests(unittest.TestCase):
         (self.root / "labels" / "a.txt").write_text("0 0.5 0.5 0.1 0.1\n0 0.2 0.2 0.1 0.1\n")
         with contextlib.redirect_stdout(io.StringIO()):
             gt = ev.load_yolo(self.root / "images", self.root / "labels")
-        gt["gone"] = {"path": str(self.root / "images" / "gone.png"), "boxes": [], "annotated": set(dp.CONDITIONS)}
+        gt["gone"] = {"path": str(self.root / "images" / "gone.png"), "boxes": [], "annotated": set(ev.CONDITIONS)}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             summary = ev.truth_report(gt, "umfih_test")

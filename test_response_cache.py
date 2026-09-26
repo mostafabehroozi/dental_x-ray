@@ -24,7 +24,7 @@ class FakeClient:
 
 
 class ResponseCacheTests(unittest.TestCase):
-    def runner(self, root, client, namespace=None, max_tokens=64):
+    def runner(self, root, client, namespace=None, max_tokens=512):
         cache = ResponseCache(root, namespace or {"model": "dentvlm", "image_max_tokens": 8192})
         return dp.VisionRunner(client=client, max_tokens=max_tokens, response_cache=cache)
 
@@ -33,8 +33,8 @@ class ResponseCacheTests(unittest.TestCase):
             client = FakeClient()
             first_runner = self.runner(tmp, client)
             second_runner = self.runner(tmp, client)
-            first = first_runner.ask(b"same-image", "same question")
-            second = second_runner.ask(b"same-image", "same question")
+            first = first_runner.ask(b"same-image", dp.questions_for("caries")[0])
+            second = second_runner.ask(b"same-image", dp.questions_for("caries")[0])
 
             self.assertEqual(len(client.requests), 1)
             self.assertFalse(first["cache_hit"])
@@ -46,14 +46,14 @@ class ResponseCacheTests(unittest.TestCase):
     def test_cache_is_an_execution_detail_not_a_run_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient()
-            self.assertEqual(self.runner(tmp, client).settings(), dp.VisionRunner(client=client, max_tokens=64).settings())
+            self.assertEqual(self.runner(tmp, client).settings(), dp.VisionRunner(client=client, max_tokens=512).settings())
 
     def test_second_protocol_run_keeps_tasks_but_makes_no_duplicate_inferences(self):
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp, "image.jpg")
             image.write_bytes(b"synthetic-image")
             client = FakeClient()
-            protocol = dp.Protocol(location="none")
+            protocol = dp.Protocol()
 
             first = dp.analyze_image(self.runner(Path(tmp, "cache"), client), image, protocol=protocol)
             second = dp.analyze_image(self.runner(Path(tmp, "cache"), client), image, protocol=protocol)
@@ -70,13 +70,14 @@ class ResponseCacheTests(unittest.TestCase):
     def test_prompt_image_generation_and_runtime_scope_do_not_cross(self):
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient()
-            self.runner(tmp, client).ask(b"image-a", "question-a")
-            self.runner(tmp, client).ask(b"image-a", "question-b")
-            self.runner(tmp, client).ask(b"image-b", "question-a")
-            self.runner(tmp, client, max_tokens=32).ask(b"image-a", "question-a")
+            self.runner(tmp, client).ask(b"image-a", dp.questions_for("caries")[0])
+            self.runner(tmp, client).ask(b"image-a", dp.questions_for("implant")[0])
+            self.runner(tmp, client).ask(b"image-b", dp.questions_for("caries")[0])
+            with self.assertRaises(ValueError):
+                self.runner(tmp, client, max_tokens=32)
             self.runner(tmp, client, namespace={"model": "dentvlm", "image_max_tokens": 1369}).ask(
-                b"image-a", "question-a")
-            self.assertEqual(len(client.requests), 5)
+                b"image-a", dp.questions_for("caries")[0])
+            self.assertEqual(len(client.requests), 4)
 
     def test_malformed_artifact_fails_loudly(self):
         with tempfile.TemporaryDirectory() as tmp:

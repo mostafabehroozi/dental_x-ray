@@ -1,0 +1,89 @@
+{
+  "source_revision": "9463edb2af47f64510b0681efc20be6ecf870955",
+  "records": [
+    {
+      "id": "en_dis_upper_1137_Calculus",
+      "images": [
+        "data/imgs/upper_1137.jpg"
+      ],
+      "question": "<image>Evaluate the images to confirm if there is calculus disease?"
+    },
+    {
+      "id": "en_dis_panoramic_2666_Impacted Tooth",
+      "images": [
+        "data/imgs/panoramic_2666.jpg"
+      ],
+      "question": "<image>Based on the imaging, determine whether the patient has an impacted tooth?"
+    },
+    {
+      "id": "en_dis_panoramic_2109_Root Canal Therapy",
+      "images": [
+        "data/imgs/panoramic_2109.jpg"
+      ],
+      "question": "<image>Based on the imaging, determine whether the patient has root canal filling?"
+    },
+    {
+      "id": "en_dis_panoramic_336_Fillings",
+      "images": [
+        "data/imgs/panoramic_336.jpg"
+      ],
+      "question": "<image>Based on the imaging analysis, does the patient have fillings?"
+    },
+    {
+      "id": "en_dis_panoramic_392_Implant",
+      "images": [
+        "data/imgs/panoramic_392.jpg"
+      ],
+      "question": "<image>Based on the imaging, determine whether the patient has an implant?"
+    },
+    {
+      "id": "en_dis_panoramic_5065_Apical Periodontitis",
+      "images": [
+        "data/imgs/panoramic_5065.jpg"
+      ],
+      "question": "<image>Based on the imaging, does the patient have apical periodontitis abnormalities?"
+    },
+    {
+      "id": "en_dis_panoramic_2869_Prosthetic Bridge",
+      "images": [
+        "data/imgs/panoramic_2869.jpg"
+      ],
+      "question": "<image>Based on the imaging, determine whether the patient has a prosthetic bridge?"
+    },
+    {
+      "id": "en_dis_panoramic_1971_Residual Root",
+      "images": [
+        "data/imgs/panoramic_1971.jpg"
+      ],
+      "question": "<image>Examine the imaging to determine if there is a disease related to residual roots?"
+    },
+    {
+      "id": "en_dis_panoramic_5156_Prosthetic Crown",
+      "images": [
+        "data/imgs/panoramic_5156.jpg"
+      ],
+      "question": "<image>Based on the imaging analysis, does the patient have a prosthetic crown?"
+    },
+    {
+      "id": "en_dis_panoramic_4414_Caries",
+      "images": [
+        "data/imgs/panoramic_4414.jpg"
+      ],
+      "question": "<image>Examine the images to determine if there is the presence of caries."
+    },
+    {
+      "id": "en_dis_panoramic_1296_Residual Crown",
+      "images": [
+        "data/imgs/panoramic_1296.jpg"
+      ],
+      "question": "<image>Please confirm whether the patient has a residual crown?"
+    },
+    {
+      "id": "en_dis_panoramic_2707_Insufficient Space for Primary Tooth Eruption",
+      "images": [
+        "data/imgs/panoramic_2707.jpg"
+      ],
+      "question": "<image>Based on the imaging, does the patient have insufficient space for the eruption of primary teeth?"
+    }
+  ]
+}

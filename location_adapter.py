@@ -45,6 +45,7 @@ from pathlib import Path
 
 import dental_eval as ev
 import dental_pipeline as dp
+from benchmark_schema import LABELS as BENCHMARK_LABELS
 import llm_api
 import run_monitor as mon
 
@@ -382,7 +383,7 @@ class LLMAdapter:
                 part = f"_{start // self.max_boxes_per_call + 1}" if len(boxes) > self.max_boxes_per_call else ""
                 Path(drawn_dir).mkdir(parents=True, exist_ok=True)
                 Path(drawn_dir, f"{image_id}{part}.jpg").write_bytes(jpeg)
-            lines = [f"{i + 1}. {dp.LABELS[box['condition']]} - {pixel}" for i, (box, pixel) in enumerate(zip(chunk, pixels))]
+            lines = [f"{i + 1}. {BENCHMARK_LABELS[box['condition']]} - {pixel}" for i, (box, pixel) in enumerate(zip(chunk, pixels))]
             prompt = USER_PROMPT.format(width=width, height=height, box_lines="\n".join(lines))
             parsed, reply, attempts, parsing = {}, {"text": ""}, [], []
             for attempt in range(self.parse_retries + 1):

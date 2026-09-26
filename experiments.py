@@ -1,22 +1,4 @@
-"""Experiment table: one dictionary per configuration, so several settings run in one session.
-
-CELL 3 of the notebook holds a list of experiment dictionaries. Each one names itself and lists only
-the knobs it changes; everything else comes from DEFAULTS, then from the `shared` dictionary passed
-to build(). Every experiment writes into <output_root>/<name>/, so two configurations never mix in
-one run directory and the evaluation cell scores them side by side on the same images.
-
-    EXPERIMENTS = xp.build([
-        {"name": "base"},
-        {"name": "three-phrasings", "phrasings": 3},
-        {"name": "regions", "location": "regions"},
-        {"name": "gemini", "analyzer": {"provider": "gemini", "model": "gemini-3-pro"}},
-        {"name": "dentvlm-local", "backend": "local"},
-    ], shared={"output_root": "/kaggle/working/dental_outputs"})
-
-A dictionary knob (analyzer, adapter, reporter) merges key by key, so an experiment can change the
-model and keep the provider's request options; every other knob is replaced. An unknown knob name is
-rejected rather than ignored, because a silent typo would cost the whole sweep.
-"""
+"""Validated configuration for the fixed PAN training-aligned baseline."""
 from __future__ import annotations
 
 import difflib
@@ -32,94 +14,74 @@ import location_adapter as la
 import report_writer as rw
 from response_cache import ResponseCache
 
-BACKENDS = ("api", "local")
+BACKENDS = ("local",)
 MODEL_SOURCES = ("convert", "local", "hf")
-LOCATION_TRUTHS = ("llm", "areas", "fdm", "geometry")
+LOCATION_TRUTHS = ("llm", "areas", "geometry")
 
-DEFAULTS = {
-    # Where runs are written. One directory per experiment: <output_root>/<name>/<dataset>/
-    "output_root": "/kaggle/working/dental_outputs",
+# Fixed inference contract; adapter/report choices do not alter analyzer questions.
+DEFAULTS = {'output_root': '/kaggle/working/dentvlm_pan_training_aligned_v1',
+ 'backend': 'local',
+ 'analyzer': {'provider': 'openrouter', 'model': 'qwen/qwen3-vl-235b-a22b-thinking'},
+ 'max_tokens': 512,
+ 'temperature': 0.1,
+ 'cache_prompt': True,
+ 'reuse_local_responses': True,
+ 'request_timeout_seconds': 600.0,
+ 'api_call_retries': 2,
+ 'smoke_images': 5,
+ 'profile': 'pan_training_aligned_v1',
+ 'location': 'rationale',
+ 'evaluate_location': True,
+ 'counting': False,
+ 'location_truth': 'geometry',
+ 'adapter': {'provider': 'openai',
+             'model': 'gpt-5',
+             'token_param': 'max_completion_tokens',
+             'temperature': None,
+             'max_output_tokens': 8192,
+             'max_boxes_per_call': 12},
+ 'location_parse_retries': 1,
+ 'location_failure_policy': 'geometry',
+ 'reporter': {'provider': 'openai',
+              'model': 'gpt-5',
+              'token_param': 'max_completion_tokens',
+              'temperature': None,
+              'max_output_tokens': 8192,
+              'include_rationale': False,
+              'vote_agreement': False},
+ 'report_language': 'English',
+ 'report_images': None,
+ 'parser_mode': 'code',
+ 'parser_modes': {'whole_image_decision': 'code',
+                  'region_decision': 'code',
+                  'rationale_location': 'code',
+                  'saved_answer_reconstruction': 'code',
+                  'spotlight_decision': 'code',
+                  'spotlight_location': 'code',
+                  'location_json': 'code',
+                  'report_json': 'code',
+                  'report_fidelity': 'code',
+                  'vote_fraction': 'code'},
+ 'parser': {'provider': 'openai',
+            'model': 'gpt-5',
+            'token_param': 'max_completion_tokens',
+            'temperature': None,
+            'max_output_tokens': 2048},
+ 'parser_parse_retries': 0,
+ 'reuse_parser_responses': True,
+ 'hf_revision': '2ad8e71ea6708eee92723e7eca6e30e6dac48d85',
+ 'gguf_revision': None,
+ 'model_source': 'convert',
+ 'gguf_repo_id': 'REPLACE/DentVLM-GGUF',
+ 'model_filename': 'DentVLM-Q8_0.gguf',
+ 'mmproj_filename': 'DentVLM-mmproj-f16.gguf',
+ 'n_gpu_layers': 999,
+ 'ctx_size': 16384,
+ 'image_max_tokens': 8192,
+ 'image_min_tokens': 4}
 
-    # Analyzer: the model that answers the task questions.
-    "backend": "api",                  # "api": the analyzer spec below | "local": DentVLM through llama.cpp
-    "analyzer": {"provider": "openrouter", "model": "qwen/qwen3-vl-235b-a22b-thinking"},
-    "max_tokens": 512,                 # the authors' output cap
-    "temperature": 0.0,                # None leaves the field out (reasoning models)
-    "cache_prompt": True,              # local only: reuse the image KV prefix across one image's questions
-    "reuse_local_responses": True,     # exact shared cache under output_root for matching DentVLM requests
-    "request_timeout_seconds": 600.0,
-    "api_call_retries": 2,             # visible retries for transient API/transport failures
-    "smoke_images": 2,                 # raw replies checked before the run; 0 skips the smoke test
-
-    # Protocol: the paper's protocol by default (see dental_pipeline.Protocol).
-    "phrasings": 1,                    # 3 = three verbatim wordings per task and a vote
-    "region_vote": "union",            # with phrasings > 1: "union" | "majority"
-    "location": "rationale",           # "rationale" | "regions" (every region named in the question) | "none"
-    "ask_untrained": False,            # also ask the five UMFIH classes DentVLM has no task for
-    "extra_tasks": True,               # residual crown, eruption space, calculus: reported, not scored
-    "parse_retries": 1,                # extra attempts per unparseable question
-
-    # Location truth: how ground-truth boxes reach the six cells, and which of the two families that
-    # need it are scored. Neither switch changes a question or a saved answer: both are evaluation and
-    # report settings, so a saved run can be scored with either setting without new inference.
-    "evaluate_location": True,         # per-cell location tables (region_presence, regions)
-    "counting": True,                  # occupied-region counts: the number of distinct regions a finding is
-                                       # reported in against the regions its true boxes occupy (never a tooth
-                                       # count, never a question). Also puts the multiplicity in the dentist
-                                       # report. Needs region evidence, so location "none" rejects it.
-    "location_truth": "llm",           # "llm" (units per box) | "areas" (this image's cell areas, then geometry)
-                                       # | "fdm" (local DentVLM) | "geometry" (fixed windows). "llm" and "areas"
-                                       # both use the adapter spec below.
-    "adapter": {"provider": "openai", "model": "gpt-5",
-                "token_param": "max_completion_tokens", "temperature": None,
-                "max_output_tokens": 8192, "max_boxes_per_call": 12},
-    "adapter_fdm_margin": 0.06,        # spotlight margin around the box, fraction of the image size
-    "location_parse_retries": 1,
-    "location_failure_policy": "geometry",  # "geometry" | "exclude" | "error"
-
-    # Dentist report: a text model turns one image's answers into a classified report.
-    "reporter": {"provider": "openai", "model": "gpt-5",
-                 "token_param": "max_completion_tokens", "temperature": None, "max_output_tokens": 8192,
-                 "include_rationale": False,
-                 # ON: the report is also given the vote behind each answer (how many of the question's
-                 # wordings reported the finding, how many named each region) and describes that
-                 # agreement in words. Needs phrasings > 1 to measure anything. It changes the report
-                 # only: the predictions, the union/majority vote and the evaluation are untouched.
-                 "vote_agreement": False},
-    "report_language": "English",
-    "report_images": None,             # None = every image with a result; N = only the first N
-
-    # Parser: the model that reads what the other models wrote, when the strict readers cannot.
-    # "parser_mode" is the one switch over every stage: "code" reads with code only (this default
-    # is exactly the behaviour of every run written before the parser existed), "llm" reads every
-    # stage with the parser model, "code_then_llm" tries the strict reader first everywhere, and
-    # None hands each stage back to its own setting in "parser_modes" below.
-    "parser_mode": "code",
-    # Manual mode ("parser_mode": None): one mode per stage. The defaults are
-    # llm_parser.DEFAULT_MODES - "code_then_llm" where the strict reader is right whenever it
-    # succeeds, "llm" where it can succeed while losing the meaning (see llm_parser.STAGES for the
-    # reason behind each one). A dictionary knob merges key by key, so naming one stage here keeps
-    # the rest at their defaults.
-    "parser_modes": dict(lp.DEFAULT_MODES),
-    "parser": {"provider": "openai", "model": "gpt-5",
-               "token_param": "max_completion_tokens", "temperature": None,
-               "max_output_tokens": 2048},
-    "parser_parse_retries": 1,         # extra attempts when the parser's own reply is malformed
-    "reuse_parser_responses": True,    # exact shared cache under output_root for parser requests
-
-    # Local DentVLM files and llama.cpp runtime (backend="local"). Where they are built, converted and
-    # cached is a machine setting and stays in the notebook; these change what the model is and sees.
-    "model_source": "convert",         # "convert" (from the gated checkpoint) | "local" | "hf"
-    "gguf_repo_id": "REPLACE/DentVLM-GGUF",   # model_source "hf": your own GGUF repository
-    "model_filename": "DentVLM-Q8_0.gguf",
-    "mmproj_filename": "DentVLM-mmproj-f16.gguf",
-    "n_gpu_layers": 999,
-    "ctx_size": 16384,                 # the authors' max input
-    "image_max_tokens": 8192,          # = the authors' max_pixels 8192x28x28; 1369 = their 1024x1024 ablation
-    "image_min_tokens": None,
-}
-
-PROTOCOL_KEYS = ("phrasings", "region_vote", "location", "ask_untrained", "extra_tasks", "parse_retries")
+PROTOCOL_KEYS = ("profile", "location")
+RETIRED = {"phrasings", "region_vote", "ask_untrained", "extra_tasks", "parse_retries", "adapter_fdm_margin"}
 SERVER_KEYS = ("model_filename", "mmproj_filename", "n_gpu_layers", "ctx_size", "image_max_tokens", "image_min_tokens")
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -135,6 +97,8 @@ def _merge(base: dict, override: dict) -> dict:
 
 def _check_keys(config: dict, where: str) -> None:
     for key in config:
+        if key in RETIRED:
+            raise ValueError(f"{where}: {key} is retired; migrate to {dp.PROFILE} with all 12 canonical questions")
         if key not in DEFAULTS and key != "name":
             close = difflib.get_close_matches(key, list(DEFAULTS) + ["name"], n=1)
             hint = f"; did you mean {close[0]!r}?" if close else ""
@@ -154,15 +118,21 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
     if not isinstance(name, str) or not NAME_PATTERN.match(name):
         raise ValueError(f"experiment name {name!r} must be a non-empty directory-safe string")
     _check_keys(config, f"experiment {name!r}")
+    _check_keys(shared or {}, "shared")
     cfg = _merge(_merge(DEFAULTS, shared or {}), config)
+    for key, expected in {"max_tokens": 512, "temperature": 0.1, "ctx_size": 16384, "image_min_tokens": 4, "image_max_tokens": 8192, "parser_mode": "code"}.items():
+        if cfg[key] != expected:
+            raise ValueError(f"{name}: {dp.PROFILE} requires {key}={expected!r}")
+    if cfg["reporter"].get("include_rationale") or cfg["reporter"].get("vote_agreement"):
+        raise ValueError("Reporter accepts normalized facts only; rationale and voting switches are retired")
+    if cfg["model_source"] == "hf" and not re.fullmatch(r"[0-9a-f]{40}", cfg.get("gguf_revision") or ""):
+        raise ValueError("HF GGUF downloads require a pinned 40-character gguf_revision")
 
     for value, allowed, knob in ((cfg["backend"], BACKENDS, "backend"),
                                  (cfg["model_source"], MODEL_SOURCES, "model_source"),
                                  (cfg["location_truth"], LOCATION_TRUTHS, "location_truth")):
         if value not in allowed:
             raise ValueError(f"{name}: {knob} must be one of {allowed}, got {value!r}")
-    if cfg["location_truth"] == "fdm" and cfg["backend"] != "local":
-        raise ValueError(f"{name}: location_truth 'fdm' needs backend 'local' (DentVLM answers the questions)")
     for knob in ("max_tokens", "ctx_size"):
         if type(cfg[knob]) is not int or cfg[knob] <= 0:
             raise ValueError(f"{name}: {knob} must be a positive integer, got {cfg[knob]!r}")
@@ -173,9 +143,6 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
     for knob in ("reuse_local_responses", "reuse_parser_responses", "evaluate_location", "counting"):
         if type(cfg[knob]) is not bool:
             raise ValueError(f"{name}: {knob} must be True or False")
-    if cfg["counting"] and cfg["location"] == "none":
-        raise ValueError(f"{name}: counting needs region evidence, and location 'none' asks presence only; "
-                         "set location to 'rationale' or 'regions', or counting to False")
     llm_api.validate_parse_retries(cfg["parser_parse_retries"])
     lp.validate_mode(cfg["parser_mode"], allow_none=True, where=f"{name}: parser_mode")
     if not isinstance(cfg["parser_modes"], dict):
@@ -192,6 +159,10 @@ def resolve(config: dict, shared: dict | None = None) -> dict:
     _check_spec(cfg["reporter"], "reporter", name)
     if type(cfg["reporter"].get("vote_agreement", False)) is not bool:
         raise ValueError(f"{name}: reporter vote_agreement must be True or False")
+    if cfg["hf_revision"] != DEFAULTS["hf_revision"]:
+        raise ValueError("This profile requires the pinned DentVLM checkpoint revision")
+    if cfg["report_language"] != "English":
+        raise ValueError("The validated clinical renderer currently supports English only")
     protocol(cfg)  # the Protocol validates its own knobs
 
     # Retry and failure settings reach the roles that need them; a spec may override any of them.
@@ -247,7 +218,7 @@ def provenance(cfg: dict, **extra) -> dict:
     if not is_local(cfg):
         return {**llm_api.public(cfg["analyzer"]), **extra}
     return {"model_file": cfg["model_filename"], "mmproj_file": cfg["mmproj_filename"],
-            "model_source": cfg["model_source"], "ctx_size": cfg["ctx_size"],
+            "model_source": cfg["model_source"], "hf_revision": cfg["hf_revision"], "gguf_revision": cfg["gguf_revision"], "ctx_size": cfg["ctx_size"],
             "image_max_tokens": cfg["image_max_tokens"], "image_min_tokens": cfg["image_min_tokens"], **extra}
 
 
@@ -275,7 +246,7 @@ def record(cfg: dict) -> Path:
 
 def model_key(cfg: dict) -> tuple:
     """The GGUF files a local experiment needs; experiments sharing them convert or download once."""
-    return (cfg["model_source"], cfg["gguf_repo_id"], cfg["model_filename"], cfg["mmproj_filename"])
+    return (cfg["model_source"], cfg["gguf_repo_id"], cfg["model_filename"], cfg["mmproj_filename"], cfg["hf_revision"], cfg["gguf_revision"])
 
 
 def server_key(cfg: dict) -> tuple:
@@ -298,10 +269,8 @@ def truth_dir(cfg: dict, dataset: str) -> Path:
         model = re.sub(r"[^a-z0-9]+", "-", str(cfg["adapter"]["model"]).lower()).strip("-")
         name = f"{cfg['location_truth']}-{model}"
     else:
-        key = {"model_file": cfg["model_filename"], "margin": cfg["adapter_fdm_margin"],
-               "max_tokens": cfg["max_tokens"], "parse_retries": cfg["location_parse_retries"],
-               "policy": cfg["location_failure_policy"]}
-        name = "fdm-spotlight"
+        key = {"method": "geometry"}
+        name = "geometry"
     # How the adapter's replies are read is part of what the adapted truth is, so two experiments
     # reading them differently get two directories instead of one they would refuse to share. The
     # key is read from the configuration, never from a built service: naming a directory must not
@@ -317,7 +286,7 @@ def truth_dir(cfg: dict, dataset: str) -> Path:
 # The three model roles of one experiment
 # ----------------------------------------------------------------------------
 def _file_identity(path: str | Path) -> dict:
-    """Cheap restart-safe identity for a local runtime artifact."""
+    """File location metadata; verified content hashes are included in server provenance."""
     path = Path(path).resolve()
     stat = path.stat()
     return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -335,6 +304,7 @@ def local_response_cache(cfg: dict, server) -> ResponseCache | None:
         "mmproj": _file_identity(server.mmproj_path),
         "llama_server": _file_identity(server.binary),
         "server": {key: cfg[key] for key in SERVER_KEYS},
+        "verified_runtime": server.provenance,
     }
     return ResponseCache(Path(cfg["output_root"]) / "_response_cache", namespace)
 
@@ -346,10 +316,13 @@ def runner(cfg: dict, server=None) -> dp.VisionRunner:
                                         temperature=cfg["temperature"], timeout=cfg["request_timeout_seconds"])
     if server is None:
         raise ValueError(f"{cfg['name']}: backend 'local' needs a started llama.cpp server")
-    return dp.VisionRunner(base_url=f"{server.base_url}/v1", model=server.alias, max_tokens=cfg["max_tokens"],
+    server.verify_runtime()
+    result = dp.VisionRunner(base_url=f"{server.base_url}/v1", model=server.alias, max_tokens=cfg["max_tokens"],
                            temperature=cfg["temperature"], timeout=cfg["request_timeout_seconds"], local=True,
                            cache_prompt=cfg["cache_prompt"], api_call_retries=cfg["api_call_retries"],
                            response_cache=local_response_cache(cfg, server))
+    result.runtime_provenance = server.provenance
+    return result
 
 
 def parser(cfg: dict) -> lp.ParserService:
@@ -373,8 +346,7 @@ def location_adapter(cfg: dict, runner=None, parser=None):
     if cfg["location_truth"] == "areas":
         # No parser: the areas are a short strict object of numbers, read by code.
         return la.AreaAdapter.from_api(cfg["adapter"], timeout=cfg["request_timeout_seconds"])
-    return la.FdmAdapter(runner, margin=cfg["adapter_fdm_margin"], parse_retries=cfg["location_parse_retries"],
-                         failure_policy=cfg["location_failure_policy"], parser=parser)
+    raise ValueError("DentVLM-generated location truth is disabled")
 
 
 def report_writer(cfg: dict, parser=None) -> rw.ReportWriter:
@@ -399,7 +371,7 @@ def table(configs: list[dict]) -> list[dict]:
     """One row per experiment holding only the knobs the experiments disagree on."""
     varying = [k for k in DEFAULTS if len({_digest(public(c)[k]) for c in configs}) > 1]
     if not varying:
-        varying = ["backend", "analyzer", "phrasings", "location", "ask_untrained"]
+        varying = ["backend", "profile", "location", "counting"]
     return [{"name": c["name"], **{k: _cell(public(c)[k], k) for k in varying}} for c in configs]
 
 

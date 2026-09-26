@@ -11,6 +11,8 @@ from pathlib import Path
 
 import dental_eval as ev
 import dental_pipeline as dp
+from benchmark_schema import UMFIH_CLASSES, TRAINED, project_results
+from types import SimpleNamespace
 import llm_parser as lp
 
 
@@ -24,6 +26,7 @@ def _outcome(truth, finding, field="presence"):
 
 
 def presence_changes(gt, before, after, comparison, before_field="presence", after_field="presence"):
+    before, after = project_results(before), project_results(after)
     groups = defaultdict(list)
     for image_id, entry in gt.items():
         for condition in sorted(entry["annotated"]):
@@ -39,7 +42,7 @@ def presence_changes(gt, before, after, comparison, before_field="presence", aft
             for (condition, transition), ids in sorted(groups.items())]
 
 
-def _score(gt, results, evaluate_location, counting=True):
+def _score(gt, results, evaluate_location, counting=False):
     return ev.evaluate(gt, results, evaluate_location=evaluate_location, counting=counting, include_analysis=False)
 
 
@@ -52,7 +55,11 @@ def metrics(gt, report):
     row = {k: summary[k] for k in ("images_scored", "expected_finding_checks", "scored_finding_checks",
            "excluded_unparseable_checks", "TP", "TN", "FP", "FN", "sensitivity", "specificity", "ppv", "f1")}
     row["annotated_checks"] = sum(len(e["annotated"]) for e in gt.values())
-    row["not_assessed_checks"] = row["annotated_checks"] - row["expected_finding_checks"]
+    row["proxy_checks"] = sum(r["images"] for r in report.get("proxy_presence", []))
+    row["not_assessed_checks"] = row["annotated_checks"] - row["expected_finding_checks"] - row["proxy_checks"]
+    for key in ("false_positive_rate", "precision", "negative_scored", "predicted_positive", "positive_scored",
+                "unresolved_positive_truth", "unresolved_negative_truth", "all_eligible_accuracy", "resolved_coverage"):
+        row[key] = summary.get(key)
     row["coverage"] = ev._ratio(row["scored_finding_checks"], row["expected_finding_checks"])
     # Occupied-region counts: None (not zeros) when counting was off or the run asked presence only.
     occupied = summary.get("occupied_regions") or {}
@@ -87,7 +94,7 @@ def finding_rows(gt, report):
         region_presence[row["condition"]].append(row)
 
     rows = []
-    for condition in dp.CONDITIONS:
+    for condition in UMFIH_CLASSES:
         annotated = [entry for entry in gt.values() if condition in entry["annotated"]]
         if not annotated:
             continue
@@ -95,7 +102,7 @@ def finding_rows(gt, report):
         annotated_positives = sum(any(b["condition"] == condition for b in entry["boxes"])
                                   for entry in annotated)
         if base is None:
-            base = {"dataset": dataset, "condition": condition, "trained_task": condition in dp.TRAINED,
+            base = {"dataset": dataset, "condition": condition, "trained_task": condition in TRAINED,
                     "images": 0, "positives": 0,
                     **{k: None for k in ("TP", "TN", "FP", "FN")}, "unparseable": 0,
                     **{k: None for k in ("sensitivity", "specificity", "ppv", "f1")}}
@@ -172,7 +179,7 @@ def parser_usage(results):
 
 def recovery_rows(gt, results, evaluate_location):
     # Individual crown/bridge questions cannot be scored from a merged restoration label.
-    task_conditions = {t: c for c in dp.CONDITIONS for t in dp.condition_tasks(c, True)
+    task_conditions = {t: c for c in UMFIH_CLASSES for t in dp.condition_tasks(c, True)
                        if len(dp.condition_tasks(c, True)) == 1}
     groups = defaultdict(list)
     for image_id, entry in gt.items():
@@ -209,7 +216,7 @@ def recovery_rows(gt, results, evaluate_location):
             for (stage, task, status), items in sorted(groups.items())]
 
 
-def phrasing_analysis(gt, results, evaluate_location, counting=True):
+def phrasing_analysis(gt, results, evaluate_location, counting=False):
     first_results, eligible, votes = {}, {}, defaultdict(list)
     for image_id, entry in gt.items():
         result = results[image_id]
@@ -248,7 +255,7 @@ def phrasing_analysis(gt, results, evaluate_location, counting=True):
             replay = {}
             for image_id, entry in subset.items():
                 result = results[image_id]
-                protocol = dp.Protocol(**result["protocol"])
+                protocol = SimpleNamespace(**{ "ask_untrained": False, **result["protocol"]})
                 findings = dict(result["findings"])
                 for condition in entry["annotated"]:
                     # The same aggregation the run used (any-yes over the tasks, regions merged, then
@@ -266,15 +273,15 @@ def phrasing_analysis(gt, results, evaluate_location, counting=True):
     return changes, vote_rows, region_rows
 
 
-def analyze(gt, results, *, dataset="dataset", evaluate_location=True, counting=True):
-    results = {i: results[i] for i in gt}
+def analyze(gt, results, *, dataset="dataset", evaluate_location=True, counting=False):
+    results = project_results({i: results[i] for i in gt})
     buckets = defaultdict(lambda: defaultdict(set))
     for image_id, entry in gt.items():
         result = results[image_id]
         present = {b["condition"] for b in entry["boxes"]} & set(entry["annotated"])
         for condition in entry["annotated"]:
             finding = result["findings"][condition]
-            labels = [("task_support", "trained" if condition in dp.TRAINED else "untrained")]
+            labels = [("task_support", "trained" if condition in TRAINED else "untrained")]
             if finding["asked"]:
                 boxes = [b for b in entry["boxes"] if b["condition"] == condition]
                 labels.append(("finding_types_in_image", "0" if not present else "1-2" if len(present) <= 2 else "3+"))
@@ -316,7 +323,7 @@ def analyze(gt, results, *, dataset="dataset", evaluate_location=True, counting=
             "case_breakdown": rows, "case_condition_breakdown": condition_rows}
 
 
-def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True, counting=True):
+def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True, counting=False):
     """First named dataset directory is the reference; rescore selected images on one truth.
 
     Pair only findings asked and resolved in both runs. Additional assessed classes
@@ -335,7 +342,7 @@ def compare_runs(gt, run_dirs, *, dataset="dataset", evaluate_location=True, cou
         missing = set(gt) - set(loaded)
         if missing:
             raise ValueError(f"{name}: missing selected images: {sorted(missing)[:5]}")
-        results = {i: loaded[i] for i in gt}
+        results = project_results({i: loaded[i] for i in gt})
         for image_id, result in results.items():
             if not result.get("image_sha256"):
                 raise ValueError(f"{name}/{image_id}: missing image_sha256")

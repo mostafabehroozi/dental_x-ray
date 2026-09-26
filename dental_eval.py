@@ -1,30 +1,10 @@
-"""Deterministic evaluation of saved pipeline results against box-level ground truth.
+"""Dataset-boundary evaluation of saved canonical or explicitly legacy results.
 
-Ground truth comes from YOLO label files (UMFIH 14-class set) or DENTEX JSON.
-Metrics stay simple: image-level TP/FP/TN/FN per finding (and the same table
-for the whole-image answers alone in the region comparison, to show what the
-region questions recovered and what they cost), presence per cell (every cell of every
-image, present or absent, against the cells the true boxes occupy, so a finding
-class is scored once per cell rather than counted), cell-level TP/FP/TN/FN for
-the localized true positives, occupied-region counts (the size of the
-deduplicated region set the model reported a finding in against the number of
-distinct regions its true boxes occupy, one region per box; `counting` switches
-this family on and off independently of `evaluate_location`), and two per-image
-numbers a dentist cares about (complete-case rate, false alarms).
-
-Findings the model was not asked about are listed as not assessed and skipped.
-Unparseable answers are excluded from the per-finding confusion tables and
-reported as counts. Both per-image metrics also exclude unresolved results: a
-true finding whose answer was unparseable is excluded from recall. Complete-case
-rate excludes images with unresolved findings. Neither metric gives them credit.
-A count is scored only when both sides are resolved; every other case is
-reported under its reason (unresolved, partial, unlocated, incomplete truth) and
-never becomes a zero.
-
-Location truth (which cells a true box occupies) comes, in this order, from
-regions attached to the box by location_adapter (apply_adapted), from DENTEX
-FDI tooth numbers, or from the fixed cell windows. The evaluation summary
-reports which source placed how many boxes.
+The 14 UMFIH class IDs are fixed independently of PAN capabilities. Primary
+summaries include exact/composite mappings; periapical lesion is a separate proxy.
+Missing truth is never negative. Unknown predictions receive no success credit.
+FDI annotations take priority over approximate adapters. Source-frame six-cell
+localization remains secondary because patient laterality is unverified.
 """
 from __future__ import annotations
 
@@ -33,8 +13,10 @@ import json
 from pathlib import Path
 
 import run_monitor as mon
-from dental_pipeline import (CELL_WINDOWS, CELLS, CONDITIONS, LEFT_IS_IMAGE_LEFT, TRAINED, cell_answers,
+from dental_pipeline import (CELL_WINDOWS, CELLS, LEFT_IS_IMAGE_LEFT, cell_answers,
                              count_block, fdi_unit, finding_count, unit_cell, units_to_cells)
+
+from benchmark_schema import UMFIH_CLASSES as CONDITIONS, TRAINED, PROXY_CONDITIONS, project_results
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}  # formats llama.cpp can decode
 
@@ -58,7 +40,7 @@ DENTEX_DISEASES = {
 # box = {"condition", "xc", "yc", "w", "h", "fdi" (optional (quadrant, tooth))}
 # ----------------------------------------------------------------------------
 def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]:
-    """UMFIH 14-class layout. An image with no label file is scored as all-negative, and a label
+    """UMFIH 14-class layout. An image with no label file has unavailable ground truth, and a label
     file with no image is never scored at all, so both are counted and reported: silently, they
     look exactly like a correct dataset."""
     images_root, labels_root = Path(images_dir), Path(labels_dir)
@@ -83,11 +65,12 @@ def load_yolo(images_dir: str | Path, labels_dir: str | Path) -> dict[str, dict]
                 boxes.append({"condition": CONDITIONS[class_id], "xc": xc, "yc": yc, "w": w, "h": h})
         if path.stem in dataset:
             raise ValueError(f"duplicate image id {path.stem}")
-        dataset[path.stem] = {"path": str(path), "boxes": boxes, "annotated": set(CONDITIONS)}
+        dataset[path.stem] = {"path": str(path), "boxes": boxes, "annotated": set(CONDITIONS) if label_path.is_file() else set(),
+                              "annotation_status": "available" if label_path.is_file() else "missing"}
     if not dataset:
         raise ValueError(f"no images under {images_root}")
     orphans = sorted(p.stem for p in labels_root.rglob("*.txt") if p.stem not in dataset)
-    for reason, names in (("images with no label file (scored as all-negative)", unlabeled),
+    for reason, names in (("images with no label file (excluded: truth unavailable)", unlabeled),
                           ("label files with no image (never scored)", orphans)):
         if names:
             mon.monitor("PROBLEM", str(images_root), reason=reason, count=len(names),
@@ -107,7 +90,7 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
         image_path = Path(images_dir) / img["file_name"]
         dataset[Path(img["file_name"]).stem] = {
             "path": str(image_path), "boxes": [],
-            "annotated": {"carious_lesion", "periapical_lesion", "impacted_tooth"},
+            "annotated": {DENTEX_DISEASES[name] for name in disease_names.values() if name in DENTEX_DISEASES},
         }
     for ann in payload["annotations"]:
         if ann.get("image_id") not in images:
@@ -123,9 +106,8 @@ def load_dentex(images_dir: str | Path, annotations_json: str | Path) -> dict[st
         width, height = img["width"], img["height"]
         box = {"condition": condition, "xc": (x + w / 2) / width, "yc": (y + h / 2) / height,
                "w": w / width, "h": h / height}
-        # FDI quadrant and tooth number give exact region truth through DentVLM's own mapping
-        # (Supplementary Table S6). They agree with box geometry on 97% of validation boxes,
-        # which confirms the image-left = patient-right display convention.
+        # FDI is original anatomical truth. Its translation into model source-frame
+        # left/right cells follows Table S6 as a secondary, unvalidated assumption.
         if ann.get("category_id_1") in quadrants and ann.get("category_id_2") in teeth:
             box["fdi"] = (quadrants[ann["category_id_1"]], teeth[ann["category_id_2"]])
         dataset[Path(img["file_name"]).stem]["boxes"].append(box)
@@ -192,15 +174,17 @@ def geometric_regions(box: dict, windows: dict | None = None) -> set[str]:
 
 def box_regions(box: dict, windows: dict | None = None) -> set[str]:
     """Cells holding the box: adapted regions if attached, else exact from FDI, else geometry."""
-    if box.get("regions") is not None:
-        return set(box["regions"])
     if box.get("fdi"):
         return {fdi_cell(*box["fdi"])}
+    if box.get("regions") is not None:
+        return set(box["regions"])
     return geometric_regions(box, windows)
 
 
 def box_source(box: dict) -> str:
     """Which method decides this box's cells (see box_regions)."""
+    if box.get("fdi"):
+        return "fdi"
     if box.get("regions") is not None:
         return box.get("region_source", "adapted")
     return "fdi" if box.get("fdi") else "geometry"
@@ -259,11 +243,18 @@ def apply_adapted(gt: dict[str, dict], adapted: dict[str, dict]) -> dict[str, di
     out = {}
     for image_id, entry in gt.items():
         boxes = [dict(b) for b in entry["boxes"]]
+        if all(b.get("fdi") for b in boxes):
+            out[image_id] = {**entry, "boxes": boxes}
+            continue
         records = adapted.get(image_id, {}).get("boxes") if boxes else []
         if records is None or len(records) != len(boxes):
             raise ValueError(f"{image_id}: {len(boxes)} boxes but adapted truth for "
                              f"{len(records) if records else 0}; run the adapter on every image of this dataset")
         for box, record in zip(boxes, records):
+            if box.get("fdi"):
+                continue
+            if record.get("source") == "fdm":
+                raise ValueError("DentVLM-generated location truth is disabled for PAN evaluation")
             expected = [box["xc"], box["yc"], box["w"], box["h"]]
             if record.get("condition") != box["condition"] or record.get("box") != expected:
                 raise ValueError(f"{image_id}: adapted box order/content does not match ground truth")
@@ -327,6 +318,8 @@ def predicted_cells(result: dict, condition: str, parser=None) -> dict[str, bool
     Regions: each region question's own answer, merged over the finding's tasks (any yes, all no, else
     unparseable); a result saved without its calls or task list falls back to the finding's cell set.
     """
+    from benchmark_schema import project_result
+    result = project_result(result)
     finding = result["findings"][condition]
     level = result.get("location_level", "none")
     if not finding["asked"] or level == "none":
@@ -347,6 +340,8 @@ def predicted_cells(result: dict, condition: str, parser=None) -> dict[str, bool
     if finding["presence"] == "yes" and finding["regions"] is None:
         return None
     named = set(finding["regions"] or [])
+    if result.get("schema") == "dentvlm-pan/1":
+        return {cell: True if cell in named else None for cell in CELLS}
     return {cell: cell in named for cell in CELLS}
 
 
@@ -359,6 +354,8 @@ def _ratio(a: float, b: float):
 
 def _prf(tp, fp, tn, fn) -> dict:
     return {
+        "false_positive_rate": _ratio(fp, fp + tn), "precision": _ratio(tp, tp + fp),
+        "negative_scored": fp + tn, "predicted_positive": tp + fp, "positive_scored": tp + fn,
         "sensitivity": _ratio(tp, tp + fn), "specificity": _ratio(tn, tn + fp),
         "ppv": _ratio(tp, tp + fp), "f1": _ratio(2 * tp, 2 * tp + fp + fn),
     }
@@ -368,6 +365,8 @@ def _tally(table: dict, truth: bool, answer: str | None) -> bool:
     """Add one image to a TP/FP/TN/FN table; False (and counted) when the answer was unparseable."""
     if answer is None:
         table["unparseable"] += 1
+        key = "unresolved_positive_truth" if truth else "unresolved_negative_truth"
+        table[key] = table.get(key, 0) + 1
         return False
     positive = answer == "yes"
     table["TP"] += truth and positive
@@ -435,7 +434,7 @@ def _sum_tables(tables: list[dict]) -> dict:
 
 
 def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "dataset",
-             out_dir: str | Path | None = None, *, evaluate_location: bool = True, counting: bool = True,
+             out_dir: str | Path | None = None, *, evaluate_location: bool = True, counting: bool = False,
              include_analysis: bool = True) -> dict:
     """Score saved results against ground truth. Images missing from either side are skipped.
 
@@ -443,6 +442,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     occupied-region count table. Either one needs the location truth (adapted or fixed windows); with
     both off no true box is ever placed.
     """
+    results = project_results(results)
     ids = sorted(set(gt) & set(results))
     missing = sorted(set(gt) - set(results))
     presence, whole_image, region_presence, regions, counts, per_image, not_assessed = [], [], [], [], [], [], []
@@ -465,6 +465,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             continue
         table = {"TP": 0, "FP": 0, "TN": 0, "FN": 0, "unparseable": 0}
         whole = dict(table)
+        table.update(unresolved_positive_truth=0, unresolved_negative_truth=0)
         positives = 0
         r_tp = r_fp = r_tn = r_fn = set_match = n_loc = unlocalized = straddle = 0
         region_unparseable = location_truth_excluded = 0
@@ -495,7 +496,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 # one cell are one presence, and an unparseable cell answer is one excluded cell.
                 pred_map = predicted_cells(results[image_id], condition)
                 placed = [b for b in boxes if not b.get("location_excluded")]
-                if pred_map is not None and boxes and not placed:
+                if pred_map is not None and boxes and len(placed) != len(boxes):
                     rp_excluded += 1
                 elif pred_map is not None:
                     truth_regions = gt_regions(placed)
@@ -508,7 +509,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
 
             if evaluate_location and level != "none" and truth and positive:
                 location_boxes = [b for b in boxes if not b.get("location_excluded")]
-                if not location_boxes:
+                if len(location_boxes) != len(boxes):
                     location_truth_excluded += 1
                     continue
                 if finding["regions"] is None:
@@ -531,7 +532,10 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 jaccard_sum += len(truth_regions & pred_regions) / len(union) if union else 1.0
 
         row = {"dataset": dataset, "condition": condition, "trained_task": condition in TRAINED_TASK,
-               "images": len(asked), "positives": positives}
+               "images": len(asked), "positives": positives,
+               "mapping_kind": "proxy" if condition in PROXY_CONDITIONS else "composite" if condition == "prosthetic_restoration" else "exact",
+               "all_eligible_accuracy": _ratio(table["TP"] + table["TN"], len(asked)),
+               "resolved_coverage": _ratio(len(asked) - table["unparseable"], len(asked))}
         presence.append({**row, **table, **_prf(table["TP"], table["FP"], table["TN"], table["FN"])})
         if whole_image_kept:
             whole_image.append({**row, **whole, **_prf(whole["TP"], whole["FP"], whole["TN"], whole["FN"])})
@@ -553,7 +557,11 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
                 "dataset": dataset, "condition": condition, "level": level, "n_localized_cases": n_loc,
                 "TP": r_tp, "FP": r_fp, "TN": r_tn, "FN": r_fn, **_prf(r_tp, r_fp, r_tn, r_fn),
                 "exact_set_match_rate": _ratio(set_match, n_loc), "mean_jaccard": _ratio(jaccard_sum, n_loc),
-                "unlocalized_rate": _ratio(unlocalized, n_loc), "straddling_boxes": straddle,
+                "unlocalized_rate": _ratio(unlocalized, n_loc),
+                "unlocated_cases": unlocalized + region_unparseable,
+                "overall_localization_coverage": _ratio(n_loc - unlocalized, positives),
+                "conditional_region_iou": _ratio(jaccard_sum, n_loc),
+                "laterality_mapping": "supplement_source_frame_assumption_unvalidated", "straddling_boxes": straddle,
                 "region_unparseable": region_unparseable,
                 "expected_location_checks": n_loc + region_unparseable + location_truth_excluded,
                 "scored_location_checks": n_loc,
@@ -572,7 +580,7 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
 
     for image_id in ids:
         findings = results[image_id]["findings"]
-        annotated = {c for c in gt[image_id]["annotated"] if findings[c]["asked"]}
+        annotated = {c for c in gt[image_id]["annotated"] if findings[c]["asked"] and c not in PROXY_CONDITIONS}
         truths = {c for c in annotated if any(b["condition"] == c for b in gt[image_id]["boxes"])}
         preds = {c for c in annotated if findings[c]["presence"] == "yes"}
         unparsed = sum(findings[c]["presence"] is None for c in annotated)
@@ -588,8 +596,9 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
             "cache_hits": results[image_id].get("cache_hit_count", 0),
         })
 
-    micro = {k: sum(r[k] for r in presence) for k in ("TP", "FP", "TN", "FN")}
-    f1s = [r["f1"] for r in presence if r["f1"] is not None]
+    primary = [r for r in presence if r["condition"] not in PROXY_CONDITIONS]
+    micro = {k: sum(r[k] for r in primary) for k in ("TP", "FP", "TN", "FN")}
+    f1s = [r["f1"] for r in primary if r["f1"] is not None]
     complete_images = [r for r in per_image if r["complete_case"] is not None]
     scored_images = [r for r in per_image if r["scored_findings"]]
     logical_calls = sum(r["calls"] or 0 for r in per_image)
@@ -598,19 +607,26 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
     summary = {
         "dataset": dataset, "images_scored": len(ids), "images_missing_results": len(missing),
         "protocol": protocol,
+        "comparison": "primary_exact_and_composite",
+        "proxy_conditions": sorted(PROXY_CONDITIONS),
+        "without_benchmark_truth": ["residual_crown", "insufficient_eruption_space", "calculus"],
+        "all_eligible_accuracy": _ratio(micro["TP"] + micro["TN"], sum(r["images"] for r in primary)),
+        "resolved_coverage": _ratio(sum(micro.values()), sum(r["images"] for r in primary)),
+        "unresolved_positive_truth": sum(r["unresolved_positive_truth"] for r in primary),
+        "unresolved_negative_truth": sum(r["unresolved_negative_truth"] for r in primary),
         "location_level": level, "not_assessed": not_assessed,
         "evaluate_location": evaluate_location, "counting": counting,
         "location_truth": (location_truth_summary({i: gt[i] for i in ids})
                            if evaluate_location or count_kept else None),
         **micro, **_prf(micro["TP"], micro["FP"], micro["TN"], micro["FN"]),
         "macro_f1": _ratio(sum(f1s), len(f1s)),
-        "unparseable_rate": _ratio(sum(r["unparseable"] for r in presence), sum(r["images"] for r in presence)),
+        "unparseable_rate": _ratio(sum(r["unparseable"] for r in primary), sum(r["images"] for r in primary)),
         "unparseable_policy": "exclude",
-        "expected_finding_checks": sum(r["images"] for r in presence),
+        "expected_finding_checks": sum(r["images"] for r in primary),
         "scored_finding_checks": sum(micro.values()),
-        "excluded_unparseable_checks": sum(r["unparseable"] for r in presence),
-        "finding_check_invariant_ok": (sum(r["images"] for r in presence)
-                                       == sum(micro.values()) + sum(r["unparseable"] for r in presence)),
+        "excluded_unparseable_checks": sum(r["unparseable"] for r in primary),
+        "finding_check_invariant_ok": (sum(r["images"] for r in primary)
+                                       == sum(micro.values()) + sum(r["unparseable"] for r in primary)),
         "complete_case_images_scored": len(complete_images),
         "complete_case_rate": _ratio(sum(r["complete_case"] for r in complete_images), len(complete_images)),
         "mean_recall_per_image": _ratio(sum(_ratio(r["caught"], r["gt_present_scored"]) or 0
@@ -634,12 +650,28 @@ def evaluate(gt: dict[str, dict], results: dict[str, dict], dataset: str = "data
         summary["region_presence"] = {**micro_cells, **_prf(*(micro_cells[k] for k in ("TP", "FP", "TN", "FN"))),
                                       "unparseable": sum(r["unparseable"] for r in region_presence)}
     if evaluate_location and level != "none":
-        summary["side_agreement"] = side_agreement({i: gt[i] for i in ids}, results)
+        summary["laterality"] = "unresolved; source-frame localization is a secondary comparison"
     if count_tables:
         summary["occupied_regions"] = _count_metrics(_sum_tables(count_tables))
-    report = {"summary": summary, "presence": presence, "whole_image": whole_image,
+    report = {"schema": "dentvlm-evaluation/2", "summary": summary, "presence": presence,
+              "proxy_presence": [r for r in presence if r["condition"] in PROXY_CONDITIONS], "whole_image": whole_image,
               "region_presence": region_presence, "regions": regions, "occupied_regions": counts,
               "per_image": per_image, "missing_results": missing}
+    import dental_pipeline as dp
+    from benchmark_schema import CONDITION_TASKS
+    report["task_coverage"] = []
+    for task, spec in dp.TASKS.items():
+        blocks = [results[i].get("tasks", {}).get(task) for i in ids]
+        report["task_coverage"].append({
+            "dataset": dataset, "task": task, "name": spec["name"], "images": len(ids),
+            "positive": sum(b is not None and b.get("presence") == "yes" for b in blocks),
+            "negative": sum(b is not None and b.get("presence") == "no" for b in blocks),
+            "unresolved": sum(b is not None and b.get("presence") not in ("yes", "no") for b in blocks),
+            "not_assessed": sum(b is None for b in blocks),
+            "benchmark_truth": any(task in keys and any(c in gt[i]["annotated"] for i in ids)
+                                   for c, keys in CONDITION_TASKS.items()),
+            "mapping_kind": "proxy" if task == "apical_periodontitis" else
+                            "composite" if task in ("prosthetic_crown", "prosthetic_bridge") else "exact_or_unavailable"})
     if include_analysis:
         from dental_analysis import analyze
         report.update(analyze({i: gt[i] for i in ids}, results, dataset=dataset,
@@ -701,6 +733,7 @@ def pooled_presence(reports: list[dict]) -> list[dict]:
             for k in cells:
                 cells[k] += row[k]
         rows.append({"dataset": "pooled", "condition": condition, "trained_task": condition in TRAINED_TASK,
+                     "mapping_kind": "proxy" if condition in PROXY_CONDITIONS else "composite" if condition == "prosthetic_restoration" else "exact",
                      **cells, **_prf(cells["TP"], cells["FP"], cells["TN"], cells["FN"])})
     return rows
 
@@ -716,7 +749,7 @@ def write_report(report: dict, out_dir: str | Path) -> None:
     (out / "evaluation.json").write_text(json.dumps(report, indent=1, default=list), encoding="utf-8")
     for name in RETIRED_TABLES:
         (out / f"{name}.csv").unlink(missing_ok=True)
-    for name in ("presence", "whole_image", "region_presence", "regions", "occupied_regions", "per_image", "stage_changes",
+    for name in ("presence", "proxy_presence", "task_coverage", "whole_image", "region_presence", "regions", "occupied_regions", "per_image", "stage_changes",
                  "phrasing_votes", "region_vote_comparison", "parse_recovery", "call_usage", "parser_usage",
                  "case_breakdown", "case_condition_breakdown", "run_comparison", "run_changes",
                  "experiment_overview", "finding_comparison", "situation_comparison",

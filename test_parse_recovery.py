@@ -1,272 +1,111 @@
-"""Offline recovery checks through both local and API VisionRunner paths."""
-from __future__ import annotations
-
-import contextlib
-import io
+"""Canonical requests, deterministic abstentions and safe resumability."""
+import copy
 import json
-import tempfile
-import unittest
 from pathlib import Path
-from types import SimpleNamespace
-
-import dental_eval as ev
+from unittest.mock import patch
+import pytest
 import dental_pipeline as dp
-import llm_api
+from pan_test_support import Client, Runner, result
 
-DENTVLM = hasattr(dp, "extract_answer")
+@pytest.mark.parametrize("task", list(dp.TASKS))
+def test_source_record_exact_question(task):
+    fixture = json.loads(Path("tests_fixtures/pan_source_questions.json").read_text())
+    spec = dp.TASKS[task]
+    record = next(r for r in fixture["records"] if r["id"] == spec["question_provenance"]["record_id"])
+    assert spec["questions"] == [record["question"].removeprefix("<image>")]
+    assert spec["question_provenance"]["revision"] == fixture["source_revision"]
+    assert spec["question_provenance"]["source_modality"] == ("UPP" if task == "calculus" else "PAN")
 
+def test_twelve_independent_exact_requests(tmp_path):
+    image = tmp_path / "full.png"; image.write_bytes(b"FULL ORIGINAL PAN")
+    client = Client()
+    runner = dp.VisionRunner(client=client)
+    output = dp.analyze_image(runner, image)
+    assert set(output["findings"]) == set(dp.TASKS)
+    assert output["call_count"] == len(client.requests) == 12
+    for request, spec, call in zip(client.requests, dp.TASKS.values(), output["calls"]):
+        assert request["messages"][0] == {"role":"system", "content":dp.SYSTEM_MESSAGE}
+        assert len(request["messages"]) == 2
+        content = request["messages"][1]["content"]
+        assert content[0]["image_url"]["url"] == dp.image_data_uri(image)
+        assert content[1] == {"type":"text", "text":spec["questions"][0]}
+        assert call["question"] == spec["questions"][0]
+        assert request["temperature"] == .1 and request["top_p"] == .001 and request["max_tokens"] == 512
+        assert request["extra_body"]["samplers"] == ["penalties", "temperature", "top_p"]
+        assert request["extra_body"]["repeat_last_n"] == -1
 
-class ScriptClient:
-    def __init__(self, replies):
-        self.replies = iter(replies)
-        self.requests = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+@pytest.mark.parametrize("text", ["", "Perhaps", "Yes and no", "No or yes", "Yes\nNo, not present", "No\nYes, present", "Answer: Yes", "```Yes```"])
+def test_unreadable_or_contradictory_answers_are_not_retried(tmp_path, text):
+    data = result(tmp_path, {"caries": text})
+    assert data["findings"]["caries"]["presence"] is None
+    assert data["call_count"] == 12
+    assert data["parse_recovery"]["retry_calls"] == 0
+    assert data["findings"]["caries"]["raw_response"] == text
 
-    def create(self, **request):
-        self.requests.append(request)
-        question = request["messages"][0]["content"][1]["text"]
-        default = ("1" if question.startswith("How many") else "No" if DENTVLM else
-                   "Answer: B. False\nCount: 0" if "Finding under review:" in question else "B")
-        response = next(self.replies, default)
-        if isinstance(response, Exception):
-            raise response
-        if hasattr(response, "choices"):
-            return response
-        text, finish = response if isinstance(response, tuple) else (response, "stop")
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=finish)],
-            usage=None)
+@pytest.mark.parametrize("reply", [{"text":"Yes", "finish_reason":"length"},
+                                    {"text":"No", "truncated":True}, RuntimeError("server failed")])
+def test_truncation_and_transport_failure_are_unresolved(tmp_path, reply):
+    data = result(tmp_path, {"caries":reply})
+    assert data["findings"]["caries"]["presence"] is None
+    assert data["findings"]["caries"]["parse_error"]
+    assert data["findings"]["implant"]["presence"] == "no"
 
+def test_identical_transport_retry(tmp_path):
+    client = Client([ConnectionError("connection reset"), "Yes"])
+    runner = dp.VisionRunner(client=client, api_call_retries=1)
+    with patch("llm_api.time.sleep"):
+        reply = runner.ask(b"image", dp.questions_for("caries")[0])
+    assert reply["text"] == "Yes"
+    assert len(client.requests) == 2 and client.requests[0] == client.requests[1]
 
-def protocol(retries=1, **kwargs):
-    base = {"location": "none"} if DENTVLM else {"presence_level": "overall", "count_level": "overall"}
-    return dp.Protocol(parse_retries=retries, **dict(base, **kwargs))
+def test_positive_without_region_remains_positive(tmp_path):
+    data = result(tmp_path, {"caries":"Yes\nCaries is present. Implant is also visible."})
+    assert data["findings"]["caries"]["presence"] == "yes"
+    assert data["findings"]["caries"]["location_status"] == "not_stated"
+    assert data["findings"]["implant"]["presence"] == "no"
 
+@pytest.mark.parametrize("rationale", ["There is no evidence of caries.", "Caries is not detected.", "Caries is absent."])
+def test_positive_with_explicit_global_denial_abstains(tmp_path, rationale):
+    data = result(tmp_path, {"caries": "Yes\n" + rationale})
+    assert data["findings"]["caries"]["presence"] is None
+    assert data["findings"]["caries"]["parse_error"] == "contradictory_response"
 
-class RecoveryTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.image = self.root / "sample.png"
-        from PIL import Image
-        Image.new("RGB", (32, 32), "white").save(self.image)
+@pytest.mark.parametrize("descriptor", list(dp.DESCRIPTORS))
+def test_all_nine_source_descriptors_are_preserved(tmp_path, descriptor):
+    data = result(tmp_path, {"caries":"Yes\nCaries is visible in " + descriptor + "."})
+    task = data["tasks"]["caries"]
+    assert set(task["regions"]) == set(dp.DESCRIPTORS[descriptor])
+    assert task["report_regions"] == task["regions"]
+    assert task["patient_laterality"] == "unresolved"
+    assert task["location_matches"][0]["text"] == descriptor
 
-    def tearDown(self):
-        self.temp.cleanup()
+@pytest.mark.parametrize("phrase", ["No caries in", "Caries is absent in", "There may be caries in", "An implant is present in", "A crown is present in", "A root canal filling is present in"])
+def test_negated_uncertain_or_other_task_regions_are_audit_only(tmp_path, phrase):
+    descriptor = next(iter(dp.DESCRIPTORS))
+    data = result(tmp_path, {"caries":"Yes.\nA finding is visible. " + phrase + " " + descriptor + "."})
+    task = data["tasks"]["caries"]
+    # A separate rationale clause is not a second diagnosis decision.
+    assert task["presence"] == "yes"
+    assert task["regions"]
+    assert not task["report_regions"]
 
-    def run_image(self, replies, *, local=False, retries=1, api_retries=2, **kwargs):
-        client = ScriptClient(replies)
-        runner = dp.VisionRunner(client=client, local=local, max_tokens=4096, api_call_retries=api_retries)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            result = dp.analyze_image(runner, self.image, protocol=protocol(retries, **kwargs))
-        return result, client, output.getvalue(), runner
+def test_resume_hashes_image_registry_and_runtime(tmp_path):
+    image = tmp_path / "image.png"; image.write_bytes(b"one")
+    runner = Runner()
+    directory = dp.run_dataset(runner, {"image":image}, tmp_path / "out")
+    dp.run_dataset(runner, {"image":image}, directory)
+    assert len(runner.requests) == 12
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["registry"] and manifest["parser_version"] == dp.PARSER_VERSION
+    with patch.dict(dp.TASKS["caries"], {"questions":["Changed question"]}):
+        with pytest.raises(ValueError, match="different configuration"):
+            dp.run_dataset(runner, {"image":image}, directory)
+    image.write_bytes(b"two")
+    with pytest.raises(ValueError, match="source image changed"):
+        dp.run_dataset(runner, {"image":image}, directory)
 
-    def truth(self, result):
-        return {"sample": {"path": str(self.image), "annotated": set(dp.CONDITIONS),
-                           "boxes": [{"condition": "dental_implant", "xc": .2, "yc": .2, "w": .1, "h": .1}]}}
-
-    def test_full_failure_printed_and_recovered_for_local_and_api(self):
-        raw = "?" * 5001 + "\nEND OF FULL RESPONSE"
-        for local in (True, False):
-            with self.subTest(local=local):
-                replies = [raw, "Yes" if DENTVLM else "A"]
-                result, client, log, _ = self.run_image(replies, local=local)
-                expected = "yes" if DENTVLM else "A"
-                self.assertEqual(result["findings"]["dental_implant"]["presence"], expected)
-                self.assertIn(raw, log)
-                question = client.requests[0]["messages"][0]["content"][1]["text"]
-                self.assertIn(question, log)
-                self.assertIn("PARSE WARNING", log)
-                self.assertIn("PARSE RECOVERED", log)
-                self.assertEqual(result["parse_recovery"]["retry_calls"], 1)
-                self.assertEqual(result["parse_recovery"]["recovered_checks"], 1)
-                self.assertEqual(result["calls"][0]["text"], raw)
-                self.assertIn("parse_recovery", result["calls"][1])
-                first, second = client.requests[:2]
-                self.assertEqual(first["messages"][0]["content"][0], second["messages"][0]["content"][0])
-                self.assertEqual(first["model"], second["model"])
-                self.assertEqual(first["temperature"], second["temperature"])
-                self.assertNotEqual(first["messages"], second["messages"])
-
-    def test_exhausted_is_neutral_and_keeps_every_attempt(self):
-        result, _, log, _ = self.run_image(["???", "???", "???"], retries=2)
-        self.assertIsNone(result["findings"]["dental_implant"]["presence"])
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 2)
-        self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)
-        self.assertEqual(log.count("PROMPT (full):"), 3)
-        self.assertIn("PARSE EXHAUSTED", log)
-        report = ev.evaluate(self.truth(result), {"sample": result}, evaluate_location=False)
-        summary = report["summary"]
-        row = next(r for r in report["presence"] if r["condition"] == "dental_implant")
-        self.assertEqual([row[k] for k in ("TP", "FP", "TN", "FN")], [0, 0, 0, 0])
-        self.assertEqual(row["unparseable"], 1)
-        self.assertEqual(summary["expected_finding_checks"], 9 if DENTVLM else 14)
-        self.assertEqual(summary["scored_finding_checks"], 8 if DENTVLM else 13)
-        self.assertEqual(summary["excluded_unparseable_checks"], 1)
-        self.assertTrue(summary["finding_check_invariant_ok"])
-        self.assertIsNone(summary["mean_recall_per_image"])
-        self.assertIsNone(summary["complete_case_rate"])
-        self.assertEqual(report["per_image"][0]["gt_present"], 1)
-        self.assertEqual(report["per_image"][0]["gt_present_scored"], 0)
-        if DENTVLM:
-            self.assertEqual(len(summary["not_assessed"]), 5)
-
-    def test_zero_retries_still_prints_failure(self):
-        result, _, log, _ = self.run_image(["???"], retries=0)
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 0)
-        self.assertIsNone(result["findings"]["dental_implant"]["presence"])
-        self.assertIn("PROMPT (full):", log)
-        self.assertIn("RESPONSE (full):\n???", log)
-
-    def test_empty_and_truncated_are_retried(self):
-        for response, reason in [("", "empty_response"), (("Yes" if DENTVLM else "A", "length"), "truncated_output")]:
-            result, _, log, _ = self.run_image([response, "No" if DENTVLM else "B"])
-            self.assertEqual(result["findings"]["dental_implant"]["presence"], "no" if DENTVLM else "B")
-            self.assertIn(reason, log)
-            self.assertEqual(result["parse_recovery"]["recovered_checks"], 1)
-
-    def test_transport_errors_use_visible_api_retries_not_parse_retries(self):
-        valid = "Yes" if DENTVLM else "A"
-        result, client, log, _ = self.run_image([RuntimeError("transport"), valid], retries=3, api_retries=1)
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 0)
-        self.assertIn("API RETRY", log)
-        self.assertGreaterEqual(len(client.requests), 2)
-
-    def test_invalid_response_envelope_is_retried(self):
-        valid = "Yes" if DENTVLM else "A"
-        result, _, log, _ = self.run_image([SimpleNamespace(choices=[]), valid], api_retries=1)
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 0)
-        self.assertIn("API RETRY", log)
-
-    def test_corrupt_resume_artifact_stops(self):
-        _, _, _, runner = self.run_image([])
-        run_dir = self.root / "corrupt-run"
-        with contextlib.redirect_stdout(io.StringIO()):
-            dp.run_dataset(runner, {"sample": self.image}, run_dir, protocol=protocol(0))
-        saved = run_dir / "results" / "sample.json"
-        saved.write_text('{"image_id":"wrong"}', encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            dp.run_dataset(runner, {"sample": self.image}, run_dir, protocol=protocol(0))
-
-    def test_retry_setting_changes_manifest_and_resume_is_rejected(self):
-        result, client, _, runner = self.run_image([])
-        run_dir = self.root / "run"
-        with contextlib.redirect_stdout(io.StringIO()):
-            dp.run_dataset(runner, {"sample": self.image}, run_dir, protocol=protocol(0))
-            previous_calls = len(client.requests)
-            dp.run_dataset(runner, {"sample": self.image}, run_dir, protocol=protocol(0))
-            self.assertEqual(len(client.requests), previous_calls)
-            with self.assertRaisesRegex(ValueError, "different configuration"):
-                dp.run_dataset(runner, {"sample": self.image}, run_dir, protocol=protocol(1))
-        saved = json.loads((run_dir / "results" / "sample.json").read_text())
-        self.assertIn("parse_recovery", saved)
-        self.assertIn("parse_recovery", saved["calls"][0])
-
-    def test_invalid_retry_counts_rejected(self):
-        for retries in (-1, 1.5, True, "2"):
-            with self.subTest(retries=retries), self.assertRaises(ValueError):
-                protocol(retries)
-
-    def test_success_never_retried_or_warned(self):
-        result, _, log, _ = self.run_image([])
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 0)
-        self.assertNotIn("PARSE WARNING", log)
-
-
-
-    def test_all_unparseable_has_no_accuracy_credit(self):
-        result, _, _, _ = self.run_image(["???"] * 100, retries=1)
-        summary = ev.evaluate(self.truth(result), {"sample": result}, evaluate_location=False)["summary"]
-        self.assertEqual(summary["scored_finding_checks"], 0)
-        self.assertEqual(summary["expected_finding_checks"], summary["excluded_unparseable_checks"])
-        for metric in ("sensitivity", "specificity", "ppv", "f1", "complete_case_rate",
-                       "mean_recall_per_image", "mean_false_alarms_per_image"):
-            self.assertIsNone(summary[metric], metric)
-
-    def test_notebook_wires_retry_configuration(self):
-        notebook = json.loads(Path(__file__).with_name("main_notebook.ipynb").read_text(encoding="utf-8"))
-        code = "\n".join("".join(c["source"]) for c in notebook["cells"] if c["cell_type"] == "code")
-        import experiments as xp
-
-        self.assertIn("protocol=xp.protocol(cfg)", code)  # every experiment runs with its own retry budget
-        self.assertEqual(xp.DEFAULTS["parse_retries"], 1)
-        cfg, = xp.build([{"name": "patient", "parse_retries": 3, "api_call_retries": 4}])
-        self.assertEqual(xp.protocol(cfg).parse_retries, 3)
-        self.assertEqual(cfg["analyzer"]["api_call_retries"], 4)
-
-    @unittest.skipIf(DENTVLM, "DentalGPT combined protocol")
-    def test_combined_missing_presence_then_count_recovery_shares_budget(self):
-        result, _, log, _ = self.run_image(
-            ["???", "Answer: A. True\nCount: 0", "2"],
-            retries=2, question_form="combined")
-        self.assertEqual(result["findings"]["dental_implant"]["presence"], "A")
-        self.assertEqual(result["findings"]["dental_implant"]["count"], 2)
-        self.assertEqual(result["parse_recovery"]["retry_calls"], 2)
-        self.assertTrue(result["calls"][2]["question"].startswith("How many"))
-        self.assertIn("invalid_count_pair", log)
-        self.assertEqual(result["calls"][2]["parse_recovery"]["attempt"], 3)
-
-    @unittest.skipIf(DENTVLM, "DentalGPT combined protocol")
-    def test_combined_preserves_presence_when_count_recovery_exhausts(self):
-        result, _, _, _ = self.run_image(
-            ["Answer: A. True\nCount: 0", "???"], question_form="combined")
-        self.assertEqual(result["findings"]["dental_implant"]["presence"], "A")
-        self.assertIsNone(result["findings"]["dental_implant"]["count"])
-        self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)
-        report = ev.evaluate(self.truth(result), {"sample": result}, evaluate_location=False)
-        self.assertEqual(report["summary"]["TP"], 1)
-        count = next(r for r in report["counts"] if r["condition"] == "dental_implant")
-        self.assertEqual(count["count_unparseable"], 1)
-        self.assertIsNone(count["mae"])
-
-    @unittest.skipIf(DENTVLM, "DentalGPT regional protocol")
-    def test_regional_presence_and_count_retry_preserve_scope(self):
-        for region_prompt in ("words", "crop"):
-            with self.subTest(region_prompt=region_prompt):
-                # All whole-image answers negative; retry presence then count in the first region.
-                result, client, _, _ = self.run_image(
-                    ["B"] * 14 + ["???", "A", "???", "2"],
-                    presence_level="region", count_level="region",
-                    region_prompt=region_prompt, local=True)
-                finding = result["findings"]["dental_implant"]
-                self.assertEqual(finding["regions"]["UR"], "A")
-                self.assertEqual(finding["region_counts"]["UR"], 2)
-                self.assertEqual(result["parse_recovery"]["retry_calls"], 2)
-                a, b = client.requests[14:16]
-                self.assertEqual(a["messages"][0]["content"][0], b["messages"][0]["content"][0])
-                if region_prompt == "words":
-                    self.assertIn("upper right", b["messages"][0]["content"][1]["text"])
-
-    @unittest.skipIf(DENTVLM, "DentalGPT combined regional protocol")
-    def test_combined_count_retry_keeps_patient_scope(self):
-        result, _, _, _ = self.run_image(
-            ["B"] * 14 + ["Answer: A. True\nCount: 0", "2"],
-            presence_level="region", count_level="region", question_form="combined")
-        self.assertEqual(result["findings"]["dental_implant"]["region_counts"]["UR"], 2)
-        retry = result["calls"][15]
-        self.assertIn("upper right", retry["question"])
-        self.assertEqual(retry["region"], "UR")
-        self.assertEqual(retry["parse_recovery"]["value"], ("A", 2))
-
-    @unittest.skipUnless(DENTVLM, "DentVLM region protocol")
-    def test_region_exhaustion_is_neutral_in_report_as_well(self):
-        n_tasks = len(protocol().tasks())
-        result, client, _, _ = self.run_image(
-            ["No"] * n_tasks + [("Yes\nunfinished", "length")] * 2, location="regions")
-        self.assertIsNone(result["findings"]["dental_implant"]["presence"])
-        cells = dp.cell_answers(result)
-        self.assertIsNone(cells["implant"][dp.CELLS[0]])
-        # The region is words, so every call carries the same whole image, and the first region call
-        # is the first task's own question with the first cell's descriptor inside it.
-        images = {json.dumps(r["messages"][0]["content"][0]) for r in client.requests}
-        self.assertEqual(len(images), 1)
-        self.assertEqual(client.requests[n_tasks]["messages"][0]["content"][1]["text"],
-                         dp.region_question("implant", dp.CELLS[0]))
-        self.assertIsNone(ev.predicted_cells(result, "dental_implant")[dp.CELLS[0]])
-        self.assertFalse(ev.predicted_cells(result, "dental_implant")[dp.CELLS[1]])
-        self.assertEqual(result["parse_recovery"]["unresolved_checks"], 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_manifest_changes_with_runtime_or_parser():
+    baseline = dp.run_config(dp.Protocol(), {"runtime":"one"})["hash"]
+    assert baseline != dp.run_config(dp.Protocol(), {"runtime":"two"})["hash"]
+    with patch.object(dp, "PARSER_VERSION", 99):
+        assert baseline != dp.run_config(dp.Protocol(), {"runtime":"one"})["hash"]

@@ -44,26 +44,10 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(dp.extract_regions("no fillings in the anterior region of the lower dentition"), ["lower-anterior"])
 
     def test_questions_are_verbatim_and_ordered(self):
-        self.assertEqual(dp.questions_for("impacted_tooth")[0],
-                         "Based on the imaging, determine whether the patient has an impacted tooth?")
-        self.assertEqual(dp.questions_for("fillings")[0], "Based on the imaging analysis, does the patient have fillings?")
-        for task, spec in dp.TASKS.items():
-            self.assertEqual(len(spec["questions"]), dp.MAX_PHRASINGS, task)
-            self.assertEqual(len(set(spec["questions"])), dp.MAX_PHRASINGS, task)
-        self.assertEqual(dp.questions_for("furcation_lesion"),
-                         ("Based on the imaging, determine whether the patient has furcation involvement?",))
-        self.assertEqual(len(dp.CONDITIONS), 14)
-        self.assertEqual(len(dp.TASKS), 13)
-        self.assertEqual(dp.Protocol().tasks(), (
-            "implant", "prosthetic_crown", "prosthetic_bridge", "fillings", "root_canal_therapy", "caries",
-            "periodontal_disease", "impacted_tooth", "apical_periodontitis", "residual_root",
-            "residual_crown", "insufficient_eruption_space", "calculus"))
-        self.assertEqual(len(dp.Protocol(ask_untrained=True).tasks()), 18)
-        self.assertEqual(len(dp.Protocol(extra_tasks=False).tasks()), 10)
-        self.assertEqual(dp.condition_tasks("surgical_device"), ())
-        self.assertEqual(dp.condition_tasks("surgical_device", ask_untrained=True), ("surgical_device",))
-        with self.assertRaises(ValueError):
-            dp.Protocol(phrasings=4)
+        self.assertEqual(len(dp.TASKS), 12)
+        self.assertEqual(dp.Protocol().tasks(), tuple(dp.TASKS))
+        with self.assertRaises(KeyError):
+            dp.questions_for("periodontal_disease")
 
     def test_vote(self):
         answers = [{"answer": "yes", "regions": ["upper-left"]}, {"answer": "no", "regions": []},
@@ -75,9 +59,9 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(dp.vote([{"answer": "no", "regions": []}], "union"), {"presence": "no", "regions": None})
 
     def test_cell_descriptions(self):
-        self.assertEqual(dp.describe_cell("upper-left"), "patient's upper right posterior (image left)")
-        self.assertEqual(dp.describe_cell("lower-right"), "patient's lower left posterior (image right)")
-        self.assertEqual(dp.describe_cell("upper-anterior"), "upper anterior")
+        self.assertEqual(dp.describe_cell("upper-left", left_is_image_left=True), "patient's upper right posterior (image left)")
+        self.assertEqual(dp.describe_cell("lower-right", left_is_image_left=True), "patient's lower left posterior (image right)")
+        self.assertEqual(dp.describe_cell("upper-anterior"), "upper anterior region")
         self.assertEqual(dp.describe_cell("upper-left", left_is_image_left=False),
                          "patient's upper left posterior (image right)")
         self.assertEqual(dp.cell_windows(False)["upper-left"], dp.cell_windows(True)["upper-right"])
@@ -135,154 +119,6 @@ SCRIPT = {
 }
 
 
-class RunAndEvaluateTests(unittest.TestCase):
-    def setUp(self):
-        if importlib.util.find_spec("PIL") is None:
-            self.skipTest("Pillow not installed")
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        (self.root / "images").mkdir()
-        (self.root / "labels").mkdir()
-        _blank_image(self.root / "images" / "img1.png")
-        _blank_image(self.root / "images" / "img2.png", shade=100)
-        # img1: two fillings in the upper image-left cell, one impacted tooth in the lower image-right cell.
-        (self.root / "labels" / "img1.txt").write_text(
-            "2 0.20 0.25 0.05 0.05\n2 0.30 0.30 0.05 0.05\n6 0.80 0.80 0.10 0.10\n")
-        # img2: nothing (empty label file).
-        (self.root / "labels" / "img2.txt").write_text("")
-        self.images = {"img1": self.root / "images" / "img1.png", "img2": self.root / "images" / "img2.png"}
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_run_then_evaluate(self):
-        runner = FakeRunner(SCRIPT)
-        out = dp.run_dataset(runner, self.images, self.root / "run")
-
-        results = dp.load_results(out)
-        self.assertEqual(set(results), {"img1", "img2"})
-        f = results["img1"]["findings"]
-        self.assertEqual(f["dental_filling"], {"asked": True, "tasks": ["fillings"], "presence": "yes", "whole_image": "yes",
-                                               "whole_image_regions": ["upper-left"], "regions": ["upper-left"],
-                                               "unresolved_regions": [], "region_count": 1, "count_status": "resolved"})
-        self.assertEqual((f["impacted_tooth"]["regions"], f["impacted_tooth"]["region_count"]), (["lower-right", "lower-left"], 2))
-        self.assertEqual(f["prosthetic_restoration"]["tasks"], ["prosthetic_crown", "prosthetic_bridge"])
-        self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]),
-                         ("yes", ["upper-anterior"]))
-        # Reported without a region: the count is unavailable, not zero.
-        self.assertEqual((f["carious_lesion"]["regions"], f["carious_lesion"]["region_count"], f["carious_lesion"]["count_status"]),
-                         ([], None, "unlocated"))
-        self.assertEqual((f["dental_implant"]["presence"], f["dental_implant"]["count_status"]), (None, "unresolved"))
-        self.assertEqual((f["surgical_device"]["asked"], f["surgical_device"]["count_status"]), (False, "not_assessed"))
-        self.assertEqual(f["root_fragment"], {"asked": True, "tasks": ["residual_root"], "presence": "no", "whole_image": "no",
-                                             "whole_image_regions": None, "regions": None, "unresolved_regions": [],
-                                             "region_count": 0, "count_status": "resolved"})
-        self.assertEqual(results["img1"]["tasks"]["residual_crown"]["presence"], "yes")
-        self.assertEqual(results["img1"]["call_count"], 13)
-        self.assertEqual(results["img2"]["call_count"], 13)
-        self.assertTrue((out / "manifest.json").is_file())
-
-        # Resume skips finished images and rejects a different protocol.
-        before = len(runner.log)
-        dp.run_dataset(runner, {"img1": self.images["img1"]}, out)
-        self.assertEqual(len(runner.log), before)
-        with self.assertRaises(ValueError):
-            dp.run_dataset(runner, {"img1": self.images["img1"]}, out, protocol=dp.Protocol(phrasings=3))
-
-        gt = ev.load_yolo(self.root / "images", self.root / "labels")
-        report = ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
-        presence = {r["condition"]: r for r in report["presence"]}
-        self.assertNotIn("surgical_device", presence)
-        self.assertEqual(report["summary"]["not_assessed"],
-                         ["furcation_lesion", "apical_surgery", "root_resorption", "orthodontic_device", "surgical_device"])
-        self.assertEqual((presence["dental_filling"]["TP"], presence["dental_filling"]["FN"], presence["dental_filling"]["TN"]), (1, 0, 1))
-        self.assertTrue(presence["dental_filling"]["trained_task"])
-        self.assertEqual(presence["carious_lesion"]["FP"], 1)
-        self.assertEqual((presence["dental_implant"]["unparseable"], presence["dental_implant"]["TN"]), (1, 1))
-        self.assertEqual(report["whole_image"], [])  # presence is the whole-image answer here
-        regions = {r["condition"]: r for r in report["regions"]}
-        self.assertEqual(regions["dental_filling"]["exact_set_match_rate"], 1.0)
-        self.assertEqual((regions["impacted_tooth"]["TP"], regions["impacted_tooth"]["FP"]), (1, 1))
-        self.assertNotIn("carious_lesion", {r["condition"] for r in report["regions"] if r["n_localized_cases"]})
-        # Presence per cell: every cell of every asked image; a named cell is present, an unnamed one absent, and
-        # two filling boxes in one cell are one presence. Unasked findings and the unresolved implant image are out.
-        rp = {(r["condition"], r["region"]): r for r in report["region_presence"]}
-        self.assertEqual(len(rp), 9 * 6)
-        self.assertEqual((rp[("dental_filling", "upper-left")]["TP"], rp[("dental_filling", "upper-left")]["positives"],
-                          rp[("dental_filling", "upper-left")]["TN"]), (1, 1, 1))
-        self.assertEqual((rp[("impacted_tooth", "lower-right")]["TP"], rp[("impacted_tooth", "lower-left")]["FP"]), (1, 1))
-        self.assertEqual((rp[("prosthetic_restoration", "upper-anterior")]["FP"], rp[("carious_lesion", "upper-left")]["TN"]), (1, 2))
-        self.assertEqual((rp[("dental_implant", "upper-left")]["images"], rp[("dental_implant", "upper-left")]["unparseable"]), (1, 0))
-        self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
-                         {"TP": 2, "FP": 2, "TN": 98, "FN": 0, "unparseable": 0})
-        self.assertTrue((out / "evaluation" / "region_presence.csv").is_file())
-        self.assertEqual(ev.evaluate(gt, results, dataset="toy", evaluate_location=False)["region_presence"], [])
-        summary = report["summary"]
-        self.assertEqual(summary["images_scored"], 2)
-        self.assertEqual(summary["complete_case_rate"], 1.0)
-        self.assertEqual(summary["mean_false_alarms_per_image"], 1.0)
-        self.assertTrue((out / "evaluation" / "presence.csv").is_file())
-        # The count question is gone: no counts table, and a counts.csv left by an older
-        # version is removed on re-export rather than sitting next to fresh metrics.
-        self.assertNotIn("counts", report)
-        (out / "evaluation" / "counts.csv").write_text("condition,mae\ndental_filling,3.0\n")
-        ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
-        self.assertFalse((out / "evaluation" / "counts.csv").exists())
-        self.assertEqual(ev.side_agreement(gt, results), {"sides_named": 3, "agree": 2, "agreement_rate": 0.6667,
-                                                          "left_is_image_left": True})
-        text = dp.dentist_report(results["img1"])
-        self.assertIn("Dental filling; in 1 region(s): patient's upper right posterior (image left)", text)
-        self.assertIn("Dental caries; region not stated", text)
-        self.assertIn("Also present (no benchmark class): Residual Crown", text)
-        self.assertIn("Not assessable (unparseable answer): Dental implant", text)
-        self.assertIn("Not assessed by this model: Furcation involvement", text)
-
-    def test_region_location_mode(self):
-        """Every region is asked every task, whatever the whole image answered; the whole image is kept separately."""
-        script = dict(SCRIPT)
-        script[("region", "fillings", "upper-left")] = "Yes\nFillings are visible."
-        script[("region", "impacted_tooth", "lower-right")] = "Yes"
-        script[("region", "root_canal_therapy", "upper-right")] = "Yes"  # missed on the whole image, found by region
-        script[("region", "residual_root", "upper-anterior")] = "Yes and no."  # one unparseable region
-        runner = FakeRunner(script)
-        out = dp.run_dataset(runner, self.images, self.root / "run_regions", protocol=dp.Protocol(location="regions"))
-        results = dp.load_results(out)
-        f = results["img1"]["findings"]
-        self.assertEqual((f["dental_filling"]["presence"], f["dental_filling"]["regions"]), ("yes", ["upper-left"]))
-        self.assertEqual(f["impacted_tooth"]["regions"], ["lower-right"])
-        self.assertEqual((f["endodontic_treatment"]["presence"], f["endodontic_treatment"]["whole_image"],
-                          f["endodontic_treatment"]["regions"]), ("yes", "no", ["upper-right"]))
-        # Caries and the bridge were yes on the whole image only: no region answers yes, so they are absent.
-        self.assertEqual((f["carious_lesion"]["presence"], f["carious_lesion"]["whole_image"]), ("no", "yes"))
-        self.assertEqual((f["prosthetic_restoration"]["presence"], f["prosthetic_restoration"]["regions"]), ("no", None))
-        self.assertEqual(results["img1"]["tasks"]["implant"]["presence"], "no")  # unparseable on the whole image only
-        self.assertIsNone(results["img1"]["findings"]["root_fragment"]["presence"])  # no yes, one unparseable region
-        self.assertEqual((dp.cell_answers(results["img1"])["fillings"]["upper-left"],
-                          dp.cell_answers(results["img1"])["residual_root"]["upper-anterior"]), ("yes", None))
-        # 13 whole-image calls + 13 tasks x 6 regions, for every image, and no image was ever cropped.
-        self.assertEqual((results["img1"]["call_count"], results["img2"]["call_count"]), (91, 91))
-        region_calls = [c for c in results["img1"]["calls"] if c["stage"] == "region"]
-        self.assertEqual(len(region_calls), 78)
-        self.assertTrue(all(c["question"].endswith(f" in {dp.CELL_DESCRIPTORS[c['cell']]}?") for c in region_calls))
-        self.assertFalse((out / "crops").exists())
-
-        gt = ev.load_yolo(self.root / "images", self.root / "labels")
-        report = ev.evaluate(gt, results, dataset="toy", out_dir=out / "evaluation")
-        presence = {r["condition"]: r for r in report["presence"]}
-        whole = {r["condition"]: r for r in report["whole_image"]}
-        self.assertEqual((presence["carious_lesion"]["FP"], whole["carious_lesion"]["FP"]), (0, 1))
-        self.assertEqual((presence["endodontic_treatment"]["FP"], whole["endodontic_treatment"]["TN"]), (1, 2))
-        self.assertEqual((presence["dental_implant"]["unparseable"], whole["dental_implant"]["unparseable"]), (0, 1))
-        self.assertEqual(report["summary"]["whole_image"]["FP"], 2)  # caries and the bridge
-        self.assertTrue((out / "evaluation" / "whole_image.csv").is_file())
-        # Presence per cell reads each region's own answer: the implant's six No regions count although the
-        # whole image was unparseable, and only the one unparseable residual-root region is excluded.
-        rp = {(r["condition"], r["region"]): r for r in report["region_presence"]}
-        self.assertEqual((rp[("dental_filling", "upper-left")]["TP"], rp[("endodontic_treatment", "upper-right")]["FP"]), (1, 1))
-        self.assertEqual((rp[("dental_implant", "upper-left")]["TN"], rp[("dental_implant", "upper-left")]["images"]), (2, 2))
-        self.assertEqual((rp[("root_fragment", "upper-anterior")]["unparseable"], rp[("root_fragment", "upper-left")]["TN"]), (1, 2))
-        self.assertEqual({k: report["summary"]["region_presence"][k] for k in ("TP", "FP", "TN", "FN", "unparseable")},
-                         {"TP": 2, "FP": 1, "TN": 104, "FN": 0, "unparseable": 1})
 
 
 class PredictedCellsTests(unittest.TestCase):

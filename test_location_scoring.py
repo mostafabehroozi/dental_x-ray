@@ -18,14 +18,14 @@ import run_monitor as mon
 class LocationScoringTests(unittest.TestCase):
     def test_toggle_preserves_finding_scores(self):
         findings = {c: {"asked": True, "presence": "no", "whole_image": "no",
-                        "regions": [], "region_count": 0} for c in dp.CONDITIONS}
+                        "regions": [], "region_count": 0} for c in ev.CONDITIONS}
         findings["dental_filling"].update(
             presence="yes", whole_image="yes",
             regions=["upper-left"], region_count=1)
         results = {"image": {"findings": findings, "call_count": 71,
                             "location_level": "regions",
                             "protocol": {"location": "regions"}}}
-        gt = {"image": {"annotated": set(dp.CONDITIONS), "boxes": [
+        gt = {"image": {"annotated": set(ev.CONDITIONS), "boxes": [
             {"condition": "dental_filling", "xc": 0.2, "yc": 0.25, "w": 0.05, "h": 0.05}]}}
         original = copy.deepcopy(results)
         with tempfile.TemporaryDirectory() as tmp:
@@ -71,7 +71,7 @@ class LocationScoringTests(unittest.TestCase):
         for truth in ("llm", "geometry"):
             scope = {"EXPERIMENTS": xp.build([{"name": "off", "evaluate_location": False, "counting": False,
                                                "location_truth": truth}]),
-                     "DATASETS": [{"name": "toy"}], "xp": xp}
+                     "DATASETS": [{"name": "toy"}], "xp": xp, "GT": {"toy": {}}}
             exec(compile(cell, "<location cell>", "exec"), scope)
             self.assertEqual(scope["ADAPTED"], {})
         # Counting alone still needs the adapted truth: the cell reaches for the adapter (and, with no
@@ -79,7 +79,7 @@ class LocationScoringTests(unittest.TestCase):
         ledger = mon.Ledger("test")
         scope = {"EXPERIMENTS": xp.build([{"name": "count-only", "evaluate_location": False, "counting": True,
                                            "location_truth": "areas", "output_root": "/tmp/out"}]),
-                 "DATASETS": [{"name": "toy"}], "xp": xp, "mon": mon, "LEDGER": ledger, "GT": {"toy": {}},
+                 "DATASETS": [{"name": "toy"}], "xp": xp, "mon": mon, "LEDGER": ledger, "GT": {"toy": {"image": {"boxes": [{"condition": "carious_lesion"}]}}},
                  "la": la, "ev": ev, "open_runner": lambda cfg: None, "open_parser": lambda cfg: None}
         with redirect_stdout(io.StringIO()):
             exec(compile(cell, "<location cell>", "exec"), scope)
@@ -88,7 +88,7 @@ class LocationScoringTests(unittest.TestCase):
         evaluation = next(s for s in sources if "# CELL 11 -" in s)
         self.assertIn('evaluate_location=cfg["evaluate_location"], counting=cfg["counting"]', evaluation)
         inspection = next(s for s in sources if "# CELL 13 -" in s)
-        self.assertIn('dp.dentist_report(result, counting=cfg["counting"])', inspection)
+        self.assertIn('dp.dentist_report(result, counting=False)', inspection)
 
 
 if __name__ == "__main__":

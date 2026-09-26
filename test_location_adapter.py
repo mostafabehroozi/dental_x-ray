@@ -316,7 +316,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(ev.location_truth_summary(truth), {"boxes": 3, "by_source": {"areas": 3}})
 
     def test_truth_agreement_on_fdi_boxes(self):
-        gt = {"a": {"path": str(self.images["img1"]), "annotated": set(dp.CONDITIONS), "boxes": [
+        gt = {"a": {"path": str(self.images["img1"]), "annotated": set(ev.CONDITIONS), "boxes": [
             {"condition": "carious_lesion", "xc": 0.2, "yc": 0.2, "w": 0.1, "h": 0.1, "fdi": (1, 6)},   # geometry agrees
             {"condition": "carious_lesion", "xc": 0.30, "yc": 0.2, "w": 0.05, "h": 0.1, "fdi": (1, 3)},  # a canine left of the fixed anterior window
         ]}}
@@ -365,8 +365,8 @@ class AdapterTests(unittest.TestCase):
         adapted = la.adapt_dataset(adapter, gt, self.root / "truth_fdm")
         self.assertEqual([r["source"] for r in adapted["img1"]["boxes"]], ["fdm", "fdm", "geometry"])
         self.assertEqual(adapted["img1"]["boxes"][2]["regions"], ["lower-right"])
-        truth = ev.apply_adapted(gt, adapted)
-        self.assertEqual([b["regions"] for b in truth["img1"]["boxes"]], [["upper-right"], ["upper-right"], ["lower-right"]])
+        with self.assertRaisesRegex(ValueError, "DentVLM-generated location truth is disabled"):
+            ev.apply_adapted(gt, adapted)
         self.assertEqual(la.summarize(adapted)["by_source"], {"fdm": 2, "geometry": 1})
 
 
